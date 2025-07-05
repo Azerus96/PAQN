@@ -5,7 +5,7 @@
 #include <numeric>
 #include <algorithm>
 #include <map>
-#include <random> // <-- ВАЖНО: Добавлен необходимый заголовок
+#include <random>
 
 namespace ofc {
 
@@ -35,14 +35,13 @@ std::vector<float> action_to_vector(const Action& action) {
     return vec;
 }
 
-// --- НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ---
-// Реализует добавление шума Дирихле к вектору стратегии для обеспечения исследования.
+// Вспомогательная функция для добавления шума Дирихле
+// (Эта функция остается без изменений)
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng) {
     if (strategy.empty()) {
         return;
     }
     
-    // 1. Генерируем шум из гамма-распределения
     std::gamma_distribution<float> gamma(alpha, 1.0f);
     std::vector<float> noise(strategy.size());
     float noise_sum = 0.0f;
@@ -52,9 +51,8 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
         noise_sum += noise[i];
     }
 
-    // 2. Нормализуем шум и смешиваем с исходной стратегией
-    if (noise_sum > 1e-6) { // Защита от деления на ноль
-        const float exploration_fraction = 0.25f; // Доля шума в итоговой стратегии
+    if (noise_sum > 1e-6) {
+        const float exploration_fraction = 0.25f;
         for (size_t i = 0; i < strategy.size(); ++i) {
             strategy[i] = (1.0f - exploration_fraction) * strategy[i] + exploration_fraction * (noise[i] / noise_sum);
         }
@@ -68,10 +66,8 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* buffer, InferenceQ
 
 void DeepMCCFR::run_traversal() {
     GameState state; 
-    // Вызываем обход для первого игрока, указывая, что это корневой узел (is_root = true)
     traverse(state, 0, true);
     state.reset(); 
-    // Вызываем обход для второго игрока, также указывая, что это корневой узел
     traverse(state, 1, true);
 }
 
@@ -117,7 +113,6 @@ std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view)
     return features;
 }
 
-// --- ИЗМЕНЕНИЕ: Обновлена сигнатура и логика функции traverse ---
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root) {
     if (state.is_terminal()) {
         auto payoffs = state.get_payoffs(evaluator_);
@@ -134,7 +129,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
     if (num_actions == 0) {
         state.apply_action({{}, INVALID_CARD}, traversing_player, undo_info);
-        // Все рекурсивные вызовы теперь передают is_root = false
         auto result = traverse(state, traversing_player, false);
         state.undo_action(undo_info, traversing_player);
         return result;
@@ -143,7 +137,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     if (current_player != traversing_player) {
         int action_idx = std::uniform_int_distribution<int>(0, num_actions - 1)(rng_);
         state.apply_action(legal_actions[action_idx], traversing_player, undo_info);
-        // Все рекурсивные вызовы теперь передают is_root = false
         auto result = traverse(state, traversing_player, false);
         state.undo_action(undo_info, traversing_player);
         return result;
@@ -179,8 +172,31 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         regrets = future.get();
     }
 
-    // --- ПОЛНОСТЬЮ НОВАЯ ЛОГИКА ФОРМИРОВАНИЯ СТРАТЕГИИ ---
-    // 5. Вычисляем стратегию на основе предсказанных сожалений (Regret Matching)
+    // --- НОВЫЙ БЛОК: НОРМАЛИЗАЦИЯ ПРЕДСКАЗАННЫХ СОЖАЛЕНИЙ ---
+    // Этот блок предотвращает "взрыв" значений сожалений, который приводит к
+    // слишком детерминированной стратегии и коллапсу обучения.
+    if (!regrets.empty()) {
+        float sum_pos_regrets = 0.0f;
+        for (float r : regrets) {
+            if (r > 0) {
+                sum_pos_regrets += r;
+            }
+        }
+
+        // Если сумма положительных сожалений становится слишком большой,
+        // мы масштабируем все предсказанные сожаления. Это не дает стратегии
+        // схлопнуться в одно действие и поддерживает разнообразие.
+        // Порог '1.0' - это настраиваемый гиперпараметр.
+        const float REGRET_SUM_SCALING_THRESHOLD = 1.0f;
+        if (sum_pos_regrets > REGRET_SUM_SCALING_THRESHOLD) { 
+            for (float& r : regrets) {
+                r /= sum_pos_regrets;
+            }
+        }
+    }
+    // --- КОНЕЦ НОВОГО БЛОКА ---
+
+    // 5. Вычисляем стратегию на основе (возможно, нормализованных) сожалений
     std::vector<float> strategy(num_actions);
     float total_positive_regret = 0.0f;
     for (int i = 0; i < num_actions; ++i) {
@@ -188,21 +204,19 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         total_positive_regret += strategy[i];
     }
 
-    if (total_positive_regret > 1e-6) { // Используем порог для численной стабильности
+    if (total_positive_regret > 1e-6) {
         for (int i = 0; i < num_actions; ++i) {
             strategy[i] /= total_positive_regret;
         }
     } else {
-        // Если нет положительных сожалений (например, в начале обучения), играем случайно
         std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
     }
 
-    // Добавляем шум Дирихле для исследования, но ТОЛЬКО в корневом узле обхода
+    // Добавляем шум Дирихле для исследования, только в корневом узле
     if (is_root) {
-        const float DIRICHLET_ALPHA = 0.3f; // Гиперпараметр, контролирующий "силу" шума
+        const float DIRICHLET_ALPHA = 0.3f;
         add_dirichlet_noise(strategy, DIRICHLET_ALPHA, rng_);
     }
-    // --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
     // 6. Обходим дочерние узлы и вычисляем истинные сожаления
     std::vector<std::map<int, float>> action_utils(num_actions);
@@ -210,7 +224,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
     for (int i = 0; i < num_actions; ++i) {
         state.apply_action(legal_actions[i], traversing_player, undo_info);
-        // Все рекурсивные вызовы теперь передают is_root = false
         action_utils[i] = traverse(state, traversing_player, false);
         state.undo_action(undo_info, traversing_player);
 
