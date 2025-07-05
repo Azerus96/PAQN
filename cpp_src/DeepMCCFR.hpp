@@ -6,7 +6,7 @@
 #include <vector>
 #include <map>
 #include <memory>
-#include <random> // <-- ДОБАВЛЕНО
+#include <random>
 
 namespace ofc {
 
@@ -17,11 +17,16 @@ public:
     void run_traversal();
 
 private:
+    // --- ИЗМЕНЕНИЕ: ДОБАВЛЕНА КОНСТАНТА EPSILON ---
+    // Вероятность выбора случайного действия для исследования (10%)
+    static constexpr double EPSILON = 0.10; 
+    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
     HandEvaluator evaluator_;
     SharedReplayBuffer* replay_buffer_; 
     InferenceQueue* inference_queue_;
     size_t action_limit_;
-    std::mt19937 rng_; // <-- RNG теперь здесь, для каждого воркера свой
+    std::mt19937 rng_;
 
     std::map<int, float> traverse(GameState& state, int traversing_player);
     std::vector<float> featurize(const GameState& state, int player_view);
