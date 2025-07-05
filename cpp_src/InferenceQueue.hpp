@@ -4,12 +4,15 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include "constants.hpp" // <-- Добавим для ACTION_VECTOR_SIZE
 
 // Запрос на инференс, который C++ отправляет в Python
 struct InferenceRequest {
     std::vector<float> infoset;
+    // ИЗМЕНЕНО: Вместо количества действий передаем сами векторы действий
+    std::vector<std::vector<float>> action_vectors;
     std::promise<std::vector<float>> promise;
-    int num_actions;
+    // num_actions больше не нужен, его можно определить из action_vectors.size()
 };
 
 // Потокобезопасная очередь для запросов
