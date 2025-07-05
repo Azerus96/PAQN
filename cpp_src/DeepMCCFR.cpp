@@ -115,7 +115,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         return result;
     }
 
-    // --- ИСПРАВЛЕННАЯ ЛОГИКА ---
+    // --- НОВАЯ ЛОГИКА С ПОЛНОЦЕННЫМ ИНФЕРЕНСОМ ---
     // 1. Создаем карту для трансформации и получаем каноническое состояние
     std::map<int, int> suit_map;
     GameState canonical_state = state.get_canonical(suit_map);
@@ -123,6 +123,25 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     // 2. Создаем инфосет из канонического состояния
     std::vector<float> infoset_vec = featurize(canonical_state, traversing_player);
     
+    // 3. Канонизируем все легальные действия и создаем их векторы
+    std::vector<std::vector<float>> canonical_action_vectors;
+    canonical_action_vectors.reserve(num_actions);
+
+    auto remap_card = [&](Card& card) {
+        if (card == INVALID_CARD) return;
+        card = get_rank(card) * 4 + suit_map.at(get_suit(card));
+    };
+
+    for (const auto& original_action : legal_actions) {
+        Action canonical_action = original_action;
+        for (auto& placement : canonical_action.first) {
+            remap_card(placement.first);
+        }
+        remap_card(canonical_action.second);
+        canonical_action_vectors.push_back(action_to_vector(canonical_action));
+    }
+
+    // 4. Отправляем запрос в нейросеть
     std::vector<float> regrets;
     {
         std::promise<std::vector<float>> promise;
@@ -130,13 +149,16 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
         InferenceRequest request;
         request.infoset = infoset_vec;
+        // Передаем созданные векторы. Используем std::move для эффективности.
+        request.action_vectors = std::move(canonical_action_vectors); 
         request.promise = std::move(promise);
-        request.num_actions = num_actions;
+        
         inference_queue_->push(std::move(request));
 
-        regrets = future.get();
+        regrets = future.get(); // Ждем предсказанные сожаления
     }
 
+    // 5. Вычисляем стратегию на основе предсказанных сожалений
     std::vector<float> strategy(num_actions);
     float total_positive_regret = 0.0f;
     for (int i = 0; i < num_actions; ++i) {
@@ -150,6 +172,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
     }
 
+    // 6. Обходим дочерние узлы и вычисляем истинные сожаления
     std::vector<std::map<int, float>> action_utils(num_actions);
     std::map<int, float> node_util = {{0, 0.0f}, {1, 0.0f}};
 
@@ -168,29 +191,20 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         true_regrets[i] = action_utils[i][current_player] - node_util[current_player];
     }
     
-    // 3. Канонизируем действия и сохраняем в буфер
+    // 7. Сохраняем данные в буфер (инфосет, канонизированное действие, истинное сожаление)
+    // Векторы канонизированных действий мы уже отправили в очередь, и они там уничтожились.
+    // Поэтому нам нужно их создать заново для сохранения в буфер.
+    // Это небольшая избыточность, но она упрощает код.
     for (int i = 0; i < num_actions; ++i) {
         Action canonical_action = legal_actions[i];
-        
-        auto remap_card = [&](Card& card) {
-            if (card == INVALID_CARD) return;
-            // Используем готовую, корректную карту трансформации
-            card = get_rank(card) * 4 + suit_map.at(get_suit(card));
-        };
-
-        // Применяем трансформацию к картам в действии
         for (auto& placement : canonical_action.first) {
             remap_card(placement.first);
         }
         remap_card(canonical_action.second);
-
-        // ИСПРАВЛЕНИЕ: Убираем некорректную сортировку действий
-        // std::sort(canonical_action.first.begin(), ...);
-
         std::vector<float> action_vec = action_to_vector(canonical_action);
         replay_buffer_->push(infoset_vec, action_vec, true_regrets[i]);
     }
-    // --- КОНЕЦ ИСПРАВЛЕНИЙ ---
+    // --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
     return node_util;
 }
