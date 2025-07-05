@@ -149,7 +149,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
         InferenceRequest request;
         request.infoset = infoset_vec;
-        // Передаем созданные векторы. Используем std::move для эффективности.
         request.action_vectors = std::move(canonical_action_vectors); 
         request.promise = std::move(promise);
         
@@ -160,17 +159,28 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
     // 5. Вычисляем стратегию на основе предсказанных сожалений
     std::vector<float> strategy(num_actions);
-    float total_positive_regret = 0.0f;
-    for (int i = 0; i < num_actions; ++i) {
-        strategy[i] = (regrets[i] > 0) ? regrets[i] : 0.0f;
-        total_positive_regret += strategy[i];
-    }
 
-    if (total_positive_regret > 0) {
-        for (int i = 0; i < num_actions; ++i) strategy[i] /= total_positive_regret;
-    } else {
+    // --- ИЗМЕНЕНИЕ: ВНЕДРЕНИЕ ε-Greedy ---
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    if (dist(rng_) < EPSILON) {
+        // ИССЛЕДОВАНИЕ (Explore): с вероятностью EPSILON выбираем случайное действие
         std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
+    } else {
+        // ЭКСПЛУАТАЦИЯ (Exploit): с вероятностью (1 - EPSILON) используем Regret Matching
+        float total_positive_regret = 0.0f;
+        for (int i = 0; i < num_actions; ++i) {
+            strategy[i] = (regrets[i] > 0) ? regrets[i] : 0.0f;
+            total_positive_regret += strategy[i];
+        }
+
+        if (total_positive_regret > 0) {
+            for (int i = 0; i < num_actions; ++i) strategy[i] /= total_positive_regret;
+        } else {
+            // Если нет положительных сожалений, играем случайно
+            std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
+        }
     }
+    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     // 6. Обходим дочерние узлы и вычисляем истинные сожаления
     std::vector<std::map<int, float>> action_utils(num_actions);
@@ -192,15 +202,23 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     }
     
     // 7. Сохраняем данные в буфер (инфосет, канонизированное действие, истинное сожаление)
-    // Векторы канонизированных действий мы уже отправили в очередь, и они там уничтожились.
-    // Поэтому нам нужно их создать заново для сохранения в буфер.
-    // Это небольшая избыточность, но она упрощает код.
     for (int i = 0; i < num_actions; ++i) {
         Action canonical_action = legal_actions[i];
+        // Пересоздаем suit_map, так как он был использован выше.
+        // Это самый простой способ, хотя и не самый эффективный.
+        std::map<int, int> current_suit_map;
+        state.get_canonical(current_suit_map); // Получаем актуальную карту мастей для текущего состояния
+        
+        auto remap_card_for_save = [&](Card& card) {
+            if (card == INVALID_CARD) return;
+            card = get_rank(card) * 4 + current_suit_map.at(get_suit(card));
+        };
+
         for (auto& placement : canonical_action.first) {
-            remap_card(placement.first);
+            remap_card_for_save(placement.first);
         }
-        remap_card(canonical_action.second);
+        remap_card_for_save(canonical_action.second);
+        
         std::vector<float> action_vec = action_to_vector(canonical_action);
         replay_buffer_->push(infoset_vec, action_vec, true_regrets[i]);
     }
