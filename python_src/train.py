@@ -14,8 +14,8 @@ from collections import deque
 
 # --- НАСТРОЙКИ ---
 # Используйте меньше воркеров для отладки, если нужно
-NUM_WORKERS = int(os.cpu_count() or 88) 
-NUM_COMPUTATION_THREADS = "8"
+NUM_WORKERS = int(os.cpu_count() or 96) # Используем все доступные ядра
+NUM_COMPUTATION_THREADS = "8" # Оптимальное количество для Torch на CPU
 os.environ['OMP_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['OPENBLAS_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['MKL_NUM_THREADS'] = NUM_COMPUTATION_THREADS
@@ -23,7 +23,8 @@ os.environ['VECLIB_MAXIMUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['NUMEXPR_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 torch.set_num_threads(int(NUM_COMPUTATION_THREADS))
 
-from .model import ParametricDuelingNetwork
+# --- ИЗМЕНЕНИЕ: Импортируем новую, упрощенную модель ---
+from .model import SimpleRegretNetwork
 from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue
 
 # --- ГИПЕРПАРАМЕТРЫ ---
@@ -33,14 +34,15 @@ ACTION_LIMIT = 1000
 LEARNING_RATE = 0.001
 REPLAY_BUFFER_CAPACITY = 1_000_000
 BATCH_SIZE = 4096
-SAVE_INTERVAL_SECONDS = 300
-MODEL_PATH = "paqn_d2cfr_model.pth"
+SAVE_INTERVAL_SECONDS = 300 # 5 минут
+MODEL_PATH = "paqn_regret_model.pth" # Изменил имя файла модели для ясности
 
 # Параметры для пакетного инференса
-INFERENCE_BATCH_SIZE = 2048 # Максимальное количество действий в одном батче для нейросети
-INFERENCE_MAX_DELAY_MS = 5 # Максимальная задержка в мс для сбора батча
+INFERENCE_BATCH_SIZE = 2048
+INFERENCE_MAX_DELAY_MS = 5
 
 class InferenceWorker(threading.Thread):
+    # (Этот класс остается БЕЗ ИЗМЕНЕНИЙ)
     def __init__(self, model, queue, device):
         super().__init__(daemon=True)
         self.model = model
@@ -50,54 +52,42 @@ class InferenceWorker(threading.Thread):
 
     def run(self):
         print(f"InferenceWorker (ThreadID: {threading.get_ident()}) started.", flush=True)
-        self.model.eval() # Переводим модель в режим инференса
+        self.model.eval()
 
         while not self.stop_event.is_set():
             try:
-                # Ждем первого запроса
                 self.queue.wait() 
-                
-                # Собираем батч запросов
                 requests = self.queue.pop_all()
-                
                 if not requests:
                     continue
 
-                # --- Логика пакетной обработки ---
                 infoset_batch = []
                 action_batch = []
-                # Структура для отслеживания, какому запросу какая часть батча принадлежит
                 request_indices = [] 
-
                 total_actions = 0
+
                 for req in requests:
                     num_actions = len(req.action_vectors)
                     if num_actions == 0:
-                        # Пустой запрос, который нужно обработать
                         request_indices.append(0)
                         continue
-
-                    # Расширяем инфосет для каждого действия
                     infoset_batch.extend([req.infoset] * num_actions)
                     action_batch.extend(req.action_vectors)
                     request_indices.append(num_actions)
                     total_actions += num_actions
 
                 if total_actions == 0:
-                    # Обрабатываем пустые запросы
                     for i, req in enumerate(requests):
                          if request_indices[i] == 0:
                             req.set_result([])
                     continue
 
-                # Преобразуем в тензоры и делаем инференс
                 infosets_tensor = torch.tensor(infoset_batch, dtype=torch.float32, device=self.device)
                 actions_tensor = torch.tensor(action_batch, dtype=torch.float32, device=self.device)
                 
                 with torch.no_grad():
                     predictions = self.model(infosets_tensor, actions_tensor).cpu().numpy().flatten()
 
-                # Разбираем результаты и отправляем обратно
                 start_idx = 0
                 for i, req in enumerate(requests):
                     num_actions = request_indices[i]
@@ -119,22 +109,13 @@ class InferenceWorker(threading.Thread):
     def stop(self):
         self.stop_event.set()
 
-# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ---
 def push_to_github(model_path, commit_message):
-    """
-    Безопасно отправляет изменения на GitHub.
-    Добавляет все отслеживаемые файлы и создает коммит, только если есть изменения.
-    """
+    # (Эта функция остается БЕЗ ИЗМЕНЕНИЙ)
     try:
         print("Pushing progress to GitHub...", flush=True)
-        # Настройка пользователя Git для коммита
         subprocess.run(['git', 'config', '--global', 'user.email', 'bot@example.com'], check=True)
         subprocess.run(['git', 'config', '--global', 'user.name', 'Training Bot'], check=True)
-        
-        # Добавляем ВСЕ измененные и новые файлы в текущей директории
         subprocess.run(['git', 'add', '.'], check=True)
-        
-        # Проверяем, есть ли что коммитить, чтобы избежать пустых коммитов
         status_result = subprocess.run(['git', 'status', '--porcelain'], capture_output=True, text=True)
         
         if status_result.stdout:
@@ -152,19 +133,19 @@ def push_to_github(model_path, commit_message):
         print(f"An unexpected error occurred during git push: {e}", flush=True)
 
 def main():
-    # Используем GPU, если доступен, иначе CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}", flush=True)
 
-    model = ParametricDuelingNetwork(
+    # --- ИЗМЕНЕНИЕ: Инициализируем новую, упрощенную модель ---
+    model = SimpleRegretNetwork(
         infoset_size=INPUT_SIZE, 
         action_vec_size=ACTION_VECTOR_SIZE
     ).to(device)
     
+    # ВАЖНО: Убедитесь, что старый файл модели удален или переименован
     if os.path.exists(MODEL_PATH):
         print(f"Found existing model at {MODEL_PATH}. Loading weights...", flush=True)
         try:
-            # Загружаем веса на нужное устройство
             model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
         except Exception as e:
             print(f"Could not load state_dict. Error: {e}. Starting from scratch.", flush=True)
@@ -175,7 +156,6 @@ def main():
     replay_buffer = SharedReplayBuffer(REPLAY_BUFFER_CAPACITY)
     inference_queue = InferenceQueue()
 
-    # Передаем модель и устройство в воркер
     inference_worker = InferenceWorker(model, inference_queue, device)
     inference_worker.start()
 
@@ -183,7 +163,7 @@ def main():
     
     stop_event = threading.Event()
     git_thread = None
-    training_losses = deque(maxlen=100) # Для сглаживания лосса
+    training_losses = deque(maxlen=100)
 
     try:
         with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
@@ -204,7 +184,7 @@ def main():
                 current_buffer_size = replay_buffer.get_count()
                 
                 if current_buffer_size >= BATCH_SIZE:
-                    model.train() # Переводим модель в режим обучения
+                    model.train()
                     
                     infosets_np, actions_np, targets_np = replay_buffer.sample(BATCH_SIZE)
                     
@@ -213,16 +193,13 @@ def main():
                     targets = torch.from_numpy(targets_np).to(device)
 
                     optimizer.zero_grad()
-                    
                     predictions = model(infosets, actions)
-                    
                     loss = criterion(predictions, targets)
                     loss.backward()
                     clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     training_losses.append(loss.item())
                     
-                    # Возвращаем модель в режим инференса для потока-инференсера
                     model.eval()
                 
                 now = time.time()
@@ -231,7 +208,6 @@ def main():
                     current_head = replay_buffer.get_head()
                     samples_generated_interval = current_head - last_report_head
                     last_report_head = current_head
-                    
                     samples_per_sec = samples_generated_interval / duration if duration > 0 else 0
                     
                     print(f"\n--- Stats Update ---", flush=True)
@@ -251,7 +227,7 @@ def main():
                                 print("\n--- Saving model and pushing to GitHub ---", flush=True)
                                 torch.save(model.state_dict(), MODEL_PATH)
                                 avg_loss = sum(training_losses) / len(training_losses)
-                                commit_message = f"PAQN Training. Samples: {current_head:,}. Loss: {avg_loss:.6f}"
+                                commit_message = f"RegretNet Training. Samples: {current_head:,}. Loss: {avg_loss:.6f}"
                                 
                                 git_thread = threading.Thread(target=push_to_github, args=(MODEL_PATH, commit_message))
                                 git_thread.start()
@@ -270,7 +246,7 @@ def main():
             git_thread.join()
 
         print("\n--- Final Save ---", flush=True)
-        torch.save(model.state_dict(), "paqn_d2cfr_model_final.pth")
+        torch.save(model.state_dict(), "paqn_regret_model_final.pth")
         print("Final model saved. Exiting.")
 
 if __name__ == "__main__":
