@@ -32,12 +32,12 @@ ACTION_VECTOR_SIZE = 208
 ACTION_LIMIT = 1000
 LEARNING_RATE = 0.001
 REPLAY_BUFFER_CAPACITY = 1_000_000
-BATCH_SIZE = 8192
+BATCH_SIZE = 4096
 SAVE_INTERVAL_SECONDS = 300
 MODEL_PATH = "paqn_d2cfr_model.pth"
 
 # Параметры для пакетного инференса
-INFERENCE_BATCH_SIZE = 4096 # Максимальное количество действий в одном батче для нейросети
+INFERENCE_BATCH_SIZE = 2048 # Максимальное количество действий в одном батче для нейросети
 INFERENCE_MAX_DELAY_MS = 5 # Максимальная задержка в мс для сбора батча
 
 class InferenceWorker(threading.Thread):
