@@ -1,5 +1,0 @@
-/content/PAQN/build/CMakeFiles/ofc_engine.dir
-/content/PAQN/build/CMakeFiles/edit_cache.dir
-/content/PAQN/build/CMakeFiles/rebuild_cache.dir
-/content/PAQN/build/_deps/pybind11-build/CMakeFiles/edit_cache.dir
-/content/PAQN/build/_deps/pybind11-build/CMakeFiles/rebuild_cache.dir

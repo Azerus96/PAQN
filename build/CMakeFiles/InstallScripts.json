@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/content/PAQN/build/cmake_install.cmake",
-		"/content/PAQN/build/_deps/pybind11-build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
