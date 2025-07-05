@@ -19,7 +19,7 @@ public:
 private:
     // --- ИЗМЕНЕНИЕ: ДОБАВЛЕНА КОНСТАНТА EPSILON ---
     // Вероятность выбора случайного действия для исследования (10%)
-    static constexpr double EPSILON = 0.20; 
+    static constexpr double EPSILON = 0.25; 
     // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     HandEvaluator evaluator_;
