@@ -16,7 +16,7 @@ namespace ofc {
 
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
 
-// ... (вспомогательные функции без изменений) ...
+// ... (вспомогательные функции action_to_vector и add_dirichlet_noise без изменений) ...
 std::vector<float> action_to_vector(const Action& action);
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng);
 std::vector<float> action_to_vector(const Action& action) {
@@ -55,6 +55,7 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
         }
     }
 }
+
 
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
                      PolicyInferenceCallback policy_cb, ValueInferenceCallback value_cb) 
@@ -164,7 +165,14 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
             py::gil_scoped_acquire acquire;
             policy_callback_(traversal_id, infoset_vec, canonical_action_vectors, responder);
         }
+        
+        // Busy-wait с таймаутом
+        auto start_time = std::chrono::steady_clock::now();
         while (!ready.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() - start_time > std::chrono::seconds(10)) {
+                std::cerr << "FATAL: Timeout waiting for Policy response in C++ thread. Aborting traversal." << std::endl;
+                return {}; // Возвращаем пустой payoff, чтобы разблокировать стек
+            }
             std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
     }
@@ -214,7 +222,13 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
             py::gil_scoped_acquire acquire;
             value_callback_(traversal_id, infoset_vec, responder);
         }
+        
+        auto start_time = std::chrono::steady_clock::now();
         while (!ready.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() - start_time > std::chrono::seconds(10)) {
+                std::cerr << "FATAL: Timeout waiting for Value response in C++ thread. Aborting traversal." << std::endl;
+                return {};
+            }
             std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
     }
