@@ -1,3 +1,4 @@
+// --- START OF FILE PAQN-main/cpp_src/DeepMCCFR.cpp ---
 #include "DeepMCCFR.hpp"
 #include "constants.hpp"
 #include <stdexcept>
@@ -177,6 +178,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::promise<std::vector<float>> promise;
         auto future = promise.get_future();
         InferenceRequest request;
+        // ИЗМЕНЕНО: Простое и безопасное присваивание благодаря std::variant
         request.data = PolicyRequestData{infoset_vec, canonical_action_vectors};
         request.promise = std::move(promise);
         inference_queue_->push(std::move(request));
@@ -227,6 +229,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::promise<std::vector<float>> promise;
         auto future = promise.get_future();
         InferenceRequest request;
+        // ИЗМЕНЕНО: Простое и безопасное присваивание благодаря std::variant
         request.data = ValueRequestData{infoset_vec};
         request.promise = std::move(promise);
         inference_queue_->push(std::move(request));
@@ -250,3 +253,4 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     return node_payoffs;
 }
 } // namespace ofc
+// --- END OF FILE PAQN-main/cpp_src/DeepMCCFR.cpp ---
