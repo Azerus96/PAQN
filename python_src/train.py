@@ -10,15 +10,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
 from collections import deque
-import queue  # Используем стандартную потокобезопасную очередь Python
+import queue
 
-# Импортируем наши компоненты
 from .model import PolicyNetwork, ValueNetwork
-# У InferenceQueue больше нет, удаляем из импорта
 from ofc_engine import DeepMCCFR, ReplayBuffer, initialize_evaluator
 
 # --- Глобальные Настройки ---
-NUM_CPP_WORKERS = int(os.cpu_count() - 16) if (os.cpu_count() or 0) > 20 else 4
+NUM_CPP_WORKERS = int(os.cpu_count() - 16) if (os.cpu_count() or 0) > 20 else 8
 NUM_INFERENCE_WORKERS = 16
 
 COMPUTATION_THREADS = str(NUM_INFERENCE_WORKERS)
@@ -43,31 +41,23 @@ SAVE_INTERVAL_SECONDS = 300
 POLICY_MODEL_PATH = "paqn_policy_model.pth"
 VALUE_MODEL_PATH = "paqn_value_model.pth"
 
-# --- Инициализация C++ части ---
 print("Initializing C++ hand evaluator lookup tables...", flush=True)
 initialize_evaluator()
 print("C++ evaluator initialized successfully.", flush=True)
 
-# --- Новая архитектура инференса на callback'ах ---
-
-# Глобальная очередь для задач инференса от всех C++ потоков
+# Глобальная очередь для задач инференса
 inference_task_queue = queue.Queue(maxsize=NUM_CPP_WORKERS * 4)
 
-def policy_inference_callback(infoset, action_vectors, responder_callback):
-    """Эта функция будет передана в C++ и вызвана оттуда."""
-    inference_task_queue.put(("POLICY", infoset, action_vectors, responder_callback))
+def policy_inference_callback(traversal_id, infoset, action_vectors, responder_callback):
+    inference_task_queue.put(("POLICY", traversal_id, infoset, action_vectors, responder_callback))
 
-def value_inference_callback(infoset, responder_callback):
-    """Эта функция будет передана в C++."""
-    inference_task_queue.put(("VALUE", infoset, None, responder_callback))
+def value_inference_callback(traversal_id, infoset, responder_callback):
+    inference_task_queue.put(("VALUE", traversal_id, infoset, None, responder_callback))
 
 class InferenceWorker(threading.Thread):
-    """
-    Поток-исполнитель. Берет задачи из глобальной очереди и выполняет их.
-    Их будет несколько штук для параллельной работы.
-    """
-    def __init__(self, policy_net, value_net, device, task_queue):
-        super().__init__(daemon=True)
+    def __init__(self, worker_id, policy_net, value_net, device, task_queue):
+        super().__init__(daemon=True, name=f"InferenceWorker-{worker_id}")
+        self.worker_id = worker_id
         self.policy_net = policy_net
         self.value_net = value_net
         self.device = device
@@ -75,45 +65,44 @@ class InferenceWorker(threading.Thread):
         self.stop_event = threading.Event()
 
     def run(self):
-        tid = threading.get_ident()
-        print(f"[Py-InferenceWorker TID: {tid}] Started.", flush=True)
+        print(f"[{self.getName()}] Started.", flush=True)
         self.policy_net.eval()
         self.value_net.eval()
         while not self.stop_event.is_set():
             try:
                 task = self.task_queue.get()
-                if task is None:
-                    break
+                if task is None: break
 
-                task_type, infoset, action_vectors, responder_callback = task
+                task_type, traversal_id, infoset, action_vectors, responder_callback = task
+                print(f"[{self.getName()}] Got {task_type} task for TR_ID: {traversal_id}", flush=True)
 
                 if task_type == "POLICY":
                     if not action_vectors:
-                        responder_callback([])
-                        continue
+                        predictions = []
+                    else:
+                        batch_size = len(action_vectors)
+                        infoset_tensor = torch.tensor([infoset] * batch_size, dtype=torch.float32)
+                        actions_tensor = torch.tensor(action_vectors, dtype=torch.float32)
+                        with torch.inference_mode():
+                            predictions = self.policy_net(infosets_tensor, actions_tensor).cpu().numpy().flatten().tolist()
                     
-                    batch_size = len(action_vectors)
-                    infoset_tensor = torch.tensor([infoset] * batch_size, dtype=torch.float32)
-                    actions_tensor = torch.tensor(action_vectors, dtype=torch.float32)
-                    
-                    with torch.inference_mode():
-                        predictions = self.policy_net(infoset_tensor, actions_tensor).cpu().numpy().flatten()
-                    
-                    responder_callback(predictions.tolist())
+                    print(f"[{self.getName()}] Responding to TR_ID: {traversal_id} for POLICY task.", flush=True)
+                    responder_callback(predictions)
 
                 elif task_type == "VALUE":
                     infoset_tensor = torch.tensor([infoset], dtype=torch.float32)
                     with torch.inference_mode():
                         prediction = self.value_net(infoset_tensor).item()
                     
+                    print(f"[{self.getName()}] Responding to TR_ID: {traversal_id} for VALUE task.", flush=True)
                     responder_callback(prediction)
 
                 self.task_queue.task_done()
             except Exception as e:
-                print(f"Error in InferenceWorker TID {tid}: {e}", flush=True)
+                print(f"Error in {self.getName()}: {e}", flush=True)
                 traceback.print_exc()
         
-        print(f"[Py-InferenceWorker TID: {tid}] Stopped.", flush=True)
+        print(f"[{self.getName()}] Stopped.", flush=True)
     
     def stop(self):
         self.stop_event.set()
@@ -142,22 +131,15 @@ def main():
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
 
-    # Запускаем пул Python-воркеров для инференса
     inference_workers = []
-    for _ in range(NUM_INFERENCE_WORKERS):
-        worker = InferenceWorker(policy_net, value_net, device, inference_task_queue)
+    for i in range(NUM_INFERENCE_WORKERS):
+        worker = InferenceWorker(i, policy_net, value_net, device, inference_task_queue)
         worker.start()
         inference_workers.append(worker)
 
-    # Создаем C++ воркеры, передавая им наши Python-функции
     solvers = [
-        DeepMCCFR(
-            ACTION_LIMIT, 
-            policy_buffer, 
-            value_buffer,
-            policy_inference_callback,
-            value_inference_callback
-        ) for _ in range(NUM_CPP_WORKERS)
+        DeepMCCFR(ACTION_LIMIT, policy_buffer, value_buffer, policy_inference_callback, value_inference_callback) 
+        for _ in range(NUM_CPP_WORKERS)
     ]
     
     stop_event = threading.Event()
@@ -168,7 +150,11 @@ def main():
         with ThreadPoolExecutor(max_workers=NUM_CPP_WORKERS) as executor:
             def worker_loop(solver):
                 while not stop_event.is_set():
-                    solver.run_traversal()
+                    try:
+                        solver.run_traversal()
+                    except Exception as e:
+                        print(f"Exception in C++ worker: {e}")
+                        traceback.print_exc()
 
             print(f"Submitting {NUM_CPP_WORKERS} C++ workers to the pool...", flush=True)
             futures = {executor.submit(worker_loop, s) for s in solvers}
@@ -180,42 +166,28 @@ def main():
             while not stop_event.is_set():
                 time.sleep(1.0)
 
-                # Обучение
-                trained_in_cycle = False
                 if value_buffer.get_count() >= BATCH_SIZE:
                     value_net.train()
                     infosets_np, _, targets_np = value_buffer.sample(BATCH_SIZE)
-                    infosets = torch.from_numpy(infosets_np).to(device)
-                    targets = torch.from_numpy(targets_np).to(device)
-                    
+                    infosets, targets = torch.from_numpy(infosets_np), torch.from_numpy(targets_np)
                     value_optimizer.zero_grad()
-                    predictions = value_net(infosets)
-                    loss = value_criterion(predictions, targets)
+                    loss = value_criterion(value_net(infosets), targets)
                     loss.backward()
-                    clip_grad_norm_(value_net.parameters(), 1.0)
                     value_optimizer.step()
                     value_losses.append(loss.item())
                     value_net.eval()
-                    trained_in_cycle = True
 
                 if policy_buffer.get_count() >= BATCH_SIZE:
                     policy_net.train()
                     infosets_np, actions_np, advantages_np = policy_buffer.sample(BATCH_SIZE)
-                    infosets = torch.from_numpy(infosets_np).to(device)
-                    actions = torch.from_numpy(actions_np).to(device)
-                    advantages = torch.from_numpy(advantages_np).to(device)
-
+                    infosets, actions, advantages = torch.from_numpy(infosets_np), torch.from_numpy(actions_np), torch.from_numpy(advantages_np)
                     policy_optimizer.zero_grad()
-                    logits = policy_net(infosets, actions)
-                    loss = policy_criterion(logits, advantages)
+                    loss = policy_criterion(policy_net(infosets, actions), advantages)
                     loss.backward()
-                    clip_grad_norm_(policy_net.parameters(), 1.0)
                     policy_optimizer.step()
                     policy_losses.append(loss.item())
                     policy_net.eval()
-                    trained_in_cycle = True
                 
-                # Отчеты и сохранение
                 now = time.time()
                 if now - last_report_time > 10.0:
                     duration = now - last_report_time
