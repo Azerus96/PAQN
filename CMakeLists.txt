@@ -51,7 +51,7 @@ target_include_directories(ofc_engine PRIVATE
 target_link_libraries(ofc_engine PRIVATE
     # ИЗМЕНЕНО: Возвращаемся к линковке с основной целью pybind11.
     # В версии 2.11.1 это работает надежно.
-    pybind11::embed
+    pybind11::module
     ${TORCH_LIBRARIES}
     OpenMP::OpenMP_CXX
 )
