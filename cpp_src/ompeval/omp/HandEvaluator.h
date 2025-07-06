@@ -13,6 +13,14 @@ namespace omp {
 class HandEvaluator
 {
 public:
+    // ИЗМЕНЕНО: Добавлена функция для явной инициализации
+    static void initialize() {
+        if (!is_initialized) {
+            staticInit();
+            is_initialized = true;
+        }
+    }
+
     HandEvaluator();
 
     // Returns the rank of a hand as a 16-bit integer. Higher value is better. Can also rank hands with less than 5
@@ -33,6 +41,9 @@ public:
     }
 
 private:
+    // ИЗМЕНЕНО: Добавлен статический флаг для отслеживания инициализации
+    static bool is_initialized;
+
     static unsigned perfHash(unsigned key)
     {
         omp_assert(key <= MAX_KEY);
