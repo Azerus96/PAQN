@@ -7,11 +7,10 @@
 #include <iostream>
 #include <mutex>
 #include "constants.hpp"
-#include <chrono> // Добавлено для неблокирующего сида
+#include <chrono>
 
 namespace ofc {
 
-// ИЗМЕНЕНО: Структура теперь хранит один пример (действие)
 struct TrainingSample {
     std::vector<float> infoset_vector;
     std::vector<float> action_vector;
@@ -25,17 +24,14 @@ struct TrainingSample {
 
 class SharedReplayBuffer {
 public:
-    // ИЗМЕНЕНО: Конструктор больше не принимает action_limit
     SharedReplayBuffer(uint64_t capacity) 
         : capacity_(capacity), head_(0), count_(0)
     {
-        buffer_.resize(capacity_); // Просто создаем пустые сэмплы
-        // ИЗМЕНЕНО: Используем неблокирующий сид на основе времени, чтобы избежать блокировки
+        buffer_.resize(capacity_);
         rng_.seed(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-        std::cout << "C++: Parametric Replay Buffer created with capacity " << capacity << std::endl;
+        std::cout << "C++: Replay Buffer created with capacity " << capacity << std::endl;
     }
 
-    // ИЗМЕНЕНО: push теперь принимает один пример за раз
     void push(const std::vector<float>& infoset_vec, const std::vector<float>& action_vec, float regret) {
         std::lock_guard<std::mutex> lock(mtx_);
         uint64_t index = head_ % capacity_;
@@ -51,17 +47,18 @@ public:
         }
     }
 
-    // ИЗМЕНЕНО: sample теперь возвращает три указателя (инфосеты, действия, сожаления)
     void sample(int batch_size, float* out_infosets, float* out_actions, float* out_regrets) {
         std::lock_guard<std::mutex> lock(mtx_);
         
-        if (count_ < static_cast<uint64_t>(batch_size)) {
+        // --- ВАЖНОЕ ИСПРАВЛЕНИЕ ---
+        if (count_ == 0) { // Если буфер пуст, просто заполняем нулями
             std::fill(out_infosets, out_infosets + batch_size * INFOSET_SIZE, 0.0f);
             std::fill(out_actions, out_actions + batch_size * ACTION_VECTOR_SIZE, 0.0f);
             std::fill(out_regrets, out_regrets + batch_size, 0.0f);
             return;
         }
 
+        // Если сэмплов меньше, чем batch_size, будем брать с повторениями
         std::uniform_int_distribution<uint64_t> dist(0, count_ - 1);
 
         for (int i = 0; i < batch_size; ++i) {
@@ -92,4 +89,4 @@ private:
     std::mt19937 rng_;
 };
 
-}
+} // namespace ofc
