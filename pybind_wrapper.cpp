@@ -1,7 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
-#include <pybind11/functional.h> // Обязательно для std::function
+#include <pybind11/functional.h>
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
 #include "cpp_src/constants.hpp"
@@ -52,5 +52,5 @@ PYBIND11_MODULE(ofc_engine, m) {
              py::arg("value_callback"),
              py::call_guard<py::gil_scoped_release>()) // Конструктор не вызывает Python, GIL можно освободить
         .def("run_traversal", &ofc::DeepMCCFR::run_traversal, 
-             "Runs one full traversal for two players. GIL will be managed internally.");
+             "Runs one full traversal for two players. GIL will be managed internally by the callbacks.");
 }
