@@ -2,7 +2,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/functional.h>
-#include <pybind11/variant.h> // <-- ВАЖНО: Добавлен заголовок для std::variant
+// #include <pybind11/variant.h> // УДАЛЕНО
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
 #include "cpp_src/InferenceQueue.hpp"
@@ -10,15 +10,10 @@
 
 namespace py = pybind11;
 
-// Используем псевдонимы для упрощения кода
-using PolicyReplayBuffer = ofc::SharedReplayBuffer;
-using ValueReplayBuffer = ofc::SharedReplayBuffer;
-
 PYBIND11_MODULE(ofc_engine, m) {
     m.doc() = "OFC Engine with Policy-Value Network support";
 
     // --- Биндинги для структур данных запросов ---
-    // Все структуры находятся в пространстве имен ofc
     py::class_<ofc::PolicyRequestData>(m, "PolicyRequestData")
         .def_readonly("infoset", &ofc::PolicyRequestData::infoset)
         .def_readonly("action_vectors", &ofc::PolicyRequestData::action_vectors);
@@ -26,17 +21,22 @@ PYBIND11_MODULE(ofc_engine, m) {
     py::class_<ofc::ValueRequestData>(m, "ValueRequestData")
         .def_readonly("infoset", &ofc::ValueRequestData::infoset);
 
+    // --- Биндинг для enum ---
+    py::enum_<ofc::RequestType>(m, "RequestType")
+        .value("POLICY", ofc::RequestType::POLICY)
+        .value("VALUE", ofc::RequestType::VALUE)
+        .export_values();
+
+    // --- Биндинг для универсального запроса ---
     py::class_<ofc::InferenceRequest>(m, "InferenceRequest")
-        .def("get_type", [](ofc::InferenceRequest &req) {
-            // pybind11::variant автоматически обрабатывает std::variant
-            // index() вернет 0 для PolicyRequestData, 1 для ValueRequestData
-            return req.data.index();
-        })
+        .def_readonly("type", &ofc::InferenceRequest::type)
         .def("get_policy_data", [](ofc::InferenceRequest &req) -> const ofc::PolicyRequestData& {
-            return std::get<ofc::PolicyRequestData>(req.data);
+            if (req.type != ofc::RequestType::POLICY) throw std::runtime_error("Request is not of type POLICY");
+            return req.data.policy_data;
         }, py::return_value_policy::reference_internal)
         .def("get_value_data", [](ofc::InferenceRequest &req) -> const ofc::ValueRequestData& {
-            return std::get<ofc::ValueRequestData>(req.data);
+            if (req.type != ofc::RequestType::VALUE) throw std::runtime_error("Request is not of type VALUE");
+            return req.data.value_data;
         }, py::return_value_policy::reference_internal)
         .def("set_result", [](ofc::InferenceRequest &req, std::vector<float> result) {
             req.promise.set_value(result);
@@ -49,7 +49,6 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def("wait", &ofc::InferenceQueue::wait, py::call_guard<py::gil_scoped_release>());
 
     // --- Биндинг для буфера воспроизведения ---
-    // Даем ему имя ReplayBuffer в Python для универсальности
     py::class_<ofc::SharedReplayBuffer>(m, "ReplayBuffer")
         .def(py::init<uint64_t>(), py::arg("capacity"))
         .def("get_count", &ofc::SharedReplayBuffer::get_count)
