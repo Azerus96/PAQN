@@ -1,4 +1,3 @@
-# --- START OF FILE PAQN-main/python_src/train.py ---
 import os
 import time
 import torch
@@ -12,9 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 from collections import deque
 
-# --- ИЗМЕНЕНИЕ: Импортируем обе модели и новые типы из C++ ---
+# ИЗМЕНЕНО: Импортируем новую функцию initialize_evaluator
 from .model import PolicyNetwork, ValueNetwork
-from ofc_engine import DeepMCCFR, ReplayBuffer, InferenceQueue
+from ofc_engine import DeepMCCFR, ReplayBuffer, InferenceQueue, initialize_evaluator
 
 # --- НАСТРОЙКИ ---
 NUM_WORKERS = int(os.cpu_count() or 96)
@@ -38,6 +37,12 @@ SAVE_INTERVAL_SECONDS = 300
 POLICY_MODEL_PATH = "paqn_policy_model.pth"
 VALUE_MODEL_PATH = "paqn_value_model.pth"
 
+# ИЗМЕНЕНО: Явно вызываем тяжелую C++ инициализацию ДО создания потоков.
+print("Initializing C++ hand evaluator lookup tables... (This may take a minute or two)", flush=True)
+initialize_evaluator()
+print("C++ evaluator initialized successfully.", flush=True)
+
+
 class InferenceWorker(threading.Thread):
     def __init__(self, policy_net, value_net, queue, device):
         super().__init__(daemon=True)
@@ -54,6 +59,7 @@ class InferenceWorker(threading.Thread):
 
         while not self.stop_event.is_set():
             try:
+                # Этот вызов теперь не освобождает GIL, что корректно для Python-потока
                 self.queue.wait()
                 requests = self.queue.pop_all()
                 if not requests:
@@ -62,7 +68,6 @@ class InferenceWorker(threading.Thread):
                 policy_reqs = []
                 value_reqs = []
                 for r in requests:
-                    # ИЗМЕНЕНО: Используем новые, более читаемые методы для проверки типа
                     if r.is_policy_request():
                         policy_reqs.append(r)
                     elif r.is_value_request():
@@ -179,13 +184,11 @@ def main():
             last_save_time = time.time()
             last_report_time = time.time()
             
-            # Используем общий счетчик сэмплов из одного из буферов (они должны заполняться примерно одинаково)
             last_report_head = 0
 
             while True:
-                time.sleep(0.05) # Небольшая пауза, чтобы не загружать CPU в Python цикле
+                time.sleep(0.05) 
                 
-                # Обучение Value Network
                 if value_buffer.get_count() >= BATCH_SIZE:
                     value_net.train()
                     infosets_np, _, targets_np = value_buffer.sample(BATCH_SIZE)
@@ -201,7 +204,6 @@ def main():
                     value_losses.append(loss.item())
                     value_net.eval()
 
-                # Обучение Policy Network
                 if policy_buffer.get_count() >= BATCH_SIZE:
                     policy_net.train()
                     infosets_np, actions_np, advantages_np = policy_buffer.sample(BATCH_SIZE)
@@ -221,7 +223,7 @@ def main():
                 now = time.time()
                 if now - last_report_time > 10.0:
                     duration = now - last_report_time
-                    current_head = policy_buffer.get_head() # Отслеживаем по одному буферу
+                    current_head = policy_buffer.get_head()
                     samples_generated_interval = current_head - last_report_head
                     last_report_head = current_head
                     samples_per_sec = samples_generated_interval / duration if duration > 0 else 0
