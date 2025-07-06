@@ -16,7 +16,6 @@ PYBIND11_MODULE(ofc_engine, m) {
         omp::HandEvaluator::initialize();
     }, py::call_guard<py::gil_scoped_release>());
 
-    // Биндинг для буфера воспроизведения (без изменений)
     py::class_<ofc::SharedReplayBuffer>(m, "ReplayBuffer")
         .def(py::init<uint64_t>(), py::arg("capacity"))
         .def("get_count", &ofc::SharedReplayBuffer::get_count)
@@ -41,7 +40,6 @@ PYBIND11_MODULE(ofc_engine, m) {
             return std::make_tuple(infosets_np, actions_np, targets_np);
         }, py::arg("batch_size"));
         
-    // Биндинг для основного класса DeepMCCFR с callback'ами
     py::class_<ofc::DeepMCCFR>(m, "DeepMCCFR")
         .def(py::init<size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, 
                       ofc::PolicyInferenceCallback, ofc::ValueInferenceCallback>(), 
@@ -50,7 +48,7 @@ PYBIND11_MODULE(ofc_engine, m) {
              py::arg("value_buffer"),
              py::arg("policy_callback"),
              py::arg("value_callback"),
-             py::call_guard<py::gil_scoped_release>()) // Конструктор не вызывает Python, GIL можно освободить
+             py::call_guard<py::gil_scoped_release>())
         .def("run_traversal", &ofc::DeepMCCFR::run_traversal, 
              "Runs one full traversal for two players. GIL will be managed internally by the callbacks.");
 }
