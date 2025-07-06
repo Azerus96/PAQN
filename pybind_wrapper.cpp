@@ -61,7 +61,7 @@ PYBIND11_MODULE(ofc_engine, m) {
     py::class_<ofc::InferenceQueue>(m, "InferenceQueue")
         .def(py::init<>())
         .def("pop_all", &ofc::InferenceQueue::pop_all)
-        .def("wait", &ofc::InferenceQueue::wait, py::call_guard<py::gil_scoped_release>());
+        .def("wait", &ofc::InferenceQueue::wait); // GIL не освобождается
 
     // --- Биндинг для буфера воспроизведения ---
     py::class_<ofc::SharedReplayBuffer>(m, "ReplayBuffer")
