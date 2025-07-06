@@ -9,26 +9,24 @@
 #include <memory>
 #include <random>
 #include <functional>
-#include <atomic> // Для атомарного счетчика
+#include <atomic>
 
 namespace py = pybind11;
 
 namespace ofc {
 
-// Тип для Python-функции, которую мы будем вызывать для Policy-инференса
 using PolicyInferenceCallback = std::function<
     void(
-        uint64_t, // traversal_id
+        uint64_t,
         const std::vector<float>&, 
         const std::vector<std::vector<float>>&,
         const std::function<void(std::vector<float>)>&
     )
 >;
 
-// Тип для Python-функции, которую мы будем вызывать для Value-инференса
 using ValueInferenceCallback = std::function<
     void(
-        uint64_t, // traversal_id
+        uint64_t,
         const std::vector<float>&,
         const std::function<void(float)>&
     )
@@ -52,10 +50,8 @@ private:
     std::mt19937 rng_;
     std::vector<float> dummy_action_vec_;
     
-    // Статический счетчик для уникальных ID обходов
     static std::atomic<uint64_t> traversal_counter_;
 
-    // Сигнатура traverse изменена для передачи ID
     std::map<int, float> traverse(GameState& state, int traversing_player, bool is_root, uint64_t traversal_id);
     std::vector<float> featurize(const GameState& state, int player_view);
 };
