@@ -11,13 +11,12 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 from collections import deque
 import queue
-import cProfile, pstats
 
 from .model import PolicyNetwork, ValueNetwork
 from ofc_engine import DeepMCCFR, ReplayBuffer, initialize_evaluator
 
 # --- Настройки ---
-NUM_CPP_WORKERS = int(os.cpu_count() * 0.75) if (os.cpu_count() or 0) > 4 else 2
+NUM_CPP_WORKERS = int(os.cpu_count() * 0.75) if (os.cpu_count() or 0) > 4 else 4
 NUM_INFERENCE_WORKERS = int(os.cpu_count() * 0.25) if (os.cpu_count() or 0) > 4 else 2
 if NUM_INFERENCE_WORKERS < 1: NUM_INFERENCE_WORKERS = 1
 if NUM_CPP_WORKERS < 1: NUM_CPP_WORKERS = 1
@@ -93,6 +92,7 @@ class InferenceWorker(threading.Thread):
             except queue.Empty:
                 continue
             except Exception:
+                print(f"---!!! EXCEPTION IN {self.name} !!!---", flush=True)
                 traceback.print_exc()
     
     def stop(self):
@@ -103,7 +103,7 @@ class InferenceWorker(threading.Thread):
             except queue.Full:
                 pass
 
-def main(profiling_mode=False):
+def main():
     device = torch.device("cpu")
     print(f"Using device: {device}", flush=True)
     policy_net = PolicyNetwork(INPUT_SIZE, ACTION_VECTOR_SIZE).to(device)
@@ -137,7 +137,7 @@ def main(profiling_mode=False):
             try:
                 solver.run_traversal()
             except Exception as e:
-                print(f"Exception in C++ worker: {e}")
+                print(f"Exception in C++ worker thread: {e}")
                 traceback.print_exc()
 
     print(f"Submitting {NUM_CPP_WORKERS} C++ workers to the pool...", flush=True)
@@ -145,15 +145,12 @@ def main(profiling_mode=False):
         main_executor.submit(worker_loop, s)
     
     last_report_time = time.time()
-    start_time = time.time()
+    last_save_time = time.time()
     last_report_head = 0
     
     try:
         while not stop_event.is_set():
-            if profiling_mode and (time.time() - start_time > 60):
-                print("Profiling time limit reached (60s). Stopping...")
-                break
-            time.sleep(0.5)
+            time.sleep(1.0)
             if value_buffer.get_count() >= BATCH_SIZE:
                 value_net.train()
                 infosets_np, _, targets_np = value_buffer.sample(BATCH_SIZE)
@@ -196,12 +193,17 @@ def main(profiling_mode=False):
                 print(f"Inference Queue Size: {inference_task_queue.qsize()}", flush=True)
                 print("="*54, flush=True)
                 last_report_time = now
+                if now - last_save_time > SAVE_INTERVAL_SECONDS:
+                    print("\n--- Saving models ---", flush=True)
+                    torch.save(policy_net.state_dict(), POLICY_MODEL_PATH)
+                    torch.save(value_net.state_dict(), VALUE_MODEL_PATH)
+                    last_save_time = now
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.", flush=True)
     finally:
         print("Stopping all workers...", flush=True)
         stop_event.set()
-        main_executor.shutdown(wait=True)
+        main_executor.shutdown(wait=True, cancel_futures=True)
         for worker in inference_workers:
             worker.stop()
         for worker in inference_workers:
@@ -212,16 +214,5 @@ def main(profiling_mode=False):
         torch.save(value_net.state_dict(), f"{VALUE_MODEL_PATH}.final")
         print("Training finished.")
 
-def profile_main():
-    profiler = cProfile.Profile()
-    try:
-        profiler.enable()
-        main(profiling_mode=True)
-    finally:
-        profiler.disable()
-        print("\n\n" + "="*20 + " cProfile Report " + "="*20)
-        stats = pstats.Stats(profiler).sort_stats('cumulative')
-        stats.print_stats(40)
-
 if __name__ == "__main__":
-    profile_main()
+    main()
