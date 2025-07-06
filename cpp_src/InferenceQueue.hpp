@@ -1,46 +1,37 @@
-// --- START OF FILE PAQN-main/cpp_src/InferenceQueue.hpp ---
 #pragma once
 #include <vector>
 #include <future>
 #include <mutex>
 #include <condition_variable>
 #include <deque>
-#include <variant> // ДОБАВЛЕНО: Для использования std::variant
+#include <variant>
+#include <iostream> 
+#include <thread>   
 #include "constants.hpp"
 
 namespace ofc {
 
-// УДАЛЕНО: enum RequestType больше не нужен, так как std::variant сам хранит тип.
-
-// Данные для запроса к Policy Network
 struct PolicyRequestData {
     std::vector<float> infoset;
     std::vector<std::vector<float>> action_vectors;
 };
 
-// Данные для запроса к Value Network
 struct ValueRequestData {
     std::vector<float> infoset;
 };
 
-// Универсальный запрос на инференс
 struct InferenceRequest {
-    // ИЗМЕНЕНО: union заменен на std::variant. Это типобезопасно и решает ошибку компиляции.
     std::variant<PolicyRequestData, ValueRequestData> data;
-
-    // Promise будет возвращать вектор float в обоих случаях
     std::promise<std::vector<float>> promise;
-
-    // УДАЛЕНО: Ручное управление конструкторами, деструкторами и операторами перемещения/копирования
-    // больше не требуется. std::variant делает все это автоматически и безопасно.
 };
 
-// Потокобезопасная очередь для запросов (без изменений)
 class InferenceQueue {
 public:
     void push(InferenceRequest&& request) {
         std::unique_lock<std::mutex> lock(mtx_);
+        std::cout << "[C++ Queue] push(): Before size=" << queue_.size() << std::endl << std::flush;
         queue_.push_back(std::move(request));
+        std::cout << "[C++ Queue] push(): After size=" << queue_.size() << ". Notifying." << std::endl << std::flush;
         lock.unlock();
         cv_.notify_one();
     }
@@ -49,6 +40,7 @@ public:
         std::vector<InferenceRequest> requests;
         {
             std::unique_lock<std::mutex> lock(mtx_);
+            std::cout << "[C++ Queue] pop_all(): Popping " << queue_.size() << " requests." << std::endl << std::flush;
             if (!queue_.empty()) {
                 requests.reserve(queue_.size());
                 std::move(queue_.begin(), queue_.end(), std::back_inserter(requests));
@@ -60,7 +52,9 @@ public:
 
     void wait() {
         std::unique_lock<std::mutex> lock(mtx_);
+        std::cout << "[C++ Queue] wait(): Entering, queue empty? " << (queue_.empty() ? "Yes" : "No") << ". Waiting..." << std::endl << std::flush;
         cv_.wait(lock, [this] { return !queue_.empty(); });
+        std::cout << "[C++ Queue] wait(): Woke up, queue size: " << queue_.size() << std::endl << std::flush;
     }
 
 private:
@@ -69,5 +63,4 @@ private:
     std::condition_variable cv_;
 };
 
-} // namespace ofc
-// --- END OF FILE PAQN-main/cpp_src/InferenceQueue.hpp ---
+}
