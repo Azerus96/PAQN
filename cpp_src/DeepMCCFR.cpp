@@ -8,8 +8,8 @@
 #include <cmath>
 #include <vector>
 #include <random>
-#include <chrono>  // Добавлено для неблокирующего сида
-#include <thread>  // Добавлено для неблокирующего сида
+#include <chrono>
+#include <thread>
 
 namespace ofc {
 
@@ -72,7 +72,6 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, Sha
       policy_buffer_(policy_buffer), 
       value_buffer_(value_buffer),
       inference_queue_(queue), 
-      // ИЗМЕНЕНО: Используем неблокирующий сид на основе времени и ID потока, чтобы избежать блокировки
       rng_(static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + 
            static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))),
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
@@ -176,6 +175,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
     
+    std::cout << "[C++ TID: " << std::this_thread::get_id() << "] Policy request: START. Actions: " << num_actions << std::endl << std::flush;
     std::vector<float> logits;
     {
         std::promise<std::vector<float>> promise;
@@ -183,8 +183,11 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         InferenceRequest request;
         request.data = PolicyRequestData{infoset_vec, canonical_action_vectors};
         request.promise = std::move(promise);
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << "] Pushing policy request to queue..." << std::endl << std::flush;
         inference_queue_->push(std::move(request));
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << "] Waiting on policy future..." << std::endl << std::flush;
         logits = future.get();
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << "] Policy future UNBLOCKED. Got " << logits.size() << " logits." << std::endl << std::flush;
     }
 
     // 2. Превращаем логиты в стратегию через Softmax
@@ -195,7 +198,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
         float sum_exp = 0.0f;
         for (int i = 0; i < num_actions; ++i) {
-            strategy[i] = std::exp(logits[i] - max_logit); // Стабильный softmax
+            strategy[i] = std::exp(logits[i] - max_logit);
             sum_exp += strategy[i];
         }
         if (sum_exp > 1e-6) {
@@ -226,6 +229,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     }
     
     // 5. Запрашиваем у ValueNetwork оценку ценности состояния (для baseline)
+    std::cout << "[C++ TID: " << std::this_thread::get_id() << "] Value request: START." << std::endl << std::flush;
     float value_baseline = 0.0f;
     {
         std::promise<std::vector<float>> promise;
@@ -233,12 +237,16 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         InferenceRequest request;
         request.data = ValueRequestData{infoset_vec};
         request.promise = std::move(promise);
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << "] Pushing value request to queue..." << std::endl << std::flush;
         inference_queue_->push(std::move(request));
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << "] Waiting on value future..." << std::endl << std::flush;
         auto result_vec = future.get();
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << "] Value future UNBLOCKED. Got " << result_vec.size() << " values." << std::endl << std::flush;
         if (!result_vec.empty()) {
             value_baseline = result_vec[0];
         }
     }
+    std::cout << "[C++ TID: " << std::this_thread::get_id() << "] Value baseline received: " << value_baseline << std::endl << std::flush;
 
     // 6. Сохраняем данные в буферы
     // 6.1. Для ValueNetwork: (инфосет, ценность узла)
@@ -252,4 +260,4 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
     return node_payoffs;
 }
-} // namespace ofc
+}
