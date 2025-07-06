@@ -1,65 +1,22 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
-#include <pybind11/functional.h>
-#include <iostream>
+#include <pybind11/functional.h> // Обязательно для std::function
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
-#include "cpp_src/InferenceQueue.hpp"
 #include "cpp_src/constants.hpp"
 #include "cpp_src/hand_evaluator.hpp"
 
 namespace py = pybind11;
 
 PYBIND11_MODULE(ofc_engine, m) {
-    m.doc() = "OFC Engine with Policy-Value Network support";
+    m.doc() = "OFC Engine with Callback-based Inference";
 
     m.def("initialize_evaluator", []() {
         omp::HandEvaluator::initialize();
     }, py::call_guard<py::gil_scoped_release>());
 
-
-    // --- Биндинги для структур данных запросов ---
-    py::class_<ofc::PolicyRequestData>(m, "PolicyRequestData")
-        .def_readonly("infoset", &ofc::PolicyRequestData::infoset)
-        .def_readonly("action_vectors", &ofc::PolicyRequestData::action_vectors);
-
-    py::class_<ofc::ValueRequestData>(m, "ValueRequestData")
-        .def_readonly("infoset", &ofc::ValueRequestData::infoset);
-
-    // --- Биндинг для универсального запроса ---
-    py::class_<ofc::InferenceRequest>(m, "InferenceRequest")
-        .def("is_policy_request", [](const ofc::InferenceRequest &req) {
-            return std::holds_alternative<ofc::PolicyRequestData>(req.data);
-        })
-        .def("is_value_request", [](const ofc::InferenceRequest &req) {
-            return std::holds_alternative<ofc::ValueRequestData>(req.data);
-        })
-        .def("get_policy_data", [](ofc::InferenceRequest &req) -> const ofc::PolicyRequestData& {
-            if (auto* p_data = std::get_if<ofc::PolicyRequestData>(&req.data)) {
-                return *p_data;
-            }
-            throw std::runtime_error("Request is not of type POLICY");
-        }, py::return_value_policy::reference_internal)
-        .def("get_value_data", [](ofc::InferenceRequest &req) -> const ofc::ValueRequestData& {
-            if (auto* v_data = std::get_if<ofc::ValueRequestData>(&req.data)) {
-                return *v_data;
-            }
-            throw std::runtime_error("Request is not of type VALUE");
-        }, py::return_value_policy::reference_internal)
-        .def("set_result", [](ofc::InferenceRequest &req, std::vector<float> result) {
-            std::cout << "[PyBind] set_result(): Setting promise. Result size: " << result.size() << std::endl << std::flush;
-            req.promise.set_value(std::move(result));
-        });
-        
-    // --- Биндинг для очереди ---
-    py::class_<ofc::InferenceQueue>(m, "InferenceQueue")
-        .def(py::init<>())
-        .def("pop_all", &ofc::InferenceQueue::pop_all)
-        // ВАЖНО: возвращаем gil_scoped_release для эксперимента
-        .def("wait", &ofc::InferenceQueue::wait, py::call_guard<py::gil_scoped_release>());
-
-    // --- Биндинг для буфера воспроизведения ---
+    // Биндинг для буфера воспроизведения (без изменений)
     py::class_<ofc::SharedReplayBuffer>(m, "ReplayBuffer")
         .def(py::init<uint64_t>(), py::arg("capacity"))
         .def("get_count", &ofc::SharedReplayBuffer::get_count)
@@ -83,10 +40,17 @@ PYBIND11_MODULE(ofc_engine, m) {
 
             return std::make_tuple(infosets_np, actions_np, targets_np);
         }, py::arg("batch_size"));
-
-    // --- Биндинг для основного класса DeepMCCFR ---
+        
+    // Биндинг для основного класса DeepMCCFR с callback'ами
     py::class_<ofc::DeepMCCFR>(m, "DeepMCCFR")
-        .def(py::init<size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, ofc::InferenceQueue*>(), 
-             py::arg("action_limit"), py::arg("policy_buffer"), py::arg("value_buffer"), py::arg("queue"))
-        .def("run_traversal", &ofc::DeepMCCFR::run_traversal, py::call_guard<py::gil_scoped_release>());
+        .def(py::init<size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, 
+                      ofc::PolicyInferenceCallback, ofc::ValueInferenceCallback>(), 
+             py::arg("action_limit"), 
+             py::arg("policy_buffer"), 
+             py::arg("value_buffer"),
+             py::arg("policy_callback"),
+             py::arg("value_callback"),
+             py::call_guard<py::gil_scoped_release>()) // Конструктор не вызывает Python, GIL можно освободить
+        .def("run_traversal", &ofc::DeepMCCFR::run_traversal, 
+             "Runs one full traversal for two players. GIL will be managed internally.");
 }
