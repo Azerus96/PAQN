@@ -32,7 +32,6 @@ using ValueInferenceCallback = std::function<
     )
 >;
 
-
 class DeepMCCFR {
 public:
     DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer, 
@@ -56,4 +55,4 @@ private:
     std::vector<float> featurize(const GameState& state, int player_view);
 };
 
-} // namespace ofc
+}
