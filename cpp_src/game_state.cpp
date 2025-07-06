@@ -2,6 +2,7 @@
 #include "constants.hpp" 
 #include <iostream>
 #include <map>
+#include <chrono> // Добавлено для неблокирующего сида
 
 namespace ofc {
 
@@ -24,7 +25,10 @@ namespace ofc {
             board.bottom.fill(INVALID_CARD);
         }
         
-        std::mt19937 temp_rng(std::random_device{}());
+        // ИЗМЕНЕНО: Используем неблокирующий сид на основе времени, чтобы избежать блокировки
+        unsigned seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        std::mt19937 temp_rng(seed);
+
         deck_.resize(52);
         std::iota(deck_.begin(), deck_.end(), 0);
         std::shuffle(deck_.begin(), deck_.end(), temp_rng);
@@ -217,7 +221,6 @@ namespace ofc {
         }
     }
 
-    // ИСПРАВЛЕННАЯ РЕАЛИЗАЦИЯ
     GameState GameState::get_canonical(std::map<int, int>& suit_map) const {
         suit_map.clear();
         GameState canonical_state = *this;
@@ -233,10 +236,7 @@ namespace ofc {
             }
         };
 
-        // Порядок важен для детерминированной канонизации.
-        // Проходим по всем известным картам в строго определенном порядке.
         for (const auto& card : dealt_cards_) process_card_for_mapping(card);
-        // ИСПРАВЛЕНО: всегда обходим игроков в одном порядке (0, 1, ...)
         for (int p_idx = 0; p_idx < num_players_; ++p_idx) {
             for (const auto& card : boards_[p_idx].get_all_cards()) {
                 process_card_for_mapping(card);
@@ -246,25 +246,21 @@ namespace ofc {
             }
         }
 
-        // Назначаем оставшиеся масти, если они не встречались
         for (int i = 0; i < SUIT_COUNT; ++i) {
             if (transform[i] == -1) {
                 transform[i] = canonical_suit_count++;
             }
         }
 
-        // Заполняем suit_map для возврата вызывающему коду
         for (int i = 0; i < SUIT_COUNT; ++i) {
             suit_map[i] = transform[i];
         }
 
-        // Функция для "перекрашивания" карты
         auto remap_card = [&](Card& card) {
             if (card == INVALID_CARD) return;
             card = get_rank(card) * 4 + transform[get_suit(card)];
         };
 
-        // Применяем трансформацию ко всем картам в нашей копии состояния
         for (auto& card : canonical_state.dealt_cards_) remap_card(card);
         for (auto& board : canonical_state.boards_) {
             for (auto& card : board.top) remap_card(card);
@@ -275,10 +271,8 @@ namespace ofc {
             for (auto& card : discard_set) remap_card(card);
         }
 
-        // Сортировка для инвариантности к перестановкам
         std::sort(canonical_state.dealt_cards_.begin(), canonical_state.dealt_cards_.end());
         for (auto& board : canonical_state.boards_) {
-            // ИСПРАВЛЕНО: Корректная сортировка с сохранением INVALID_CARD
             auto sort_row = [](auto& row) {
                 CardSet valid_cards;
                 for (Card c : row) {
