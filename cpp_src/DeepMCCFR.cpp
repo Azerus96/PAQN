@@ -15,9 +15,10 @@
 
 namespace ofc {
 
-// ... (Вспомогательные функции action_to_vector и add_dirichlet_noise остаются без изменений) ...
-std::vector<float> action_to_vector(const Action& action);
-void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng);
+// Инициализация статического счетчика
+std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
+
+// Вспомогательные функции (без изменений)
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -39,9 +40,7 @@ std::vector<float> action_to_vector(const Action& action) {
     return vec;
 }
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng) {
-    if (strategy.empty()) {
-        return;
-    }
+    if (strategy.empty()) { return; }
     std::gamma_distribution<float> gamma(alpha, 1.0f);
     std::vector<float> noise(strategy.size());
     float noise_sum = 0.0f;
@@ -72,10 +71,11 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, Sha
 {}
 
 void DeepMCCFR::run_traversal() {
+    uint64_t traversal_id = ++traversal_counter_;
     GameState state; 
-    traverse(state, 0, true);
+    traverse(state, 0, true, traversal_id);
     state.reset(); 
-    traverse(state, 1, true);
+    traverse(state, 1, true, traversal_id);
 }
 
 std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view) {
@@ -110,7 +110,7 @@ std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view)
     return features;
 }
 
-std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root) {
+std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root, uint64_t traversal_id) {
     if (state.is_terminal()) {
         auto payoffs = state.get_payoffs(evaluator_);
         return {{0, payoffs.first}, {1, payoffs.second}};
@@ -125,7 +125,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
     if (num_actions == 0) {
         state.apply_action({{}, INVALID_CARD}, traversing_player, undo_info);
-        auto result = traverse(state, traversing_player, false);
+        auto result = traverse(state, traversing_player, false, traversal_id);
         state.undo_action(undo_info, traversing_player);
         return result;
     }
@@ -133,7 +133,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     if (current_player != traversing_player) {
         int action_idx = std::uniform_int_distribution<int>(0, num_actions - 1)(rng_);
         state.apply_action(legal_actions[action_idx], traversing_player, undo_info);
-        auto result = traverse(state, traversing_player, false);
+        auto result = traverse(state, traversing_player, false, traversal_id);
         state.undo_action(undo_info, traversing_player);
         return result;
     }
@@ -169,18 +169,20 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
             cv.notify_one();
         };
 
-        policy_callback_(infoset_vec, canonical_action_vectors, responder);
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << " | TR_ID: " << traversal_id << "] Calling Policy CB. Actions: " << num_actions << std::endl << std::flush;
+        policy_callback_(traversal_id, infoset_vec, canonical_action_vectors, responder);
 
         py::gil_scoped_release release;
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << " | TR_ID: " << traversal_id << "] Waiting for Policy response..." << std::endl << std::flush;
         std::unique_lock<std::mutex> lk(m);
         cv.wait(lk, [&]{ return ready; });
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << " | TR_ID: " << traversal_id << "] Policy response received." << std::endl << std::flush;
     }
 
     std::vector<float> strategy(num_actions);
     if (!logits.empty()) {
         float max_logit = -std::numeric_limits<float>::infinity();
         for(float l : logits) if(l > max_logit) max_logit = l;
-
         float sum_exp = 0.0f;
         for (int i = 0; i < num_actions; ++i) {
             strategy[i] = std::exp(logits[i] - max_logit);
@@ -204,7 +206,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
     for (int i = 0; i < num_actions; ++i) {
         state.apply_action(legal_actions[i], traversing_player, undo_info);
-        action_payoffs[i] = traverse(state, traversing_player, false);
+        action_payoffs[i] = traverse(state, traversing_player, false, traversal_id);
         state.undo_action(undo_info, traversing_player);
         for(auto const& [player_idx, payoff] : action_payoffs[i]) {
             node_payoffs[player_idx] += strategy[i] * payoff;
@@ -225,11 +227,14 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
             cv.notify_one();
         };
 
-        value_callback_(infoset_vec, responder);
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << " | TR_ID: " << traversal_id << "] Calling Value CB." << std::endl << std::flush;
+        value_callback_(traversal_id, infoset_vec, responder);
 
         py::gil_scoped_release release;
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << " | TR_ID: " << traversal_id << "] Waiting for Value response..." << std::endl << std::flush;
         std::unique_lock<std::mutex> lk(m);
         cv.wait(lk, [&]{ return ready; });
+        std::cout << "[C++ TID: " << std::this_thread::get_id() << " | TR_ID: " << traversal_id << "] Value response received." << std::endl << std::flush;
     }
 
     value_buffer_->push(infoset_vec, dummy_action_vec_, node_payoffs.at(current_player));
