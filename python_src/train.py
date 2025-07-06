@@ -17,9 +17,14 @@ from .model import PolicyNetwork, ValueNetwork
 from ofc_engine import DeepMCCFR, ReplayBuffer, initialize_evaluator
 
 # --- Настройки ---
-NUM_CPP_WORKERS = int(os.cpu_count() - 16) if (os.cpu_count() or 0) > 20 else 8
-NUM_INFERENCE_WORKERS = 16
+# Оставляем достаточно ядер для C++ воркеров, но и для инференса
+NUM_CPP_WORKERS = int(os.cpu_count() * 0.75) if (os.cpu_count() or 0) > 4 else 2
+NUM_INFERENCE_WORKERS = int(os.cpu_count() * 0.25) if (os.cpu_count() or 0) > 4 else 2
+if NUM_INFERENCE_WORKERS == 0: NUM_INFERENCE_WORKERS = 1
+if NUM_CPP_WORKERS == 0: NUM_CPP_WORKERS = 1
 
+
+# Настраиваем OMP/MKL для PyTorch
 COMPUTATION_THREADS = str(NUM_INFERENCE_WORKERS)
 os.environ['OMP_NUM_THREADS'] = COMPUTATION_THREADS
 os.environ['OPENBLAS_NUM_THREADS'] = COMPUTATION_THREADS
@@ -46,7 +51,7 @@ print("Initializing C++ hand evaluator lookup tables...", flush=True)
 initialize_evaluator()
 print("C++ evaluator initialized successfully.", flush=True)
 
-inference_task_queue = queue.Queue(maxsize=NUM_CPP_WORKERS * 4)
+inference_task_queue = queue.Queue(maxsize=NUM_CPP_WORKERS * 8)
 
 def policy_inference_callback(traversal_id, infoset, action_vectors, responder_callback):
     inference_task_queue.put(("POLICY", traversal_id, infoset, action_vectors, responder_callback))
@@ -69,7 +74,7 @@ class InferenceWorker(threading.Thread):
         self.value_net.eval()
         while not self.stop_event.is_set():
             try:
-                task = self.task_queue.get()
+                task = self.task_queue.get(timeout=1.0)
                 if task is None: break
 
                 task_type, traversal_id, infoset, action_vectors, responder_callback = task
@@ -92,14 +97,20 @@ class InferenceWorker(threading.Thread):
                     responder_callback(prediction)
 
                 self.task_queue.task_done()
+            except queue.Empty:
+                continue
             except Exception:
                 traceback.print_exc()
     
     def stop(self):
         self.stop_event.set()
-        self.task_queue.put(None)
+        for _ in range(NUM_INFERENCE_WORKERS):
+            try:
+                self.task_queue.put_nowait(None)
+            except queue.Full:
+                pass
 
-def main():
+def main(profiling_mode=False):
     device = torch.device("cpu")
     print(f"Using device: {device}", flush=True)
 
@@ -135,7 +146,6 @@ def main():
     policy_losses = deque(maxlen=100)
     value_losses = deque(maxlen=100)
 
-    # Запускаем C++ воркеры в ThreadPoolExecutor
     main_executor = ThreadPoolExecutor(max_workers=NUM_CPP_WORKERS)
     
     def worker_loop(solver):
@@ -151,12 +161,16 @@ def main():
         main_executor.submit(worker_loop, s)
     
     last_report_time = time.time()
-    last_save_time = time.time()
+    start_time = time.time()
     last_report_head = 0
     
-    while not stop_event.is_set():
-        try:
-            time.sleep(1.0)
+    try:
+        while not stop_event.is_set():
+            if profiling_mode and (time.time() - start_time > 60):
+                print("Profiling time limit reached (60s). Stopping...")
+                break
+
+            time.sleep(0.5)
 
             if value_buffer.get_count() >= BATCH_SIZE:
                 value_net.train()
@@ -165,6 +179,7 @@ def main():
                 value_optimizer.zero_grad()
                 loss = value_criterion(value_net(infosets), targets)
                 loss.backward()
+                clip_grad_norm_(value_net.parameters(), 1.0)
                 value_optimizer.step()
                 value_losses.append(loss.item())
                 value_net.eval()
@@ -177,12 +192,14 @@ def main():
                 logits = policy_net(infosets, actions)
                 loss = policy_criterion(logits, advantages)
                 loss.backward()
+                clip_grad_norm_(policy_net.parameters(), 1.0)
                 policy_optimizer.step()
                 policy_losses.append(loss.item())
                 policy_net.eval()
             
             now = time.time()
             if now - last_report_time > 15.0:
+                # --- ВОССТАНОВЛЕННЫЙ БЛОК ОТЧЕТА ---
                 duration = now - last_report_time
                 current_head = policy_buffer.get_head()
                 samples_generated_interval = current_head - last_report_head
@@ -201,45 +218,38 @@ def main():
                 print(f"Avg Losses (last 100) -> Policy: {avg_p_loss:.6f} | Value: {avg_v_loss:.6f}", flush=True)
                 print(f"Inference Queue Size: {inference_task_queue.qsize()}", flush=True)
                 print("="*54, flush=True)
+                # --- КОНЕЦ БЛОКА ОТЧЕТА ---
                 
                 last_report_time = now
 
-        except KeyboardInterrupt:
-            print("\nTraining interrupted by user.", flush=True)
-            break
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.", flush=True)
+    finally:
+        print("Stopping all workers...", flush=True)
+        stop_event.set()
+        
+        main_executor.shutdown(wait=True)
+        
+        for worker in inference_workers:
+            worker.stop()
+        for worker in inference_workers:
+            worker.join()
 
-    print("Stopping all workers...", flush=True)
-    stop_event.set()
-    
-    main_executor.shutdown(wait=True)
-    
-    for worker in inference_workers:
-        worker.stop()
-    for worker in inference_workers:
-        worker.join()
-
-    print("All Python workers stopped.")
-
-    print("Final model saving...", flush=True)
-    torch.save(policy_net.state_dict(), f"{POLICY_MODEL_PATH}.final")
-    torch.save(value_net.state_dict(), f"{VALUE_MODEL_PATH}.final")
-    print("Training finished.")
+        print("All Python workers stopped.")
+        print("Training finished.")
 
 def profile_main():
     """Обертка для cProfile."""
     profiler = cProfile.Profile()
     try:
         profiler.enable()
-        main()
+        main(profiling_mode=True)
     finally:
         profiler.disable()
         print("\n\n" + "="*20 + " cProfile Report " + "="*20)
         stats = pstats.Stats(profiler).sort_stats('cumulative')
-        stats.print_stats(30) # Печатаем 30 самых "тяжелых" функций
+        stats.print_stats(40)
 
 if __name__ == "__main__":
-    # Для обычного запуска:
-    main()
-    
-    # Для запуска с профилированием Python-части, раскомментируйте следующую строку:
-    # profile_main()
+    # Для запуска с профилированием Python-части
+    profile_main()
