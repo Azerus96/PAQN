@@ -4,18 +4,33 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
-#include "constants.hpp" // <-- Добавим для ACTION_VECTOR_SIZE
+#include <variant> // Используем variant для хранения разных типов данных
+#include "constants.hpp"
 
-// Запрос на инференс, который C++ отправляет в Python
-struct InferenceRequest {
+namespace ofc {
+
+// Данные для запроса к Policy Network
+struct PolicyRequestData {
     std::vector<float> infoset;
-    // ИЗМЕНЕНО: Вместо количества действий передаем сами векторы действий
     std::vector<std::vector<float>> action_vectors;
-    std::promise<std::vector<float>> promise;
-    // num_actions больше не нужен, его можно определить из action_vectors.size()
 };
 
-// Потокобезопасная очередь для запросов
+// Данные для запроса к Value Network
+struct ValueRequestData {
+    std::vector<float> infoset;
+};
+
+// Универсальный запрос на инференс
+struct InferenceRequest {
+    // std::variant - более современный и безопасный аналог union
+    std::variant<PolicyRequestData, ValueRequestData> data;
+
+    // Promise будет возвращать вектор float в обоих случаях
+    // Для Policy - вектор логитов, для Value - вектор из одного элемента (ценность)
+    std::promise<std::vector<float>> promise;
+};
+
+// Потокобезопасная очередь для запросов (без изменений)
 class InferenceQueue {
 public:
     void push(InferenceRequest&& request) {
@@ -25,7 +40,6 @@ public:
         cv_.notify_one();
     }
 
-    // Забирает все запросы из очереди, не блокируя
     std::vector<InferenceRequest> pop_all() {
         std::vector<InferenceRequest> requests;
         {
@@ -39,7 +53,6 @@ public:
         return requests;
     }
 
-    // Ждет, пока в очереди не появится хотя бы один элемент
     void wait() {
         std::unique_lock<std::mutex> lock(mtx_);
         cv_.wait(lock, [this] { return !queue_.empty(); });
@@ -50,3 +63,5 @@ private:
     std::mutex mtx_;
     std::condition_variable cv_;
 };
+
+} // namespace ofc
