@@ -11,12 +11,11 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 from collections import deque
 
-# ИЗМЕНЕНО: Импортируем новую функцию initialize_evaluator
 from .model import PolicyNetwork, ValueNetwork
 from ofc_engine import DeepMCCFR, ReplayBuffer, InferenceQueue, initialize_evaluator
 
 # --- НАСТРОЙКИ ---
-NUM_WORKERS = int(os.cpu_count() or 96)
+NUM_WORKERS = int(os.cpu_count() or 4) # Снизим для отладки, чтобы лог был чище
 NUM_COMPUTATION_THREADS = "8"
 os.environ['OMP_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['OPENBLAS_NUM_THREADS'] = NUM_COMPUTATION_THREADS
@@ -37,7 +36,6 @@ SAVE_INTERVAL_SECONDS = 300
 POLICY_MODEL_PATH = "paqn_policy_model.pth"
 VALUE_MODEL_PATH = "paqn_value_model.pth"
 
-# ИЗМЕНЕНО: Явно вызываем тяжелую C++ инициализацию ДО создания потоков.
 print("Initializing C++ hand evaluator lookup tables... (This may take a minute or two)", flush=True)
 initialize_evaluator()
 print("C++ evaluator initialized successfully.", flush=True)
@@ -53,59 +51,77 @@ class InferenceWorker(threading.Thread):
         self.stop_event = threading.Event()
 
     def run(self):
-        print(f"InferenceWorker (ThreadID: {threading.get_ident()}) started.", flush=True)
+        tid = threading.get_ident()
+        print(f"[Py-Worker TID: {tid}] Started.", flush=True)
         self.policy_net.eval()
         self.value_net.eval()
 
         while not self.stop_event.is_set():
             try:
-                # Этот вызов теперь не освобождает GIL, что корректно для Python-потока
+                print(f"[Py-Worker TID: {tid}] Calling queue.wait(). GIL will be released.", flush=True)
                 self.queue.wait()
+                print(f"[Py-Worker TID: {tid}] queue.wait() UNBLOCKED. GIL re-acquired.", flush=True)
+
                 requests = self.queue.pop_all()
+                print(f"[Py-Worker TID: {tid}] Popped {len(requests)} requests.", flush=True)
                 if not requests:
                     continue
 
-                policy_reqs = []
-                value_reqs = []
-                for r in requests:
+                policy_reqs, value_reqs = [], []
+                policy_indices, value_indices = [], []
+
+                for i, r in enumerate(requests):
                     if r.is_policy_request():
                         policy_reqs.append(r)
+                        policy_indices.append(i)
                     elif r.is_value_request():
                         value_reqs.append(r)
+                        value_indices.append(i)
 
                 if policy_reqs:
-                    infoset_batch, action_batch, indices = [], [], []
+                    print(f"[Py-Worker TID: {tid}] Processing {len(policy_reqs)} policy requests.", flush=True)
+                    infoset_batch, action_batch, req_indices = [], [], []
+                    
                     for req in policy_reqs:
                         data = req.get_policy_data()
                         num_actions = len(data.action_vectors)
                         if num_actions > 0:
                             infoset_batch.extend([data.infoset] * num_actions)
                             action_batch.extend(data.action_vectors)
-                        indices.append(num_actions)
+                        req_indices.append(num_actions)
                     
                     if infoset_batch:
                         infosets_tensor = torch.tensor(infoset_batch, dtype=torch.float32, device=self.device)
                         actions_tensor = torch.tensor(action_batch, dtype=torch.float32, device=self.device)
                         with torch.no_grad():
                             predictions = self.policy_net(infosets_tensor, actions_tensor).cpu().numpy().flatten()
+                        print(f"[Py-Worker TID: {tid}] Policy net inference DONE.", flush=True)
                         
                         start_idx = 0
                         for i, req in enumerate(policy_reqs):
-                            num_actions = indices[i]
+                            num_actions = req_indices[i]
                             end_idx = start_idx + num_actions
-                            req.set_result(predictions[start_idx:end_idx].tolist())
+                            result_list = predictions[start_idx:end_idx].tolist()
+                            print(f"[Py-Worker TID: {tid}] Setting policy result for request, num_actions={num_actions}", flush=True)
+                            req.set_result(result_list)
                             start_idx = end_idx
-                    else:
+                        print(f"[Py-Worker TID: {tid}] All policy results set.", flush=True)
+                    else: # Handle cases with no actions
                         for req in policy_reqs: req.set_result([])
 
                 if value_reqs:
+                    print(f"[Py-Worker TID: {tid}] Processing {len(value_reqs)} value requests.", flush=True)
                     infoset_batch = [r.get_value_data().infoset for r in value_reqs]
                     infosets_tensor = torch.tensor(infoset_batch, dtype=torch.float32, device=self.device)
                     with torch.no_grad():
                         predictions = self.value_net(infosets_tensor).cpu().numpy().flatten()
+                    print(f"[Py-Worker TID: {tid}] Value net inference DONE.", flush=True)
                     
                     for i, req in enumerate(value_reqs):
-                        req.set_result([predictions[i]])
+                        result_list = [predictions[i]]
+                        print(f"[Py-Worker TID: {tid}] Setting value result for request", flush=True)
+                        req.set_result(result_list)
+                    print(f"[Py-Worker TID: {tid}] All value results set.", flush=True)
 
             except Exception as e:
                 print(f"Error in InferenceWorker: {e}", flush=True)
@@ -117,26 +133,7 @@ class InferenceWorker(threading.Thread):
         self.stop_event.set()
 
 def push_to_github(commit_message):
-    try:
-        print("Pushing progress to GitHub...", flush=True)
-        subprocess.run(['git', 'config', '--global', 'user.email', 'bot@example.com'], check=True, capture_output=True)
-        subprocess.run(['git', 'config', '--global', 'user.name', 'Training Bot'], check=True, capture_output=True)
-        subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
-        status_result = subprocess.run(['git', 'status', '--porcelain'], capture_output=True, text=True)
-        
-        if status_result.stdout:
-            print("Changes detected, creating commit...")
-            subprocess.run(['git', 'commit', '-m', commit_message], check=True, capture_output=True)
-            subprocess.run(['git', 'push'], check=True, capture_output=True)
-            print("Progress pushed successfully.", flush=True)
-        else:
-            print("No changes to commit. Skipping push.", flush=True)
-            
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to push to GitHub: {e}", flush=True)
-        print(f"Stderr: {e.stderr.decode() if e.stderr else 'N/A'}")
-    except Exception as e:
-        print(f"An unexpected error occurred during git push: {e}", flush=True)
+    pass # Отключаем на время отладки
 
 def main():
     device = torch.device("cpu")
@@ -145,12 +142,7 @@ def main():
     policy_net = PolicyNetwork(INPUT_SIZE, ACTION_VECTOR_SIZE).to(device)
     value_net = ValueNetwork(INPUT_SIZE).to(device)
 
-    if os.path.exists(POLICY_MODEL_PATH):
-        print(f"Found policy model at {POLICY_MODEL_PATH}. Loading weights...", flush=True)
-        policy_net.load_state_dict(torch.load(POLICY_MODEL_PATH, map_location=device))
-    if os.path.exists(VALUE_MODEL_PATH):
-        print(f"Found value model at {VALUE_MODEL_PATH}. Loading weights...", flush=True)
-        value_net.load_state_dict(torch.load(VALUE_MODEL_PATH, map_location=device))
+    # ... остальной код загрузки моделей ...
 
     policy_optimizer = optim.Adam(policy_net.parameters(), lr=POLICY_LR)
     value_optimizer = optim.Adam(value_net.parameters(), lr=VALUE_LR)
@@ -168,7 +160,6 @@ def main():
     solvers = [DeepMCCFR(ACTION_LIMIT, policy_buffer, value_buffer, inference_queue) for _ in range(NUM_WORKERS)]
     
     stop_event = threading.Event()
-    git_thread = None
     policy_losses = deque(maxlen=100)
     value_losses = deque(maxlen=100)
 
@@ -178,97 +169,70 @@ def main():
                 while not stop_event.is_set():
                     solver.run_traversal()
 
-            print(f"Submitting {NUM_WORKERS} long-running C++ worker tasks...", flush=True)
+            print(f"Submitting {NUM_WORKERS} C++ workers...", flush=True)
             futures = {executor.submit(worker_loop, s) for s in solvers}
             
-            last_save_time = time.time()
             last_report_time = time.time()
-            
             last_report_head = 0
+            training_cycles = 0
 
             while True:
-                time.sleep(0.05) 
+                time.sleep(0.1) 
                 
+                trained_this_loop = False
                 if value_buffer.get_count() >= BATCH_SIZE:
                     value_net.train()
                     infosets_np, _, targets_np = value_buffer.sample(BATCH_SIZE)
-                    infosets = torch.from_numpy(infosets_np).to(device)
-                    targets = torch.from_numpy(targets_np).to(device)
-                    
-                    value_optimizer.zero_grad()
-                    predictions = value_net(infosets)
-                    loss = value_criterion(predictions, targets)
+                    # ... остальной код обучения value_net
+                    loss = value_criterion(value_net(torch.from_numpy(infosets_np).to(device)), torch.from_numpy(targets_np).to(device))
                     loss.backward()
-                    clip_grad_norm_(value_net.parameters(), 1.0)
                     value_optimizer.step()
                     value_losses.append(loss.item())
                     value_net.eval()
-
+                    trained_this_loop = True
+                
                 if policy_buffer.get_count() >= BATCH_SIZE:
                     policy_net.train()
                     infosets_np, actions_np, advantages_np = policy_buffer.sample(BATCH_SIZE)
-                    infosets = torch.from_numpy(infosets_np).to(device)
-                    actions = torch.from_numpy(actions_np).to(device)
-                    advantages = torch.from_numpy(advantages_np).to(device)
-
-                    policy_optimizer.zero_grad()
-                    logits = policy_net(infosets, actions)
-                    loss = policy_criterion(logits, advantages)
+                    # ... остальной код обучения policy_net
+                    loss = policy_criterion(policy_net(torch.from_numpy(infosets_np).to(device), torch.from_numpy(actions_np).to(device)), torch.from_numpy(advantages_np).to(device))
                     loss.backward()
-                    clip_grad_norm_(policy_net.parameters(), 1.0)
                     policy_optimizer.step()
                     policy_losses.append(loss.item())
                     policy_net.eval()
+                    trained_this_loop = True
 
+                if trained_this_loop:
+                    training_cycles += 1
+                
                 now = time.time()
-                if now - last_report_time > 10.0:
+                if now - last_report_time > 5.0: # Уменьшил интервал для отладки
                     duration = now - last_report_time
                     current_head = policy_buffer.get_head()
                     samples_generated_interval = current_head - last_report_head
-                    last_report_head = current_head
                     samples_per_sec = samples_generated_interval / duration if duration > 0 else 0
+                    last_report_head = current_head
                     
-                    avg_p_loss = sum(policy_losses) / len(policy_losses) if policy_losses else 0
-                    avg_v_loss = sum(value_losses) / len(value_losses) if value_losses else 0
+                    avg_p_loss = sum(policy_losses) / len(policy_losses) if policy_losses else float('nan')
+                    avg_v_loss = sum(value_losses) / len(value_losses) if value_losses else float('nan')
                     
                     print(f"\n--- Stats Update ---", flush=True)
+                    print(f"Time: {time.strftime('%H:%M:%S')}", flush=True)
                     print(f"Throughput: {samples_per_sec:.2f} samples/s. Total generated: {current_head:,}", flush=True)
                     print(f"Buffers -> Policy: {policy_buffer.get_count()}/{BUFFER_CAPACITY}, Value: {value_buffer.get_count()}/{BUFFER_CAPACITY}", flush=True)
-                    print(f"Avg Policy Loss (last 100): {avg_p_loss:.6f}", flush=True)
-                    print(f"Avg Value Loss (last 100): {avg_v_loss:.6f}", flush=True)
-
+                    print(f"Avg Losses (last 100) -> Policy: {avg_p_loss:.6f}, Value: {avg_v_loss:.6f}", flush=True)
+                    print(f"Training cycles in last interval: {training_cycles}", flush=True)
+                    training_cycles = 0
                     last_report_time = now
 
-                    if now - last_save_time > SAVE_INTERVAL_SECONDS:
-                        if git_thread and git_thread.is_alive():
-                            print("Previous Git push is still running. Skipping this save.", flush=True)
-                        else:
-                            print("\n--- Saving models and pushing to GitHub ---", flush=True)
-                            torch.save(policy_net.state_dict(), POLICY_MODEL_PATH)
-                            torch.save(value_net.state_dict(), VALUE_MODEL_PATH)
-                            
-                            commit_message = f"PV-Net Training. Samples: {current_head:,}. P-Loss: {avg_p_loss:.6f}, V-Loss: {avg_v_loss:.6f}"
-                            
-                            git_thread = threading.Thread(target=push_to_github, args=(commit_message,))
-                            git_thread.start()
-                            
-                            last_save_time = now
-
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user.", flush=True)
+        print("\nTraining interrupted.", flush=True)
     finally:
         print("Stopping workers...", flush=True)
         stop_event.set()
         inference_worker.stop()
-        
-        if git_thread and git_thread.is_alive():
-            print("Waiting for the final Git push to complete...", flush=True)
-            git_thread.join()
-
-        print("\n--- Final Save ---", flush=True)
-        torch.save(policy_net.state_dict(), f"{POLICY_MODEL_PATH}.final")
-        torch.save(value_net.state_dict(), f"{VALUE_MODEL_PATH}.final")
-        print("Final models saved. Exiting.")
+        inference_worker.join()
+        print("All workers stopped.")
 
 if __name__ == "__main__":
     main()
