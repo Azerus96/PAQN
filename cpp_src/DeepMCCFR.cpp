@@ -16,7 +16,7 @@ namespace ofc {
 
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
 
-// Вспомогательные функции (без изменений)
+// ... (вспомогательные функции без изменений) ...
 std::vector<float> action_to_vector(const Action& action);
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng);
 std::vector<float> action_to_vector(const Action& action) {
@@ -160,14 +160,10 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
             logits = std::move(result);
             ready.store(true, std::memory_order_release);
         };
-        
-        if (policy_callback_) {
+        {
             py::gil_scoped_acquire acquire;
             policy_callback_(traversal_id, infoset_vec, canonical_action_vectors, responder);
-        } else {
-            responder({});
         }
-
         while (!ready.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
@@ -214,14 +210,10 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
             value_baseline = result;
             ready.store(true, std::memory_order_release);
         };
-        
-        if (value_callback_) {
+        {
             py::gil_scoped_acquire acquire;
             value_callback_(traversal_id, infoset_vec, responder);
-        } else {
-            responder(0.0f);
         }
-
         while (!ready.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
@@ -237,4 +229,4 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     return node_payoffs;
 }
 
-} // namespace ofc
+}
