@@ -10,7 +10,7 @@
 #include <random>
 #include <chrono>
 #include <thread>
-#include <atomic> // Для std::atomic
+#include <atomic>
 
 namespace ofc {
 
@@ -160,10 +160,14 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
             logits = std::move(result);
             ready.store(true, std::memory_order_release);
         };
-        {
+        
+        if (policy_callback_) {
             py::gil_scoped_acquire acquire;
             policy_callback_(traversal_id, infoset_vec, canonical_action_vectors, responder);
+        } else {
+            responder({});
         }
+
         while (!ready.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
@@ -210,10 +214,14 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
             value_baseline = result;
             ready.store(true, std::memory_order_release);
         };
-        {
+        
+        if (value_callback_) {
             py::gil_scoped_acquire acquire;
             value_callback_(traversal_id, infoset_vec, responder);
+        } else {
+            responder(0.0f);
         }
+
         while (!ready.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
