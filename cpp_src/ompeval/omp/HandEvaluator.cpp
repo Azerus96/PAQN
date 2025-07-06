@@ -24,26 +24,22 @@ uint16_t HandEvaluator::LOOKUP[]{};
 uint16_t* HandEvaluator::ORIG_LOOKUP = nullptr;
 uint16_t HandEvaluator::FLUSH_LOOKUP[]{};
 const unsigned HandEvaluator::MAX_KEY = 4 * RANKS[12] + 3 * RANKS[11];
+
+// ИЗМЕНЕНО: Добавлена инициализация статического флага
+bool HandEvaluator::is_initialized = false;
+
+// ИЗМЕНЕНО: Убрана статическая инициализация из конструктора
 bool HandEvaluator::cardInit = (initCardConstants(), true);
 
-// Does a thread-safe (guaranteed by C++11) one time initialization of static data.
 HandEvaluator::HandEvaluator()
 {
-    static bool initVar = (staticInit(), true);
-    (void)initVar;
+    // Конструктор теперь пуст. Вся тяжелая работа вынесена в initialize().
+    // Можно добавить проверку, но это не обязательно, т.к. мы управляем этим из Python.
+    omp_assert(is_initialized && "HandEvaluator must be initialized by calling HandEvaluator::initialize() before use.");
 }
 
-// Initialize card constants.
-void HandEvaluator::initCardConstants()
-{
-    for (unsigned c = 0; c < CARD_COUNT; ++c) {
-        unsigned rank = c / 4, suit = c % 4;
-        Hand::CARDS[c] = Hand((1ull << (4 * suit + Hand::SUITS_SHIFT)) + (1ull << Hand::CARD_COUNT_SHIFT)
-                              + RANKS[rank], 1ull << ((3 - suit) * 16 + rank));
-    }
-}
-
-// Initialize static class data.
+// Does a thread-safe (guaranteed by C++11) one time initialization of static data.
+// ИЗМЕНЕНО: Эта функция теперь вызывается явно, а не через "магию" со static.
 void HandEvaluator::staticInit()
 {
     // Temporary table for hash recalculation.
@@ -103,6 +99,16 @@ void HandEvaluator::staticInit()
     if (RECALCULATE_PERF_HASH_OFFSETS) {
         calculatePerfectHashOffsets();
         delete[] ORIG_LOOKUP;
+    }
+}
+
+// Initialize card constants.
+void HandEvaluator::initCardConstants()
+{
+    for (unsigned c = 0; c < CARD_COUNT; ++c) {
+        unsigned rank = c / 4, suit = c % 4;
+        Hand::CARDS[c] = Hand((1ull << (4 * suit + Hand::SUITS_SHIFT)) + (1ull << Hand::CARD_COUNT_SHIFT)
+                              + RANKS[rank], 1ull << ((3 - suit) * 16 + rank));
     }
 }
 
