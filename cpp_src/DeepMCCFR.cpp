@@ -1,4 +1,3 @@
-// --- START OF FILE PAQN-main/cpp_src/DeepMCCFR.cpp ---
 #include "DeepMCCFR.hpp"
 #include "constants.hpp"
 #include <stdexcept>
@@ -8,7 +7,9 @@
 #include <map>
 #include <cmath>
 #include <vector>
-#include <random> // Добавлен для std::gamma_distribution
+#include <random>
+#include <chrono>  // Добавлено для неблокирующего сида
+#include <thread>  // Добавлено для неблокирующего сида
 
 namespace ofc {
 
@@ -71,7 +72,9 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, Sha
       policy_buffer_(policy_buffer), 
       value_buffer_(value_buffer),
       inference_queue_(queue), 
-      rng_(std::random_device{}()),
+      // ИЗМЕНЕНО: Используем неблокирующий сид на основе времени и ID потока, чтобы избежать блокировки
+      rng_(static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + 
+           static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))),
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
 {}
 
@@ -178,7 +181,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::promise<std::vector<float>> promise;
         auto future = promise.get_future();
         InferenceRequest request;
-        // ИЗМЕНЕНО: Простое и безопасное присваивание благодаря std::variant
         request.data = PolicyRequestData{infoset_vec, canonical_action_vectors};
         request.promise = std::move(promise);
         inference_queue_->push(std::move(request));
@@ -229,7 +231,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::promise<std::vector<float>> promise;
         auto future = promise.get_future();
         InferenceRequest request;
-        // ИЗМЕНЕНО: Простое и безопасное присваивание благодаря std::variant
         request.data = ValueRequestData{infoset_vec};
         request.promise = std::move(promise);
         inference_queue_->push(std::move(request));
@@ -241,7 +242,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
     // 6. Сохраняем данные в буферы
     // 6.1. Для ValueNetwork: (инфосет, ценность узла)
-    // В качестве action_vec передаем фиктивный вектор, он не будет использоваться при обучении value_net
     value_buffer_->push(infoset_vec, dummy_action_vec_, node_payoffs.at(current_player));
 
     // 6.2. Для PolicyNetwork: (инфосет, действие, преимущество)
@@ -253,4 +253,3 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     return node_payoffs;
 }
 } // namespace ofc
-// --- END OF FILE PAQN-main/cpp_src/DeepMCCFR.cpp ---
