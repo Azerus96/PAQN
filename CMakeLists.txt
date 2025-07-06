@@ -1,6 +1,4 @@
-# PAQN-main/CMakeLists.txt (ИСПРАВЛЕННАЯ ВЕРСИЯ 5.0 - ПУЛЕНЕПРОБИВАЕМАЯ)
-
-cmake_minimum_required(VERSION 3.14) # Поднимаем версию для лучших практик
+cmake_minimum_required(VERSION 3.14)
 project(OFCEngine LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -13,7 +11,8 @@ include(FetchContent)
 FetchContent_Declare(
   pybind11
   GIT_REPOSITORY https://github.com/pybind/pybind11.git
-  GIT_TAG v2.13.1
+  # ИЗМЕНЕНО: Используем стабильную и проверенную версию v2.11.1
+  GIT_TAG v2.11.1
 )
 FetchContent_MakeAvailable(pybind11)
 
@@ -36,8 +35,6 @@ set(SOURCES
 )
 
 # --- Создание цели (Python модуль) ---
-# Используем pybind11_add_module для создания модуля
-# SHARED - означает, что мы создаем .so файл
 pybind11_add_module(ofc_engine SHARED ${SOURCES})
 
 
@@ -51,18 +48,11 @@ target_include_directories(ofc_engine PRIVATE
 )
 
 # 2. Линкуем зависимости
-# Это САМЫЙ ВАЖНЫЙ БЛОК.
-# Мы линкуем ofc_engine с целями, которые предоставляют зависимости.
-# CMake автоматически разрешит все пути к заголовочным файлам и библиотекам.
 target_link_libraries(ofc_engine PRIVATE
-    # Линковка с pybind11::module автоматически подтягивает pybind11::headers
-    # и решает проблему с "variant.h not found".
-    pybind11::module
-    
-    # Линковка с библиотеками PyTorch
+    # ИЗМЕНЕНО: Возвращаемся к линковке с основной целью pybind11.
+    # В версии 2.11.1 это работает надежно.
+    pybind11::embed
     ${TORCH_LIBRARIES}
-    
-    # Линковка с OpenMP
     OpenMP::OpenMP_CXX
 )
 
@@ -70,7 +60,7 @@ target_link_libraries(ofc_engine PRIVATE
 target_compile_options(ofc_engine PRIVATE -O3 -g)
 
 
-# --- Отладочные сообщения (опционально, но полезно) ---
+# --- Отладочные сообщения ---
 message(STATUS "Pybind11 version: ${pybind11_VERSION}")
 message(STATUS "Torch libraries: ${TORCH_LIBRARIES}")
 message(STATUS "Torch include dirs: ${TORCH_INCLUDE_DIRS}")
