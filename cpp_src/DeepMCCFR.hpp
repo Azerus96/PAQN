@@ -12,23 +12,21 @@ namespace ofc {
 
 class DeepMCCFR {
 public:
-    DeepMCCFR(size_t action_limit, SharedReplayBuffer* buffer, InferenceQueue* queue);
+    // Конструктор теперь принимает два указателя на буферы
+    DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer, InferenceQueue* queue);
     
     void run_traversal();
 
 private:
-    // --- УДАЛЕНО: Константа EPSILON для ε-greedy больше не нужна. ---
-
     HandEvaluator evaluator_;
-    SharedReplayBuffer* replay_buffer_; 
+    SharedReplayBuffer* policy_buffer_; // Буфер для (s, a, advantage)
+    SharedReplayBuffer* value_buffer_;  // Буфер для (s, value)
     InferenceQueue* inference_queue_;
     size_t action_limit_;
     std::mt19937 rng_;
+    std::vector<float> dummy_action_vec_; // Фиктивный вектор для value_buffer
 
-    // --- ИЗМЕНЕНИЕ: Добавлен параметр is_root для отслеживания корневого узла обхода. ---
-    // Это необходимо, чтобы применять шум Дирихле только один раз в начале обхода для каждого игрока.
     std::map<int, float> traverse(GameState& state, int traversing_player, bool is_root);
-    
     std::vector<float> featurize(const GameState& state, int player_view);
 };
 
