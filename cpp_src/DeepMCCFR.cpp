@@ -5,12 +5,15 @@
 #include <numeric>
 #include <algorithm>
 #include <map>
-#include <random>
+#include <cmath>
+#include <vector>
+#include <random> // Добавлен для std::gamma_distribution
 
 namespace ofc {
 
+// --- Начало недостающих вспомогательных функций ---
+
 // Вспомогательная функция для преобразования ofc::Action в вектор
-// (Эта функция остается без изменений)
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -36,7 +39,6 @@ std::vector<float> action_to_vector(const Action& action) {
 }
 
 // Вспомогательная функция для добавления шума Дирихле
-// (Эта функция остается без изменений)
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng) {
     if (strategy.empty()) {
         return;
@@ -59,10 +61,18 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
     }
 }
 
+// --- Конец недостающих вспомогательных функций ---
 
-DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* buffer, InferenceQueue* queue) 
-    : action_limit_(action_limit), replay_buffer_(buffer), inference_queue_(queue), rng_(std::random_device{}()) {
-}
+
+// Конструктор
+DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer, InferenceQueue* queue) 
+    : action_limit_(action_limit), 
+      policy_buffer_(policy_buffer), 
+      value_buffer_(value_buffer),
+      inference_queue_(queue), 
+      rng_(std::random_device{}()),
+      dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
+{}
 
 void DeepMCCFR::run_traversal() {
     GameState state; 
@@ -71,8 +81,8 @@ void DeepMCCFR::run_traversal() {
     traverse(state, 1, true);
 }
 
+// Функция featurize
 std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view) {
-    // (Эта функция остается без изменений)
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
     std::vector<float> features(INFOSET_SIZE, 0.0f);
@@ -113,6 +123,8 @@ std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view)
     return features;
 }
 
+
+// Основная функция обхода
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root) {
     if (state.is_terminal()) {
         auto payoffs = state.get_payoffs(evaluator_);
@@ -123,7 +135,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     
     std::vector<Action> legal_actions;
     state.get_legal_actions(action_limit_, legal_actions, rng_);
-    
     int num_actions = legal_actions.size();
     UndoInfo undo_info;
 
@@ -142,10 +153,12 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         return result;
     }
 
-    // --- Логика инференса (без изменений) ---
+    // --- УЗЕЛ ТЕКУЩЕГО ИГРОКА ---
     std::map<int, int> suit_map;
     GameState canonical_state = state.get_canonical(suit_map);
     std::vector<float> infoset_vec = featurize(canonical_state, traversing_player);
+
+    // 1. Запрашиваем у PolicyNetwork логиты для всех действий
     std::vector<std::vector<float>> canonical_action_vectors;
     canonical_action_vectors.reserve(num_actions);
     auto remap_card = [&](Card& card) {
@@ -154,107 +167,86 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     };
     for (const auto& original_action : legal_actions) {
         Action canonical_action = original_action;
-        for (auto& placement : canonical_action.first) {
-            remap_card(placement.first);
-        }
+        for (auto& placement : canonical_action.first) remap_card(placement.first);
         remap_card(canonical_action.second);
         canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
-    std::vector<float> regrets;
+    
+    std::vector<float> logits;
     {
         std::promise<std::vector<float>> promise;
-        std::future<std::vector<float>> future = promise.get_future();
+        auto future = promise.get_future();
         InferenceRequest request;
-        request.infoset = infoset_vec;
-        request.action_vectors = std::move(canonical_action_vectors); 
+        request.data = PolicyRequestData{infoset_vec, canonical_action_vectors};
         request.promise = std::move(promise);
         inference_queue_->push(std::move(request));
-        regrets = future.get();
+        logits = future.get();
     }
 
-    // --- НОВЫЙ БЛОК: НОРМАЛИЗАЦИЯ ПРЕДСКАЗАННЫХ СОЖАЛЕНИЙ ---
-    // Этот блок предотвращает "взрыв" значений сожалений, который приводит к
-    // слишком детерминированной стратегии и коллапсу обучения.
-    if (!regrets.empty()) {
-        float sum_pos_regrets = 0.0f;
-        for (float r : regrets) {
-            if (r > 0) {
-                sum_pos_regrets += r;
-            }
-        }
-
-        // Если сумма положительных сожалений становится слишком большой,
-        // мы масштабируем все предсказанные сожаления. Это не дает стратегии
-        // схлопнуться в одно действие и поддерживает разнообразие.
-        // Порог '1.0' - это настраиваемый гиперпараметр.
-        const float REGRET_SUM_SCALING_THRESHOLD = 1.0f;
-        if (sum_pos_regrets > REGRET_SUM_SCALING_THRESHOLD) { 
-            for (float& r : regrets) {
-                r /= sum_pos_regrets;
-            }
-        }
-    }
-    // --- КОНЕЦ НОВОГО БЛОКА ---
-
-    // 5. Вычисляем стратегию на основе (возможно, нормализованных) сожалений
+    // 2. Превращаем логиты в стратегию через Softmax
     std::vector<float> strategy(num_actions);
-    float total_positive_regret = 0.0f;
-    for (int i = 0; i < num_actions; ++i) {
-        strategy[i] = (regrets[i] > 0) ? regrets[i] : 0.0f;
-        total_positive_regret += strategy[i];
-    }
+    if (!logits.empty()) {
+        float max_logit = -std::numeric_limits<float>::infinity();
+        for(float l : logits) if(l > max_logit) max_logit = l;
 
-    if (total_positive_regret > 1e-6) {
+        float sum_exp = 0.0f;
         for (int i = 0; i < num_actions; ++i) {
-            strategy[i] /= total_positive_regret;
+            strategy[i] = std::exp(logits[i] - max_logit); // Стабильный softmax
+            sum_exp += strategy[i];
+        }
+        if (sum_exp > 1e-6) {
+            for (int i = 0; i < num_actions; ++i) strategy[i] /= sum_exp;
+        } else {
+            std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
         }
     } else {
         std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
     }
 
-    // Добавляем шум Дирихле для исследования, только в корневом узле
+    // 3. Добавляем шум Дирихле
     if (is_root) {
-        const float DIRICHLET_ALPHA = 0.3f;
-        add_dirichlet_noise(strategy, DIRICHLET_ALPHA, rng_);
+        add_dirichlet_noise(strategy, 0.3f, rng_);
     }
 
-    // 6. Обходим дочерние узлы и вычисляем истинные сожаления
-    std::vector<std::map<int, float>> action_utils(num_actions);
-    std::map<int, float> node_util = {{0, 0.0f}, {1, 0.0f}};
+    // 4. Рекурсивно обходим дочерние узлы
+    std::vector<std::map<int, float>> action_payoffs(num_actions);
+    std::map<int, float> node_payoffs = {{0, 0.0f}, {1, 0.0f}};
 
     for (int i = 0; i < num_actions; ++i) {
         state.apply_action(legal_actions[i], traversing_player, undo_info);
-        action_utils[i] = traverse(state, traversing_player, false);
+        action_payoffs[i] = traverse(state, traversing_player, false);
         state.undo_action(undo_info, traversing_player);
-
-        for(auto const& [player_idx, util] : action_utils[i]) {
-            node_util[player_idx] += strategy[i] * util;
+        for(auto const& [player_idx, payoff] : action_payoffs[i]) {
+            node_payoffs[player_idx] += strategy[i] * payoff;
         }
-    }
-
-    std::vector<float> true_regrets(num_actions);
-    for(int i = 0; i < num_actions; ++i) {
-        true_regrets[i] = action_utils[i][current_player] - node_util[current_player];
     }
     
-    // 7. Сохраняем данные в буфер (этот блок без изменений)
-    for (int i = 0; i < num_actions; ++i) {
-        Action canonical_action = legal_actions[i];
-        std::map<int, int> current_suit_map;
-        state.get_canonical(current_suit_map);
-        auto remap_card_for_save = [&](Card& card) {
-            if (card == INVALID_CARD) return;
-            card = get_rank(card) * 4 + current_suit_map.at(get_suit(card));
-        };
-        for (auto& placement : canonical_action.first) {
-            remap_card_for_save(placement.first);
+    // 5. Запрашиваем у ValueNetwork оценку ценности состояния (для baseline)
+    float value_baseline = 0.0f;
+    {
+        std::promise<std::vector<float>> promise;
+        auto future = promise.get_future();
+        InferenceRequest request;
+        request.data = ValueRequestData{infoset_vec};
+        request.promise = std::move(promise);
+        inference_queue_->push(std::move(request));
+        auto result_vec = future.get();
+        if (!result_vec.empty()) {
+            value_baseline = result_vec[0];
         }
-        remap_card_for_save(canonical_action.second);
-        std::vector<float> action_vec = action_to_vector(canonical_action);
-        replay_buffer_->push(infoset_vec, action_vec, true_regrets[i]);
     }
 
-    return node_util;
-}
+    // 6. Сохраняем данные в буферы
+    // 6.1. Для ValueNetwork: (инфосет, ценность узла)
+    // В качестве action_vec передаем фиктивный вектор, он не будет использоваться при обучении value_net
+    value_buffer_->push(infoset_vec, dummy_action_vec_, node_payoffs.at(current_player));
 
+    // 6.2. Для PolicyNetwork: (инфосет, действие, преимущество)
+    for (int i = 0; i < num_actions; ++i) {
+        float advantage = action_payoffs[i].at(current_player) - value_baseline;
+        policy_buffer_->push(infoset_vec, canonical_action_vectors[i], advantage);
+    }
+
+    return node_payoffs;
 }
+} // namespace ofc
