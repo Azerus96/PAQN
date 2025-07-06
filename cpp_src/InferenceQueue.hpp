@@ -4,10 +4,15 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
-#include <variant> // Используем variant для хранения разных типов данных
 #include "constants.hpp"
 
 namespace ofc {
+
+// Тип запроса к нейронной сети
+enum class RequestType {
+    POLICY,
+    VALUE
+};
 
 // Данные для запроса к Policy Network
 struct PolicyRequestData {
@@ -22,15 +27,49 @@ struct ValueRequestData {
 
 // Универсальный запрос на инференс
 struct InferenceRequest {
-    // std::variant - более современный и безопасный аналог union
-    std::variant<PolicyRequestData, ValueRequestData> data;
+    RequestType type;
+    
+    // Используем union, чтобы хранить данные только одного типа
+    union Data {
+        PolicyRequestData policy_data;
+        ValueRequestData value_data;
+
+        // Конструкторы и деструкторы для правильного управления union
+        Data() {}
+        ~Data() {}
+    } data;
 
     // Promise будет возвращать вектор float в обоих случаях
-    // Для Policy - вектор логитов, для Value - вектор из одного элемента (ценность)
     std::promise<std::vector<float>> promise;
+
+    // Конструктор и деструктор для правильного управления union
+    InferenceRequest() : type(RequestType::POLICY) {
+        new (&data.policy_data) PolicyRequestData();
+    }
+
+    ~InferenceRequest() {
+        if (type == RequestType::POLICY) {
+            data.policy_data.~PolicyRequestData();
+        } else {
+            data.value_data.~ValueRequestData();
+        }
+    }
+
+    // Запрещаем копирование, чтобы избежать проблем с union
+    InferenceRequest(const InferenceRequest&) = delete;
+    InferenceRequest& operator=(const InferenceRequest&) = delete;
+
+    // Разрешаем перемещение
+    InferenceRequest(InferenceRequest&& other) noexcept : type(other.type), promise(std::move(other.promise)) {
+        if (type == RequestType::POLICY) {
+            new (&data.policy_data) PolicyRequestData(std::move(other.data.policy_data));
+        } else {
+            new (&data.value_data) ValueRequestData(std::move(other.data.value_data));
+        }
+    }
 };
 
-// Потокобезопасная очередь для запросов (без изменений)
+// Потокобезопасная очередь для запросов
 class InferenceQueue {
 public:
     void push(InferenceRequest&& request) {
