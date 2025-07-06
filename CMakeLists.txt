@@ -1,4 +1,4 @@
-# D2CFR-main/CMakeLists.txt (ИСПРАВЛЕННАЯ ВЕРСИЯ 2.0)
+# D2CFR-main/CMakeLists.txt (ИСПРАВЛЕННАЯ ВЕРСИЯ 3.0)
 
 cmake_minimum_required(VERSION 3.10)
 project(OFCEngine)
@@ -32,6 +32,9 @@ set(SOURCES
 pybind11_add_module(ofc_engine SHARED ${SOURCES})
 
 target_include_directories(ofc_engine PRIVATE
+    # ИСПРАВЛЕНО: Явно добавляем путь к заголовочным файлам pybind11.
+    # Это решает ошибку "pybind11/variant.h: No such file or directory".
+    "${pybind11_SOURCE_DIR}/include" 
     "${PROJECT_SOURCE_DIR}/cpp_src"
     "${PROJECT_SOURCE_DIR}/cpp_src/ompeval"
     "${PROJECT_SOURCE_DIR}/cpp_src/concurrentqueue"
