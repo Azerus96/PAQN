@@ -15,7 +15,7 @@ import queue
 from .model import PolicyNetwork, ValueNetwork
 from ofc_engine import DeepMCCFR, ReplayBuffer, initialize_evaluator
 
-# --- Глобальные Настройки ---
+# --- Настройки ---
 NUM_CPP_WORKERS = int(os.cpu_count() - 16) if (os.cpu_count() or 0) > 20 else 8
 NUM_INFERENCE_WORKERS = 16
 
@@ -45,7 +45,6 @@ print("Initializing C++ hand evaluator lookup tables...", flush=True)
 initialize_evaluator()
 print("C++ evaluator initialized successfully.", flush=True)
 
-# Глобальная очередь для задач инференса
 inference_task_queue = queue.Queue(maxsize=NUM_CPP_WORKERS * 4)
 
 def policy_inference_callback(traversal_id, infoset, action_vectors, responder_callback):
@@ -65,7 +64,7 @@ class InferenceWorker(threading.Thread):
         self.stop_event = threading.Event()
 
     def run(self):
-        print(f"[{self.getName()}] Started.", flush=True)
+        print(f"[{self.name}] Started.", flush=True)
         self.policy_net.eval()
         self.value_net.eval()
         while not self.stop_event.is_set():
@@ -74,35 +73,40 @@ class InferenceWorker(threading.Thread):
                 if task is None: break
 
                 task_type, traversal_id, infoset, action_vectors, responder_callback = task
-                print(f"[{self.getName()}] Got {task_type} task for TR_ID: {traversal_id}", flush=True)
-
+                
                 if task_type == "POLICY":
                     if not action_vectors:
-                        predictions = []
-                    else:
-                        batch_size = len(action_vectors)
-                        infoset_tensor = torch.tensor([infoset] * batch_size, dtype=torch.float32)
-                        actions_tensor = torch.tensor(action_vectors, dtype=torch.float32)
-                        with torch.inference_mode():
-                            predictions = self.policy_net(infosets_tensor, actions_tensor).cpu().numpy().flatten().tolist()
+                        responder_callback([])
+                        self.task_queue.task_done()
+                        continue
                     
-                    print(f"[{self.getName()}] Responding to TR_ID: {traversal_id} for POLICY task.", flush=True)
-                    responder_callback(predictions)
+                    # --- ИСПРАВЛЕНИЕ: ВОЗВРАЩАЕМ ЛОГИКУ СБОРКИ БАТЧА ---
+                    batch_size = len(action_vectors)
+                    infoset_tensor = torch.tensor([infoset] * batch_size, dtype=torch.float32)
+                    actions_tensor = torch.tensor(action_vectors, dtype=torch.float32)
+                    # ----------------------------------------------------
+                    
+                    with torch.inference_mode():
+                        predictions = self.policy_net(infoset_tensor, actions_tensor).cpu().numpy().flatten()
+                    
+                    responder_callback(predictions.tolist())
 
                 elif task_type == "VALUE":
+                    # --- ИСПРАВЛЕНИЕ: ВОЗВРАЩАЕМ ЛОГИКУ СБОРКИ БАТЧА ---
                     infoset_tensor = torch.tensor([infoset], dtype=torch.float32)
+                    # ----------------------------------------------------
+
                     with torch.inference_mode():
                         prediction = self.value_net(infoset_tensor).item()
                     
-                    print(f"[{self.getName()}] Responding to TR_ID: {traversal_id} for VALUE task.", flush=True)
                     responder_callback(prediction)
 
                 self.task_queue.task_done()
             except Exception as e:
-                print(f"Error in {self.getName()}: {e}", flush=True)
+                print(f"Error in {self.name}: {e}", flush=True)
                 traceback.print_exc()
         
-        print(f"[{self.getName()}] Stopped.", flush=True)
+        print(f"[{self.name}] Stopped.", flush=True)
     
     def stop(self):
         self.stop_event.set()
@@ -166,6 +170,7 @@ def main():
             while not stop_event.is_set():
                 time.sleep(1.0)
 
+                # Обучение
                 if value_buffer.get_count() >= BATCH_SIZE:
                     value_net.train()
                     infosets_np, _, targets_np = value_buffer.sample(BATCH_SIZE)
@@ -173,6 +178,7 @@ def main():
                     value_optimizer.zero_grad()
                     loss = value_criterion(value_net(infosets), targets)
                     loss.backward()
+                    clip_grad_norm_(value_net.parameters(), 1.0)
                     value_optimizer.step()
                     value_losses.append(loss.item())
                     value_net.eval()
@@ -182,12 +188,15 @@ def main():
                     infosets_np, actions_np, advantages_np = policy_buffer.sample(BATCH_SIZE)
                     infosets, actions, advantages = torch.from_numpy(infosets_np), torch.from_numpy(actions_np), torch.from_numpy(advantages_np)
                     policy_optimizer.zero_grad()
-                    loss = policy_criterion(policy_net(infosets, actions), advantages)
+                    logits = policy_net(infosets, actions)
+                    loss = policy_criterion(logits, advantages)
                     loss.backward()
+                    clip_grad_norm_(policy_net.parameters(), 1.0)
                     policy_optimizer.step()
                     policy_losses.append(loss.item())
                     policy_net.eval()
                 
+                # Отчеты
                 now = time.time()
                 if now - last_report_time > 10.0:
                     duration = now - last_report_time
