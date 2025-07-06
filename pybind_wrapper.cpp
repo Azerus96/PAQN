@@ -1,27 +1,24 @@
-// --- START OF FILE PAQN-main/pybind_wrapper.cpp ---
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/functional.h>
-// #include <pybind11/variant.h> // УДАЛЕНО: Этот файл появился только в pybind11 v2.12.0. В v2.11.1 поддержка variant уже есть в <pybind11/stl.h>
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
 #include "cpp_src/InferenceQueue.hpp"
 #include "cpp_src/constants.hpp"
+#include "cpp_src/hand_evaluator.hpp" // ИЗМЕНЕНО: Добавлен инклюд для HandEvaluator
 
 namespace py = pybind11;
 
-// ИЗМЕНЕНИЕ: py::variant теперь нужно явно указать, так как он не импортируется автоматически
-// из удаленного заголовка. Но поскольку мы используем std::variant, pybind11/stl.h
-// должен справиться сам. Мы можем убрать явное использование py::variant в биндингах.
-// Однако, для большей ясности, можно добавить #include <pybind11/stl/variant.h> если бы он был,
-// но в 2.11.1 его нет. <pybind11/stl.h> - правильный путь.
-
-// pybind11 v2.11.1 автоматически обрабатывает std::variant при подключении <pybind11/stl.h>,
-// поэтому дополнительный #include не нужен, и код биндингов уже корректен.
-
 PYBIND11_MODULE(ofc_engine, m) {
     m.doc() = "OFC Engine with Policy-Value Network support";
+
+    // ИЗМЕНЕНО: Добавлен биндинг для явной инициализации.
+    // Освобождаем GIL, так как это долгая C++ операция с OpenMP.
+    m.def("initialize_evaluator", []() {
+        omp::HandEvaluator::initialize();
+    }, py::call_guard<py::gil_scoped_release>());
+
 
     // --- Биндинги для структур данных запросов ---
     py::class_<ofc::PolicyRequestData>(m, "PolicyRequestData")
@@ -32,8 +29,6 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def_readonly("infoset", &ofc::ValueRequestData::infoset);
 
     // --- Биндинг для универсального запроса ---
-    // Для std::variant<...> поддержка уже встроена в <pybind11/stl.h>
-    // и не требует дополнительных биндингов. pybind11 сам разберется.
     py::class_<ofc::InferenceRequest>(m, "InferenceRequest")
         .def("is_policy_request", [](const ofc::InferenceRequest &req) {
             return std::holds_alternative<ofc::PolicyRequestData>(req.data);
@@ -61,7 +56,8 @@ PYBIND11_MODULE(ofc_engine, m) {
     py::class_<ofc::InferenceQueue>(m, "InferenceQueue")
         .def(py::init<>())
         .def("pop_all", &ofc::InferenceQueue::pop_all)
-        .def("wait", &ofc::InferenceQueue::wait); // GIL не освобождается
+        // ИЗМЕНЕНО: Убран gil_scoped_release. Python-поток должен держать GIL в ожидании.
+        .def("wait", &ofc::InferenceQueue::wait);
 
     // --- Биндинг для буфера воспроизведения ---
     py::class_<ofc::SharedReplayBuffer>(m, "ReplayBuffer")
@@ -94,4 +90,3 @@ PYBIND11_MODULE(ofc_engine, m) {
              py::arg("action_limit"), py::arg("policy_buffer"), py::arg("value_buffer"), py::arg("queue"))
         .def("run_traversal", &ofc::DeepMCCFR::run_traversal, py::call_guard<py::gil_scoped_release>());
 }
-// --- END OF FILE PAQN-main/pybind_wrapper.cpp ---
