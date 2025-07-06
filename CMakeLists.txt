@@ -5,7 +5,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # --- Зависимости ---
-# ВОЗВРАЩАЕМ: Нам нужны заголовочные файлы pybind11
 find_package(pybind11 REQUIRED)
 find_package(Torch REQUIRED)
 find_package(OpenMP REQUIRED)
@@ -19,29 +18,30 @@ set(SOURCES
     "cpp_src/ompeval/omp/CombinedRange.cpp"
     "cpp_src/ompeval/omp/EquityCalculator.cpp"
     "cpp_src/ompeval/omp/HandEvaluator.cpp"
+    "pybind_wrapper.cpp"
 )
 
-# --- НОВАЯ ЦЕЛЬ: ЧИСТЫЙ C++ ТЕСТ ---
-add_executable(main_test cpp_src/main_test.cpp ${SOURCES})
+# --- Создание цели (Python модуль) ---
+# Используем стандартную функцию pybind11 для создания модуля
+pybind11_add_module(ofc_engine SHARED ${SOURCES})
 
 # --- Настройка путей и линковки ---
-target_include_directories(main_test PRIVATE
+target_include_directories(ofc_engine PRIVATE
     "${PROJECT_SOURCE_DIR}/cpp_src"
     "${PROJECT_SOURCE_DIR}/cpp_src/ompeval"
-    "${PROJECT_SOURCE_DIR}/cpp_src/concurrentqueue"
-    # ВОЗВРАЩАЕМ: Добавляем путь к заголовкам pybind11
-    ${pybind11_INCLUDE_DIRS}
+    # concurrentqueue больше не используется, можно убрать
 )
 
-target_link_libraries(main_test PRIVATE
-    # pybind11::module # ЭТО НЕ НУЖНО, так как это не модуль Python
+# pybind11_add_module уже добавляет нужные зависимости Python,
+# но мы добавим остальные явно для надежности.
+target_link_libraries(ofc_engine PRIVATE
     ${TORCH_LIBRARIES}
     OpenMP::OpenMP_CXX
     Threads::Threads
 )
 
 # --- Опции компиляции ---
-target_compile_options(main_test PRIVATE -O3 -g -fno-omit-frame-pointer)
+target_compile_options(ofc_engine PRIVATE -O3 -g -fno-omit-frame-pointer)
 
 # --- Отладочные сообщения ---
 message(STATUS "Pybind11 version: ${pybind11_VERSION}")
