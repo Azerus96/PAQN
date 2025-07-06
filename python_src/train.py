@@ -1,3 +1,4 @@
+# --- START OF FILE PAQN-main/python_src/train.py ---
 import os
 import time
 import torch
@@ -61,9 +62,10 @@ class InferenceWorker(threading.Thread):
                 policy_reqs = []
                 value_reqs = []
                 for r in requests:
-                    if r.get_type() == 0: # 0 for PolicyRequestData
+                    # ИЗМЕНЕНО: Используем новые, более читаемые методы для проверки типа
+                    if r.is_policy_request():
                         policy_reqs.append(r)
-                    else: # 1 for ValueRequestData
+                    elif r.is_value_request():
                         value_reqs.append(r)
 
                 if policy_reqs:
