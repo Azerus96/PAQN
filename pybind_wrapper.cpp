@@ -50,5 +50,5 @@ PYBIND11_MODULE(ofc_engine, m) {
              py::arg("value_callback"),
              py::call_guard<py::gil_scoped_release>())
         .def("run_traversal", &ofc::DeepMCCFR::run_traversal, 
-             "Runs one full traversal for two players. GIL will be managed internally by the callbacks.");
+             "Runs one full traversal. GIL is managed internally by callbacks.");
 }
