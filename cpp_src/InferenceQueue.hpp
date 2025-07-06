@@ -1,18 +1,16 @@
+// --- START OF FILE PAQN-main/cpp_src/InferenceQueue.hpp ---
 #pragma once
 #include <vector>
 #include <future>
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include <variant> // ДОБАВЛЕНО: Для использования std::variant
 #include "constants.hpp"
 
 namespace ofc {
 
-// Тип запроса к нейронной сети
-enum class RequestType {
-    POLICY,
-    VALUE
-};
+// УДАЛЕНО: enum RequestType больше не нужен, так как std::variant сам хранит тип.
 
 // Данные для запроса к Policy Network
 struct PolicyRequestData {
@@ -27,49 +25,17 @@ struct ValueRequestData {
 
 // Универсальный запрос на инференс
 struct InferenceRequest {
-    RequestType type;
-    
-    // Используем union, чтобы хранить данные только одного типа
-    union Data {
-        PolicyRequestData policy_data;
-        ValueRequestData value_data;
-
-        // Конструкторы и деструкторы для правильного управления union
-        Data() {}
-        ~Data() {}
-    } data;
+    // ИЗМЕНЕНО: union заменен на std::variant. Это типобезопасно и решает ошибку компиляции.
+    std::variant<PolicyRequestData, ValueRequestData> data;
 
     // Promise будет возвращать вектор float в обоих случаях
     std::promise<std::vector<float>> promise;
 
-    // Конструктор и деструктор для правильного управления union
-    InferenceRequest() : type(RequestType::POLICY) {
-        new (&data.policy_data) PolicyRequestData();
-    }
-
-    ~InferenceRequest() {
-        if (type == RequestType::POLICY) {
-            data.policy_data.~PolicyRequestData();
-        } else {
-            data.value_data.~ValueRequestData();
-        }
-    }
-
-    // Запрещаем копирование, чтобы избежать проблем с union
-    InferenceRequest(const InferenceRequest&) = delete;
-    InferenceRequest& operator=(const InferenceRequest&) = delete;
-
-    // Разрешаем перемещение
-    InferenceRequest(InferenceRequest&& other) noexcept : type(other.type), promise(std::move(other.promise)) {
-        if (type == RequestType::POLICY) {
-            new (&data.policy_data) PolicyRequestData(std::move(other.data.policy_data));
-        } else {
-            new (&data.value_data) ValueRequestData(std::move(other.data.value_data));
-        }
-    }
+    // УДАЛЕНО: Ручное управление конструкторами, деструкторами и операторами перемещения/копирования
+    // больше не требуется. std::variant делает все это автоматически и безопасно.
 };
 
-// Потокобезопасная очередь для запросов
+// Потокобезопасная очередь для запросов (без изменений)
 class InferenceQueue {
 public:
     void push(InferenceRequest&& request) {
@@ -104,3 +70,4 @@ private:
 };
 
 } // namespace ofc
+// --- END OF FILE PAQN-main/cpp_src/InferenceQueue.hpp ---
