@@ -7,6 +7,7 @@
 #include <iostream>
 #include <mutex>
 #include "constants.hpp"
+#include <chrono> // Добавлено для неблокирующего сида
 
 namespace ofc {
 
@@ -29,7 +30,8 @@ public:
         : capacity_(capacity), head_(0), count_(0)
     {
         buffer_.resize(capacity_); // Просто создаем пустые сэмплы
-        rng_.seed(std::random_device{}());
+        // ИЗМЕНЕНО: Используем неблокирующий сид на основе времени, чтобы избежать блокировки
+        rng_.seed(std::chrono::high_resolution_clock::now().time_since_epoch().count());
         std::cout << "C++: Parametric Replay Buffer created with capacity " << capacity << std::endl;
     }
 
@@ -81,8 +83,6 @@ public:
         return head_;
     }
     
-    // get_max_actions() больше не нужен
-
 private:
     std::vector<TrainingSample> buffer_;
     uint64_t capacity_;
