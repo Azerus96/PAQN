@@ -16,10 +16,9 @@ from .model import PolicyNetwork, ValueNetwork
 from ofc_engine import DeepMCCFR, ReplayBuffer, initialize_evaluator
 
 # --- Настройки ---
-NUM_CPP_WORKERS = int(os.cpu_count() - 16) if (os.cpu_count() or 0) > 20 else 8
-NUM_INFERENCE_WORKERS = 16
-
-COMPUTATION_THREADS = str(NUM_INFERENCE_WORKERS)
+NUM_CPP_WORKERS = int(os.cpu_count() or 16)
+# Для CPU-инференса, 8-16 потоков обычно хороший компромисс
+COMPUTATION_THREADS = "16"
 os.environ['OMP_NUM_THREADS'] = COMPUTATION_THREADS
 os.environ['OPENBLAS_NUM_THREADS'] = COMPUTATION_THREADS
 os.environ['MKL_NUM_THREADS'] = COMPUTATION_THREADS
@@ -27,7 +26,7 @@ os.environ['VECLIB_MAXIMUM_THREADS'] = COMPUTATION_THREADS
 os.environ['NUMEXPR_NUM_THREADS'] = COMPUTATION_THREADS
 torch.set_num_threads(int(COMPUTATION_THREADS))
 
-print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
+print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {COMPUTATION_THREADS} threads for PyTorch.")
 
 # --- Гиперпараметры ---
 INPUT_SIZE = 1486
@@ -45,22 +44,13 @@ print("Initializing C++ hand evaluator lookup tables...", flush=True)
 initialize_evaluator()
 print("C++ evaluator initialized successfully.", flush=True)
 
-inference_task_queue = queue.Queue(maxsize=NUM_CPP_WORKERS * 4)
-
-def policy_inference_callback(traversal_id, infoset, action_vectors, responder_callback):
-    inference_task_queue.put(("POLICY", traversal_id, infoset, action_vectors, responder_callback))
-
-def value_inference_callback(traversal_id, infoset, responder_callback):
-    inference_task_queue.put(("VALUE", traversal_id, infoset, None, responder_callback))
-
 class InferenceWorker(threading.Thread):
-    def __init__(self, worker_id, policy_net, value_net, device, task_queue):
-        super().__init__(daemon=True, name=f"InferenceWorker-{worker_id}")
-        self.worker_id = worker_id
+    def __init__(self, policy_net, value_net, device):
+        super().__init__(daemon=True, name="InferenceWorker")
         self.policy_net = policy_net
         self.value_net = value_net
         self.device = device
-        self.task_queue = task_queue
+        self.task_queue = queue.Queue()
         self.stop_event = threading.Event()
 
     def run(self):
@@ -80,11 +70,9 @@ class InferenceWorker(threading.Thread):
                         self.task_queue.task_done()
                         continue
                     
-                    # --- ИСПРАВЛЕНИЕ: ВОЗВРАЩАЕМ ЛОГИКУ СБОРКИ БАТЧА ---
                     batch_size = len(action_vectors)
                     infoset_tensor = torch.tensor([infoset] * batch_size, dtype=torch.float32)
                     actions_tensor = torch.tensor(action_vectors, dtype=torch.float32)
-                    # ----------------------------------------------------
                     
                     with torch.inference_mode():
                         predictions = self.policy_net(infoset_tensor, actions_tensor).cpu().numpy().flatten()
@@ -92,10 +80,7 @@ class InferenceWorker(threading.Thread):
                     responder_callback(predictions.tolist())
 
                 elif task_type == "VALUE":
-                    # --- ИСПРАВЛЕНИЕ: ВОЗВРАЩАЕМ ЛОГИКУ СБОРКИ БАТЧА ---
                     infoset_tensor = torch.tensor([infoset], dtype=torch.float32)
-                    # ----------------------------------------------------
-
                     with torch.inference_mode():
                         prediction = self.value_net(infoset_tensor).item()
                     
@@ -108,6 +93,9 @@ class InferenceWorker(threading.Thread):
         
         print(f"[{self.name}] Stopped.", flush=True)
     
+    def submit_task(self, task_type, traversal_id, infoset, action_vectors, responder_callback):
+        self.task_queue.put((task_type, traversal_id, infoset, action_vectors, responder_callback))
+
     def stop(self):
         self.stop_event.set()
         self.task_queue.put(None)
@@ -135,14 +123,17 @@ def main():
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
 
-    inference_workers = []
-    for i in range(NUM_INFERENCE_WORKERS):
-        worker = InferenceWorker(i, policy_net, value_net, device, inference_task_queue)
-        worker.start()
-        inference_workers.append(worker)
+    inference_worker = InferenceWorker(policy_net, value_net, device)
+    inference_worker.start()
+
+    def policy_cb(traversal_id, infoset, actions, responder):
+        inference_worker.submit_task("POLICY", traversal_id, infoset, actions, responder)
+
+    def value_cb(traversal_id, infoset, responder):
+        inference_worker.submit_task("VALUE", traversal_id, infoset, None, responder)
 
     solvers = [
-        DeepMCCFR(ACTION_LIMIT, policy_buffer, value_buffer, policy_inference_callback, value_inference_callback) 
+        DeepMCCFR(ACTION_LIMIT, policy_buffer, value_buffer, policy_cb, value_cb) 
         for _ in range(NUM_CPP_WORKERS)
     ]
     
@@ -170,7 +161,6 @@ def main():
             while not stop_event.is_set():
                 time.sleep(1.0)
 
-                # Обучение
                 if value_buffer.get_count() >= BATCH_SIZE:
                     value_net.train()
                     infosets_np, _, targets_np = value_buffer.sample(BATCH_SIZE)
@@ -196,7 +186,6 @@ def main():
                     policy_losses.append(loss.item())
                     policy_net.eval()
                 
-                # Отчеты
                 now = time.time()
                 if now - last_report_time > 10.0:
                     duration = now - last_report_time
@@ -215,7 +204,7 @@ def main():
                     print(f"Buffer Fill -> Policy: {policy_buffer.get_count():,}/{BUFFER_CAPACITY:,} ({policy_buffer.get_count()/BUFFER_CAPACITY:.1%}) "
                           f"| Value: {value_buffer.get_count():,}/{BUFFER_CAPACITY:,} ({value_buffer.get_count()/BUFFER_CAPACITY:.1%})", flush=True)
                     print(f"Avg Losses (last 100) -> Policy: {avg_p_loss:.6f} | Value: {avg_v_loss:.6f}", flush=True)
-                    print(f"Inference Queue Size: {inference_task_queue.qsize()}", flush=True)
+                    print(f"Inference Queue Size: {inference_worker.task_queue.qsize()}", flush=True)
                     print("="*54, flush=True)
                     
                     last_report_time = now
@@ -232,10 +221,8 @@ def main():
         print("Stopping all workers...", flush=True)
         stop_event.set()
         
-        for worker in inference_workers:
-            worker.stop()
-        for worker in inference_workers:
-            worker.join()
+        inference_worker.stop()
+        inference_worker.join()
 
         print("All Python workers stopped.")
 
