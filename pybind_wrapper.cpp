@@ -11,15 +11,6 @@
 
 namespace py = pybind11;
 
-// ИЗМЕНЕНИЕ: py::variant теперь нужно явно указать, так как он не импортируется автоматически
-// из удаленного заголовка. Но поскольку мы используем std::variant, pybind11/stl.h
-// должен справиться сам. Мы можем убрать явное использование py::variant в биндингах.
-// Однако, для большей ясности, можно добавить #include <pybind11/stl/variant.h> если бы он был,
-// но в 2.11.1 его нет. <pybind11/stl.h> - правильный путь.
-
-// pybind11 v2.11.1 автоматически обрабатывает std::variant при подключении <pybind11/stl.h>,
-// поэтому дополнительный #include не нужен, и код биндингов уже корректен.
-
 PYBIND11_MODULE(ofc_engine, m) {
     m.doc() = "OFC Engine with Policy-Value Network support";
 
@@ -32,8 +23,6 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def_readonly("infoset", &ofc::ValueRequestData::infoset);
 
     // --- Биндинг для универсального запроса ---
-    // Для std::variant<...> поддержка уже встроена в <pybind11/stl.h>
-    // и не требует дополнительных биндингов. pybind11 сам разберется.
     py::class_<ofc::InferenceRequest>(m, "InferenceRequest")
         .def("is_policy_request", [](const ofc::InferenceRequest &req) {
             return std::holds_alternative<ofc::PolicyRequestData>(req.data);
@@ -61,7 +50,8 @@ PYBIND11_MODULE(ofc_engine, m) {
     py::class_<ofc::InferenceQueue>(m, "InferenceQueue")
         .def(py::init<>())
         .def("pop_all", &ofc::InferenceQueue::pop_all)
-        .def("wait", &ofc::InferenceQueue::wait, py::call_guard<py::gil_scoped_release>());
+        // ИЗМЕНЕНО: Убран gil_scoped_release. Поток InferenceWorker должен удерживать GIL во время ожидания.
+        .def("wait", &ofc::InferenceQueue::wait);
 
     // --- Биндинг для буфера воспроизведения ---
     py::class_<ofc::SharedReplayBuffer>(m, "ReplayBuffer")
