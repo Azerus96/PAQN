@@ -2,19 +2,18 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/functional.h>
+#include <iostream>
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
 #include "cpp_src/InferenceQueue.hpp"
 #include "cpp_src/constants.hpp"
-#include "cpp_src/hand_evaluator.hpp" // ИЗМЕНЕНО: Добавлен инклюд для HandEvaluator
+#include "cpp_src/hand_evaluator.hpp"
 
 namespace py = pybind11;
 
 PYBIND11_MODULE(ofc_engine, m) {
     m.doc() = "OFC Engine with Policy-Value Network support";
 
-    // ИЗМЕНЕНО: Добавлен биндинг для явной инициализации.
-    // Освобождаем GIL, так как это долгая C++ операция с OpenMP.
     m.def("initialize_evaluator", []() {
         omp::HandEvaluator::initialize();
     }, py::call_guard<py::gil_scoped_release>());
@@ -49,6 +48,7 @@ PYBIND11_MODULE(ofc_engine, m) {
             throw std::runtime_error("Request is not of type VALUE");
         }, py::return_value_policy::reference_internal)
         .def("set_result", [](ofc::InferenceRequest &req, std::vector<float> result) {
+            std::cout << "[PyBind] set_result(): Setting promise. Result size: " << result.size() << std::endl << std::flush;
             req.promise.set_value(std::move(result));
         });
         
@@ -56,8 +56,8 @@ PYBIND11_MODULE(ofc_engine, m) {
     py::class_<ofc::InferenceQueue>(m, "InferenceQueue")
         .def(py::init<>())
         .def("pop_all", &ofc::InferenceQueue::pop_all)
-        // ИЗМЕНЕНО: Убран gil_scoped_release. Python-поток должен держать GIL в ожидании.
-        .def("wait", &ofc::InferenceQueue::wait);
+        // ВАЖНО: возвращаем gil_scoped_release для эксперимента
+        .def("wait", &ofc::InferenceQueue::wait, py::call_guard<py::gil_scoped_release>());
 
     // --- Биндинг для буфера воспроизведения ---
     py::class_<ofc::SharedReplayBuffer>(m, "ReplayBuffer")
