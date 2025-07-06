@@ -22,14 +22,12 @@ set(SOURCES
 )
 
 # --- Создание цели (Python модуль) ---
-# Используем стандартную функцию pybind11 для создания модуля
 pybind11_add_module(ofc_engine SHARED ${SOURCES})
 
 # --- Настройка путей и линковки ---
 target_include_directories(ofc_engine PRIVATE
     "${PROJECT_SOURCE_DIR}/cpp_src"
     "${PROJECT_SOURCE_DIR}/cpp_src/ompeval"
-    # concurrentqueue больше не используется, можно убрать
 )
 
 # pybind11_add_module уже добавляет нужные зависимости Python,
@@ -42,9 +40,3 @@ target_link_libraries(ofc_engine PRIVATE
 
 # --- Опции компиляции ---
 target_compile_options(ofc_engine PRIVATE -O3 -g -fno-omit-frame-pointer)
-
-# --- Отладочные сообщения ---
-message(STATUS "Pybind11 version: ${pybind11_VERSION}")
-message(STATUS "Torch libraries: ${TORCH_LIBRARIES}")
-message(STATUS "Torch include dirs: ${TORCH_INCLUDE_DIRS}")
-message(STATUS "OpenMP flags: ${OpenMP_CXX_FLAGS}")
