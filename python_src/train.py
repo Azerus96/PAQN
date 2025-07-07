@@ -16,9 +16,8 @@ if __name__ == '__main__':
 import sys
 sys.path.append('/content/PAQN/build')
 
-# <<< ИСПРАВЛЕНИЕ: Импортируем правильный класс модели
 from .model import PAQN_Network 
-from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager, InferenceRequest, InferenceResult
+from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
 # --- Настройки ---
 TOTAL_CPUS = os.cpu_count() or 1
@@ -39,7 +38,7 @@ BATCH_SIZE = 1024
 MIN_BUFFER_FILL = BATCH_SIZE * 10
 SAVE_INTERVAL_SECONDS = 300
 STATS_INTERVAL_SECONDS = 10
-MODEL_PATH = "/content/models/paqn_model.pth" # <<< ИСПРАВЛЕНИЕ: Одна модель - один путь
+MODEL_PATH = "/content/models/paqn_model.pth"
 
 class InferenceWorker(mp.Process):
     def __init__(self, name, task_queue, result_queue, stop_event):
@@ -47,7 +46,7 @@ class InferenceWorker(mp.Process):
         self.task_queue = task_queue
         self.result_queue = result_queue
         self.stop_event = stop_event
-        self.model = None # <<< ИСПРАВЛЕНИЕ: Одна модель
+        self.model = None
         self.device = None
 
     def _initialize(self):
@@ -56,7 +55,6 @@ class InferenceWorker(mp.Process):
         torch.set_num_threads(1)
         os.environ['OMP_NUM_THREADS'] = '1'
         
-        # <<< ИСПРАВЛЕНИЕ: Инициализируем и загружаем одну модель
         self.model = PAQN_Network(INPUT_SIZE, ACTION_VECTOR_SIZE).to(self.device)
         if os.path.exists(MODEL_PATH):
             self.model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
@@ -66,38 +64,31 @@ class InferenceWorker(mp.Process):
         self._initialize()
         while not self.stop_event.is_set():
             try:
-                req: InferenceRequest = self.task_queue.get(timeout=1.0)
+                # <<< ИЗМЕНЕНИЕ: Получаем Python tuple
+                req_id, is_policy, infoset, action_vectors = self.task_queue.get(timeout=1.0)
                 
-                if req.is_policy_request:
-                    if not req.action_vectors:
+                if is_policy:
+                    if not action_vectors:
                         predictions = []
                     else:
-                        batch_size = len(req.action_vectors)
-                        infoset_tensor = torch.tensor([req.infoset] * batch_size, dtype=torch.float32, device=self.device)
-                        actions_tensor = torch.tensor(req.action_vectors, dtype=torch.float32, device=self.device)
+                        batch_size = len(action_vectors)
+                        infoset_tensor = torch.tensor([infoset] * batch_size, dtype=torch.float32, device=self.device)
+                        actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
                         with torch.inference_mode():
-                            # <<< ИСПРАВЛЕНИЕ: Вызываем модель для получения только логитов
                             policy_logits, _ = self.model(infoset_tensor, actions_tensor)
                             predictions = policy_logits.cpu().numpy().flatten().tolist()
                     
-                    res = InferenceResult()
-                    res.id = req.id
-                    res.is_policy_result = True
-                    res.predictions = predictions
-                    self.result_queue.put(res)
+                    # <<< ИЗМЕНЕНИЕ: Отправляем обратно Python tuple
+                    self.result_queue.put((req_id, True, predictions))
 
                 else: # Value request
-                    infoset_tensor = torch.tensor([req.infoset], dtype=torch.float32, device=self.device)
+                    infoset_tensor = torch.tensor([infoset], dtype=torch.float32, device=self.device)
                     with torch.inference_mode():
-                        # <<< ИСПРАВЛЕНИЕ: Вызываем модель для получения только value
                         value = self.model(infoset_tensor)
                         prediction = value.item()
                     
-                    res = InferenceResult()
-                    res.id = req.id
-                    res.is_policy_result = False
-                    res.predictions = [prediction]
-                    self.result_queue.put(res)
+                    # <<< ИЗМЕНЕНИЕ: Отправляем обратно Python tuple
+                    self.result_queue.put((req_id, False, [prediction]))
 
             except mp.queues.Empty:
                 continue
@@ -119,12 +110,11 @@ def main():
     device = torch.device("cpu")
     print(f"Using device: {device}", flush=True)
     
-    # <<< ИСПРАВЛЕНИЕ: Одна модель, один оптимизатор
     model = PAQN_Network(INPUT_SIZE, ACTION_VECTOR_SIZE).to(device)
     if os.path.exists(MODEL_PATH):
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
         
-    optimizer = optim.Adam(model.parameters(), lr=POLICY_LR) # Можно использовать один LR или разные для групп параметров
+    optimizer = optim.Adam(model.parameters(), lr=POLICY_LR)
     value_criterion = nn.MSELoss()
     policy_criterion = nn.MSELoss()
     
@@ -157,13 +147,10 @@ def main():
         while True:
             time.sleep(0.5)
             
-            # <<< ИСПРАВЛЕНИЕ: Обучаем обе "головы" за один проход
             if value_buffer.size() >= MIN_BUFFER_FILL and policy_buffer.size() >= MIN_BUFFER_FILL:
                 model.train()
                 
-                # Сэмплируем для value
                 v_batch = value_buffer.sample(BATCH_SIZE)
-                # Сэмплируем для policy
                 p_batch = policy_buffer.sample(BATCH_SIZE)
 
                 if v_batch and p_batch:
@@ -178,15 +165,12 @@ def main():
 
                     optimizer.zero_grad()
                     
-                    # Forward pass для value
                     pred_values = model(v_infosets)
                     loss_v = value_criterion(pred_values, v_targets)
                     
-                    # Forward pass для policy
                     pred_logits, _ = model(p_infosets, p_actions)
                     loss_p = policy_criterion(pred_logits, p_advantages)
                     
-                    # Суммарный loss
                     total_loss = loss_v + loss_p
                     total_loss.backward()
                     clip_grad_norm_(model.parameters(), 1.0)
@@ -214,7 +198,7 @@ def main():
                 last_stats_time = now
 
             if now - last_save_time > SAVE_INTERVAL_SECONDS:
-                print("\n--- Saving model ---", flush=True)
+                print("\n--- Saving models ---", flush=True)
                 torch.save(model.state_dict(), MODEL_PATH)
                 last_save_time = now
 
