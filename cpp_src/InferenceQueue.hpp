@@ -1,66 +1,40 @@
 #pragma once
-#include <vector>
-#include <future>
-#include <mutex>
-#include <condition_variable>
-#include <deque>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <pybind11/numpy.h>
 #include <variant>
-#include <iostream> 
-#include <thread>   
+#include <vector>
+#include <string>
+#include <cstdint>
 #include "constants.hpp"
+
+namespace py = pybind11;
 
 namespace ofc {
 
-struct PolicyRequestData {
-    std::vector<float> infoset;
-    std::vector<std::vector<float>> action_vectors;
-};
-
-struct ValueRequestData {
-    std::vector<float> infoset;
-};
-
+// Структура запроса от C++ к Python
 struct InferenceRequest {
-    std::variant<PolicyRequestData, ValueRequestData> data;
-    std::promise<std::vector<float>> promise;
+    uint64_t id;
+    bool is_policy_request;
+    std::vector<float> infoset;
+    // Для policy-запроса, содержит векторы действий. Для value - пустой.
+    std::vector<std::vector<float>> action_vectors; 
 };
 
-class InferenceQueue {
-public:
-    void push(InferenceRequest&& request) {
-        std::unique_lock<std::mutex> lock(mtx_);
-        std::cout << "[C++ Queue] push(): Before size=" << queue_.size() << std::endl << std::flush;
-        queue_.push_back(std::move(request));
-        std::cout << "[C++ Queue] push(): After size=" << queue_.size() << ". Notifying." << std::endl << std::flush;
-        lock.unlock();
-        cv_.notify_one();
-    }
-
-    std::vector<InferenceRequest> pop_all() {
-        std::vector<InferenceRequest> requests;
-        {
-            std::unique_lock<std::mutex> lock(mtx_);
-            std::cout << "[C++ Queue] pop_all(): Popping " << queue_.size() << " requests." << std::endl << std::flush;
-            if (!queue_.empty()) {
-                requests.reserve(queue_.size());
-                std::move(queue_.begin(), queue_.end(), std::back_inserter(requests));
-                queue_.clear();
-            }
-        }
-        return requests;
-    }
-
-    void wait() {
-        std::unique_lock<std::mutex> lock(mtx_);
-        std::cout << "[C++ Queue] wait(): Entering, queue empty? " << (queue_.empty() ? "Yes" : "No") << ". Waiting..." << std::endl << std::flush;
-        cv_.wait(lock, [this] { return !queue_.empty(); });
-        std::cout << "[C++ Queue] wait(): Woke up, queue size: " << queue_.size() << std::endl << std::flush;
-    }
-
-private:
-    std::deque<InferenceRequest> queue_;
-    std::mutex mtx_;
-    std::condition_variable cv_;
+// Структура ответа от Python к C++
+struct InferenceResult {
+    uint64_t id;
+    bool is_policy_result;
+    // Для policy-ответа, содержит логиты. Для value - один элемент (сама ценность).
+    std::vector<float> predictions; 
 };
 
-}
+// Очередь запросов (C++ -> Python)
+// Используем py::object, чтобы pybind11 сам управлял GIL при доступе к Python-объекту queue.Queue
+using InferenceRequestQueue = py::object;
+
+// Очередь результатов (Python -> C++)
+// Используем py::object по той же причине
+using InferenceResultQueue = py::object;
+
+} // namespace ofc
