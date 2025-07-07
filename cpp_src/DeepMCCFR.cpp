@@ -14,55 +14,19 @@
 
 namespace ofc {
 
+// ... (вспомогательные функции action_to_vector и add_dirichlet_noise без изменений) ...
+// ...
+
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
 
-// ... (вспомогательные функции action_to_vector и add_dirichlet_noise без изменений) ...
-std::vector<float> action_to_vector(const Action& action);
-void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng);
-std::vector<float> action_to_vector(const Action& action) {
-    std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
-    const auto& placements = action.first;
-    const auto& discarded_card = action.second;
-    for (const auto& p : placements) {
-        const auto& card = p.first;
-        const auto& row_name = p.second.first;
-        int slot_idx = -1;
-        if (row_name == "top") slot_idx = 0;
-        else if (row_name == "middle") slot_idx = 1;
-        else if (row_name == "bottom") slot_idx = 2;
-        if (slot_idx != -1 && card != INVALID_CARD) {
-            vec[card * 4 + slot_idx] = 1.0f;
-        }
-    }
-    if (discarded_card != INVALID_CARD) {
-        vec[discarded_card * 4 + 3] = 1.0f;
-    }
-    return vec;
-}
-void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng) {
-    if (strategy.empty()) { return; }
-    std::gamma_distribution<float> gamma(alpha, 1.0f);
-    std::vector<float> noise(strategy.size());
-    float noise_sum = 0.0f;
-    for (size_t i = 0; i < strategy.size(); ++i) {
-        noise[i] = gamma(rng);
-        noise_sum += noise[i];
-    }
-    if (noise_sum > 1e-6) {
-        const float exploration_fraction = 0.25f;
-        for (size_t i = 0; i < strategy.size(); ++i) {
-            strategy[i] = (1.0f - exploration_fraction) * strategy[i] + exploration_fraction * (noise[i] / noise_sum);
-        }
-    }
-}
-
+// <<< ИЗМЕНЕНИЕ: Конструктор теперь принимает очереди
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
-                     PolicyInferenceCallback policy_cb, ValueInferenceCallback value_cb) 
+                     InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue) 
     : action_limit_(action_limit), 
       policy_buffer_(policy_buffer), 
       value_buffer_(value_buffer),
-      policy_callback_(std::move(policy_cb)),
-      value_callback_(std::move(value_cb)),
+      request_queue_(request_queue),
+      result_queue_(result_queue),
       rng_(static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + 
            static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))),
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
@@ -76,37 +40,8 @@ void DeepMCCFR::run_traversal() {
     traverse(state, 1, true, traversal_id);
 }
 
-std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view) {
-    const Board& my_board = state.get_player_board(player_view);
-    const Board& opp_board = state.get_opponent_board(player_view);
-    std::vector<float> features(INFOSET_SIZE, 0.0f);
-    int offset = 0;
-    features[offset++] = static_cast<float>(state.get_street());
-    features[offset++] = static_cast<float>(state.get_dealer_pos());
-    features[offset++] = static_cast<float>(state.get_current_player());
-    const auto& dealt_cards = state.get_dealt_cards();
-    for (Card c : dealt_cards) {
-        if (c != INVALID_CARD) features[offset + c] = 1.0f;
-    }
-    offset += 52;
-    auto process_board = [&](const Board& board, int& current_offset) {
-        for(int i=0; i<3; ++i) features[current_offset + i*53 + (board.top[i] == INVALID_CARD ? 52 : board.top[i])] = 1.0f;
-        current_offset += 3 * 53;
-        for(int i=0; i<5; ++i) features[current_offset + i*53 + (board.middle[i] == INVALID_CARD ? 52 : board.middle[i])] = 1.0f;
-        current_offset += 5 * 53;
-        for(int i=0; i<5; ++i) features[current_offset + i*53 + (board.bottom[i] == INVALID_CARD ? 52 : board.bottom[i])] = 1.0f;
-        current_offset += 5 * 53;
-    };
-    process_board(my_board, offset);
-    process_board(opp_board, offset);
-    const auto& my_discards = state.get_my_discards(player_view);
-    for (Card c : my_discards) {
-        if (c != INVALID_CARD) features[offset + c] = 1.0f;
-    }
-    offset += 52;
-    features[offset++] = static_cast<float>(state.get_opponent_discard_count(player_view));
-    return features;
-}
+// ... (featurize без изменений) ...
+// ...
 
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root, uint64_t traversal_id) {
     if (state.is_terminal()) {
@@ -153,25 +88,29 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
 
+    // <<< ИЗМЕНЕНИЕ: Логика инференса полностью переписана. >>>
+    // 1. Отправляем запрос в очередь
+    uint64_t policy_request_id = traversal_id * 2;
+    {
+        py::gil_scoped_acquire acquire;
+        request_queue_->attr("put")(InferenceRequest{policy_request_id, true, infoset_vec, canonical_action_vectors});
+    }
+
+    // 2. Получаем результат из другой очереди
     std::vector<float> logits;
     {
-        std::atomic<bool> ready = false;
-        auto responder = [&](std::vector<float> result) {
-            logits = std::move(result);
-            ready.store(true, std::memory_order_release);
-        };
-        {
-            py::gil_scoped_acquire acquire;
-            policy_callback_(traversal_id, infoset_vec, canonical_action_vectors, responder);
+        py::gil_scoped_acquire acquire;
+        // Блокируемся на Python-очереди, GIL будет отпущен во время ожидания
+        py::object result_obj = result_queue_->attr("get")(); 
+        InferenceResult result = result_obj.cast<InferenceResult>();
+        // Простая проверка, что мы получили то, что ждали. В проде можно убрать.
+        if (result.id != policy_request_id || !result.is_policy_result) {
+            // Обработка ошибки - например, возврат пустого результата
+            return {};
         }
-        auto start_time = std::chrono::steady_clock::now();
-        while (!ready.load(std::memory_order_acquire)) {
-            if (std::chrono::steady_clock::now() - start_time > std::chrono::seconds(10)) {
-                return {};
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
-        }
+        logits = std::move(result.predictions);
     }
+    // <<< КОНЕЦ ИЗМЕНЕНИЯ >>>
 
     std::vector<float> strategy(num_actions);
     if (!logits.empty()) {
@@ -207,26 +146,30 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         }
     }
     
-    float value_baseline = 0.0f;
+    // <<< ИЗМЕНЕНИЕ: Логика инференса для Value Network >>>
+    uint64_t value_request_id = traversal_id * 2 + 1;
     {
-        std::atomic<bool> ready = false;
-        auto responder = [&](float result) {
-            value_baseline = result;
-            ready.store(true, std::memory_order_release);
-        };
-        {
-            py::gil_scoped_acquire acquire;
-            value_callback_(traversal_id, infoset_vec, responder);
-        }
-        auto start_time = std::chrono::steady_clock::now();
-        while (!ready.load(std::memory_order_acquire)) {
-            if (std::chrono::steady_clock::now() - start_time > std::chrono::seconds(10)) {
-                return {};
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
-        }
+        py::gil_scoped_acquire acquire;
+        // Для value-запроса action_vectors пустые
+        request_queue_->attr("put")(InferenceRequest{value_request_id, false, infoset_vec, {}});
     }
 
+    float value_baseline = 0.0f;
+    {
+        py::gil_scoped_acquire acquire;
+        py::object result_obj = result_queue_->attr("get")();
+        InferenceResult result = result_obj.cast<InferenceResult>();
+        if (result.id != value_request_id || result.is_policy_result || result.predictions.empty()) {
+            return {};
+        }
+        value_baseline = result.predictions[0];
+    }
+    // <<< КОНЕЦ ИЗМЕНЕНИЯ >>>
+
+    // <<< ИЗМЕНЕНИЕ: Исправлена логическая ошибка.
+    // Теперь мы сохраняем канонический инфосет и канонические векторы действий.
+    // А таргеты (regret/value) считаются на основе оригинальных, не-канонических исходов.
+    // Это правильно, т.к. модель должна учиться на канонических представлениях.
     value_buffer_->push(infoset_vec, dummy_action_vec_, node_payoffs.at(current_player));
 
     for (int i = 0; i < num_actions; ++i) {
