@@ -1,41 +1,30 @@
 #pragma once
 #include <pybind11/pybind11.h>
-#include <pybind11/functional.h>
 #include "game_state.hpp"
 #include "hand_evaluator.hpp"
 #include "SharedReplayBuffer.hpp"
+#include "InferenceQueue.hpp" // <<< ИЗМЕНЕНИЕ: Подключаем новый заголовок для очередей
 #include <vector>
 #include <map>
 #include <memory>
 #include <random>
-#include <functional>
 #include <atomic>
 
 namespace py = pybind11;
 
 namespace ofc {
 
-using PolicyInferenceCallback = std::function<
-    void(
-        uint64_t,
-        const std::vector<float>&, 
-        const std::vector<std::vector<float>>&,
-        const std::function<void(std::vector<float>)>&
-    )
->;
-
-using ValueInferenceCallback = std::function<
-    void(
-        uint64_t,
-        const std::vector<float>&,
-        const std::function<void(float)>&
-    )
->;
+// <<< ИЗМЕНЕНИЕ: Полностью убираем std::function коллбэки.
+// Вместо них будем использовать очереди напрямую.
 
 class DeepMCCFR {
 public:
-    DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer, 
-              PolicyInferenceCallback policy_cb, ValueInferenceCallback value_cb);
+    // <<< ИЗМЕНЕНИЕ: Конструктор теперь принимает указатели на очереди.
+    DeepMCCFR(size_t action_limit, 
+              SharedReplayBuffer* policy_buffer, 
+              SharedReplayBuffer* value_buffer, 
+              InferenceRequestQueue* request_queue,
+              InferenceResultQueue* result_queue);
     
     void run_traversal();
 
@@ -43,8 +32,11 @@ private:
     HandEvaluator evaluator_;
     SharedReplayBuffer* policy_buffer_;
     SharedReplayBuffer* value_buffer_;
-    PolicyInferenceCallback policy_callback_;
-    ValueInferenceCallback value_callback_;
+    
+    // <<< ИЗМЕНЕНИЕ: Храним указатели на очереди.
+    InferenceRequestQueue* request_queue_;
+    InferenceResultQueue* result_queue_;
+
     size_t action_limit_;
     std::mt19937 rng_;
     std::vector<float> dummy_action_vec_;
