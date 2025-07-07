@@ -14,10 +14,9 @@
 
 namespace ofc {
 
-// ... (вспомогательные функции action_to_vector и add_dirichlet_noise остаются без изменений) ...
+// ... (вспомогательные функции и конструктор без изменений) ...
 std::vector<float> action_to_vector(const Action& action);
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng);
-
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -54,10 +53,7 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
         }
     }
 }
-
-
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
-
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
                      InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue) 
     : action_limit_(action_limit), 
@@ -69,7 +65,6 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, Sha
            static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))),
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
 {}
-
 void DeepMCCFR::run_traversal() {
     uint64_t traversal_id = ++traversal_counter_;
     GameState state; 
@@ -77,23 +72,20 @@ void DeepMCCFR::run_traversal() {
     state.reset(); 
     traverse(state, 1, true, traversal_id);
 }
-
 std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view) {
+    // ... (реализация featurize без изменений) ...
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
     std::vector<float> features(INFOSET_SIZE, 0.0f);
     int offset = 0;
-    
     features[offset++] = static_cast<float>(state.get_street());
     features[offset++] = static_cast<float>(state.get_dealer_pos());
     features[offset++] = static_cast<float>(state.get_current_player());
-    
     const auto& dealt_cards = state.get_dealt_cards();
     for (Card c : dealt_cards) {
         if (c != INVALID_CARD) features[offset + c] = 1.0f;
     }
     offset += 52;
-    
     auto process_board = [&](const Board& board, int& current_offset) {
         for(int i=0; i<3; ++i) {
             if (board.top[i] != INVALID_CARD) features[current_offset + board.top[i]] = 1.0f;
@@ -108,20 +100,16 @@ std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view)
         }
         current_offset += 52;
     };
-    
     process_board(my_board, offset);
     process_board(opp_board, offset);
-    
     const auto& my_discards = state.get_my_discards(player_view);
     for (Card c : my_discards) {
         if (c != INVALID_CARD) features[offset + c] = 1.0f;
     }
     offset += 52;
-    
     features[offset++] = static_cast<float>(state.get_opponent_discard_count(player_view));
-    features[offset++] = 0.0f; // Placeholder for my fantasyland
-    features[offset++] = 0.0f; // Placeholder for opp fantasyland
-
+    features[offset++] = 0.0f;
+    features[offset++] = 0.0f;
     return features;
 }
 
@@ -175,10 +163,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     {
         py::gil_scoped_acquire acquire;
         py::tuple request_tuple = py::make_tuple(
-            policy_request_id, 
-            true,
-            py::cast(infoset_vec), 
-            py::cast(canonical_action_vectors)
+            policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors)
         );
         request_queue_->attr("put")(request_tuple);
     }
@@ -188,10 +173,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         py::gil_scoped_acquire acquire;
         py::object result_obj = result_queue_->attr("get")(); 
         py::tuple result_tuple = result_obj.cast<py::tuple>();
-        uint64_t result_id = result_tuple[0].cast<uint64_t>();
-        if (result_id != policy_request_id) {
-            return {};
-        }
+        if (result_tuple[0].cast<uint64_t>() != policy_request_id) return {};
         logits = result_tuple[2].cast<std::vector<float>>();
     }
 
@@ -224,6 +206,12 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         state.apply_action(legal_actions[i], traversing_player, undo_info);
         action_payoffs[i] = traverse(state, traversing_player, false, traversal_id);
         state.undo_action(undo_info, traversing_player);
+        
+        // <<< ИЗМЕНЕНИЕ: Сохраняем сэмпл для Value-сети ПОСЛЕ каждого рекурсивного вызова >>>
+        // Мы используем результат симуляции для конкретного действия как таргет для Value-сети.
+        // Это создает один V-сэмпл на каждый P-сэмпл.
+        value_buffer_->push(infoset_vec, dummy_action_vec_, action_payoffs[i].at(current_player));
+        
         for(auto const& [player_idx, payoff] : action_payoffs[i]) {
             node_payoffs[player_idx] += strategy[i] * payoff;
         }
@@ -233,10 +221,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     {
         py::gil_scoped_acquire acquire;
         py::tuple request_tuple = py::make_tuple(
-            value_request_id, 
-            false,
-            py::cast(infoset_vec), 
-            py::none()
+            value_request_id, false, py::cast(infoset_vec), py::none()
         );
         request_queue_->attr("put")(request_tuple);
     }
@@ -246,18 +231,11 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         py::gil_scoped_acquire acquire;
         py::object result_obj = result_queue_->attr("get")();
         py::tuple result_tuple = result_obj.cast<py::tuple>();
-        uint64_t result_id = result_tuple[0].cast<uint64_t>();
+        if (result_tuple[0].cast<uint64_t>() != value_request_id) return {};
         std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
-        if (result_id != value_request_id || predictions.empty()) {
-            return {};
-        }
+        if (predictions.empty()) return {};
         value_baseline = predictions[0];
     }
-
-    // <<< ИЗМЕНЕНИЕ: Сохраняем сэмпл для Value-сети в КАЖДОМ узле >>>
-    // Таргетом является ожидаемый исход (payoff) из этого узла, который мы посчитали,
-    // усреднив исходы всех исследованных действий согласно стратегии.
-    value_buffer_->push(infoset_vec, dummy_action_vec_, node_payoffs.at(current_player));
 
     // Сохраняем сэмплы для Policy-сети
     for (int i = 0; i < num_actions; ++i) {
