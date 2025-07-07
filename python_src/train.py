@@ -6,27 +6,30 @@ import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
 import traceback
-import threading
-import subprocess
 from collections import deque
-import queue
+import multiprocessing as mp
+
+# <<< ИЗМЕНЕНИЕ: Устанавливаем метод 'spawn' для multiprocessing >>>
+# Это САМОЕ ВАЖНОЕ ИЗМЕНЕНИЕ. Оно должно быть выполнено до создания
+# любых пулов или процессов в основном блоке скрипта.
+if __name__ == '__main__':
+    if mp.get_start_method(allow_none=True) != 'spawn':
+        mp.set_start_method('spawn', force=True)
+
+# Добавляем путь к скомпилированному модулю
+import sys
+sys.path.append('/content/PAQN/build')
 
 from .model import PolicyNetwork, ValueNetwork
-from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
+# <<< ИЗМЕНЕНИЕ: Импортируем новые классы из биндингов
+from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager, InferenceRequest, InferenceResult
 
 # --- Настройки ---
-NUM_CPP_WORKERS = int(os.cpu_count() * 0.75) if (os.cpu_count() or 0) > 4 else 4
-NUM_INFERENCE_WORKERS = int(os.cpu_count() * 0.25) if (os.cpu_count() or 0) > 4 else 2
-if NUM_INFERENCE_WORKERS < 1: NUM_INFERENCE_WORKERS = 1
-if NUM_CPP_WORKERS < 1: NUM_CPP_WORKERS = 1
-
-COMPUTATION_THREADS = str(NUM_INFERENCE_WORKERS)
-os.environ['OMP_NUM_THREADS'] = COMPUTATION_THREADS
-os.environ['OPENBLAS_NUM_THREADS'] = COMPUTATION_THREADS
-os.environ['MKL_NUM_THREADS'] = COMPUTATION_THREADS
-os.environ['VECLIB_MAXIMUM_THREADS'] = COMPUTATION_THREADS
-os.environ['NUMEXPR_NUM_THREADS'] = COMPUTATION_THREADS
-torch.set_num_threads(int(COMPUTATION_THREADS))
+# <<< ИЗМЕНЕНИЕ: Более консервативная и надежная настройка воркеров
+TOTAL_CPUS = os.cpu_count() or 1
+RESERVED_CPUS = 2 if TOTAL_CPUS > 4 else 1
+NUM_INFERENCE_WORKERS = max(1, int(TOTAL_CPUS * 0.25))
+NUM_CPP_WORKERS = max(1, TOTAL_CPUS - NUM_INFERENCE_WORKERS - RESERVED_CPUS)
 
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
@@ -37,165 +40,225 @@ ACTION_LIMIT = 1000
 POLICY_LR = 0.0002
 VALUE_LR = 0.001
 BUFFER_CAPACITY = 2_000_000
-BATCH_SIZE = 8192
+BATCH_SIZE = 1024 # Уменьшил для стабильности на старте
+MIN_BUFFER_FILL = BATCH_SIZE * 10 # Начинаем обучение, когда есть хотя бы 10 батчей
 SAVE_INTERVAL_SECONDS = 300
-POLICY_MODEL_PATH = "paqn_policy_model.pth"
-VALUE_MODEL_PATH = "paqn_value_model.pth"
+STATS_INTERVAL_SECONDS = 10
+POLICY_MODEL_PATH = "/content/models/paqn_policy_model.pth"
+VALUE_MODEL_PATH = "/content/models/paqn_value_model.pth"
 
-print("Initializing C++ hand evaluator lookup tables...", flush=True)
-initialize_evaluator()
-print("C++ evaluator initialized successfully.", flush=True)
-
-inference_task_queue = queue.Queue(maxsize=NUM_CPP_WORKERS * 8)
-
-def policy_inference_callback(traversal_id, infoset, action_vectors, responder_callback):
-    inference_task_queue.put(("POLICY", traversal_id, infoset, action_vectors, responder_callback))
-
-def value_inference_callback(traversal_id, infoset, responder_callback):
-    inference_task_queue.put(("VALUE", traversal_id, infoset, None, responder_callback))
-
-class InferenceWorker(threading.Thread):
-    def __init__(self, worker_id, policy_net, value_net, device, task_queue):
-        super().__init__(daemon=True, name=f"InferenceWorker-{worker_id}")
-        self.policy_net = policy_net
-        self.value_net = value_net
-        self.device = device
+# <<< ИЗМЕНЕНИЕ: Класс воркера теперь наследуется от mp.Process
+class InferenceWorker(mp.Process):
+    def __init__(self, name, task_queue, result_queue, stop_event):
+        super().__init__(name=name)
         self.task_queue = task_queue
-        self.stop_event = threading.Event()
+        self.result_queue = result_queue
+        self.stop_event = stop_event
+        self.policy_net = None
+        self.value_net = None
+        self.device = None
 
-    def run(self):
+    def _initialize(self):
+        """Инициализация внутри дочернего процесса."""
+        print(f"[{self.name}] Started.", flush=True)
+        self.device = torch.device("cpu")
+        
+        # Настраиваем потоки для torch внутри воркера
+        torch.set_num_threads(1)
+        os.environ['OMP_NUM_THREADS'] = '1'
+        
+        self.policy_net = PolicyNetwork(INPUT_SIZE, ACTION_VECTOR_SIZE).to(self.device)
+        self.value_net = ValueNetwork(INPUT_SIZE).to(self.device)
+        
+        if os.path.exists(POLICY_MODEL_PATH):
+            self.policy_net.load_state_dict(torch.load(POLICY_MODEL_PATH, map_location=self.device))
+        if os.path.exists(VALUE_MODEL_PATH):
+            self.value_net.load_state_dict(torch.load(VALUE_MODEL_PATH, map_location=self.device))
+            
         self.policy_net.eval()
         self.value_net.eval()
+
+    def run(self):
+        self._initialize()
         while not self.stop_event.is_set():
             try:
-                task = self.task_queue.get(timeout=1.0)
-                if task is None: break
-                task_type, _, infoset, action_vectors, responder_callback = task
+                # <<< ИЗМЕНЕНИЕ: Получаем C++ структуру InferenceRequest
+                req: InferenceRequest = self.task_queue.get(timeout=1.0)
                 
-                if task_type == "POLICY":
-                    if not action_vectors:
-                        responder_callback([])
+                if req.is_policy_request:
+                    if not req.action_vectors:
+                        predictions = []
                     else:
-                        batch_size = len(action_vectors)
-                        infoset_tensor = torch.tensor([infoset] * batch_size, dtype=torch.float32)
-                        actions_tensor = torch.tensor(action_vectors, dtype=torch.float32)
+                        batch_size = len(req.action_vectors)
+                        infoset_tensor = torch.tensor([req.infoset] * batch_size, dtype=torch.float32, device=self.device)
+                        actions_tensor = torch.tensor(req.action_vectors, dtype=torch.float32, device=self.device)
                         with torch.inference_mode():
-                            predictions = self.policy_net(infoset_tensor, actions_tensor).cpu().numpy().flatten()
-                        responder_callback(predictions.tolist())
-                elif task_type == "VALUE":
-                    infoset_tensor = torch.tensor([infoset], dtype=torch.float32)
+                            predictions = self.policy_net(infoset_tensor, actions_tensor).cpu().numpy().flatten().tolist()
+                    
+                    res = InferenceResult()
+                    res.id = req.id
+                    res.is_policy_result = True
+                    res.predictions = predictions
+                    self.result_queue.put(res)
+
+                else: # Value request
+                    infoset_tensor = torch.tensor([req.infoset], dtype=torch.float32, device=self.device)
                     with torch.inference_mode():
                         prediction = self.value_net(infoset_tensor).item()
-                    responder_callback(prediction)
-                self.task_queue.task_done()
-            except queue.Empty:
+                    
+                    res = InferenceResult()
+                    res.id = req.id
+                    res.is_policy_result = False
+                    res.predictions = [prediction]
+                    self.result_queue.put(res)
+
+            except mp.queues.Empty:
                 continue
+            except (KeyboardInterrupt, SystemExit):
+                break
             except Exception:
                 print(f"---!!! EXCEPTION IN {self.name} !!!---", flush=True)
                 traceback.print_exc()
-    
-    def stop(self):
-        self.stop_event.set()
-        for _ in range(NUM_INFERENCE_WORKERS):
-            try:
-                self.task_queue.put_nowait(None)
-            except queue.Full:
-                pass
+        
+        print(f"[{self.name}] Stopped.", flush=True)
 
 def main():
+    os.makedirs(os.path.dirname(POLICY_MODEL_PATH), exist_ok=True)
+    
+    print("Initializing C++ hand evaluator lookup tables...", flush=True)
+    initialize_evaluator()
+    print("C++ evaluator initialized successfully.", flush=True)
+
     device = torch.device("cpu")
     print(f"Using device: {device}", flush=True)
+    
+    # Главные модели для обучения
     policy_net = PolicyNetwork(INPUT_SIZE, ACTION_VECTOR_SIZE).to(device)
     value_net = ValueNetwork(INPUT_SIZE).to(device)
     if os.path.exists(POLICY_MODEL_PATH):
         policy_net.load_state_dict(torch.load(POLICY_MODEL_PATH, map_location=device))
     if os.path.exists(VALUE_MODEL_PATH):
         value_net.load_state_dict(torch.load(VALUE_MODEL_PATH, map_location=device))
+        
     policy_optimizer = optim.Adam(policy_net.parameters(), lr=POLICY_LR)
     value_optimizer = optim.Adam(value_net.parameters(), lr=VALUE_LR)
     value_criterion = nn.MSELoss()
     policy_criterion = nn.MSELoss()
+    
+    # Общие ресурсы
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
+    
+    # <<< ИЗМЕНЕНИЕ: Используем multiprocessing.Queue
+    request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 4)
+    result_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 4)
+    stop_event = mp.Event()
+
+    # Запуск воркеров инференса
     inference_workers = []
     for i in range(NUM_INFERENCE_WORKERS):
-        worker = InferenceWorker(i, policy_net, value_net, device, inference_task_queue)
+        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_queue, stop_event)
         worker.start()
         inference_workers.append(worker)
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
     solver_manager = SolverManager(
         NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
-        policy_inference_callback, value_inference_callback
+        request_queue, result_queue
     )
     print("C++ workers are running in the background.", flush=True)
     
     policy_losses = deque(maxlen=100)
     value_losses = deque(maxlen=100)
-    last_report_time = time.time()
+    last_stats_time = time.time()
     last_save_time = time.time()
-    last_report_head = 0
     
     try:
         while True:
-            time.sleep(1.0)
-            if value_buffer.get_count() >= BATCH_SIZE:
+            time.sleep(0.5) # Главный цикл может спать, работа идет в других процессах
+            
+            # Обучение Value Network
+            if value_buffer.size() >= MIN_BUFFER_FILL:
                 value_net.train()
-                infosets_np, _, targets_np = value_buffer.sample(BATCH_SIZE)
-                infosets, targets = torch.from_numpy(infosets_np), torch.from_numpy(targets_np)
-                value_optimizer.zero_grad()
-                loss = value_criterion(value_net(infosets), targets)
-                loss.backward()
-                clip_grad_norm_(value_net.parameters(), 1.0)
-                value_optimizer.step()
-                value_losses.append(loss.item())
+                batch = value_buffer.sample(BATCH_SIZE)
+                if batch:
+                    infosets_np, _, targets_np = batch
+                    infosets = torch.from_numpy(infosets_np).to(device)
+                    targets = torch.from_numpy(targets_np).to(device)
+                    
+                    value_optimizer.zero_grad()
+                    predictions = value_net(infosets)
+                    loss = value_criterion(predictions, targets)
+                    loss.backward()
+                    clip_grad_norm_(value_net.parameters(), 1.0)
+                    value_optimizer.step()
+                    value_losses.append(loss.item())
                 value_net.eval()
-            if policy_buffer.get_count() >= BATCH_SIZE:
+
+            # Обучение Policy Network
+            if policy_buffer.size() >= MIN_BUFFER_FILL:
                 policy_net.train()
-                infosets_np, actions_np, advantages_np = policy_buffer.sample(BATCH_SIZE)
-                infosets, actions, advantages = torch.from_numpy(infosets_np), torch.from_numpy(actions_np), torch.from_numpy(advantages_np)
-                policy_optimizer.zero_grad()
-                logits = policy_net(infosets, actions)
-                loss = policy_criterion(logits, advantages)
-                loss.backward()
-                clip_grad_norm_(policy_net.parameters(), 1.0)
-                policy_optimizer.step()
-                policy_losses.append(loss.item())
+                batch = policy_buffer.sample(BATCH_SIZE)
+                if batch:
+                    infosets_np, actions_np, advantages_np = batch
+                    infosets = torch.from_numpy(infosets_np).to(device)
+                    actions = torch.from_numpy(actions_np).to(device)
+                    advantages = torch.from_numpy(advantages_np).to(device)
+                    
+                    policy_optimizer.zero_grad()
+                    logits = policy_net(infosets, actions)
+                    loss = policy_criterion(logits, advantages)
+                    loss.backward()
+                    clip_grad_norm_(policy_net.parameters(), 1.0)
+                    policy_optimizer.step()
+                    policy_losses.append(loss.item())
                 policy_net.eval()
+
             now = time.time()
-            if now - last_report_time > 15.0:
-                duration = now - last_report_time
-                current_head = policy_buffer.get_head()
-                samples_generated_interval = current_head - last_report_head
-                last_report_head = current_head
-                samples_per_sec = samples_generated_interval / duration if duration > 0 else 0
+            if now - last_stats_time > STATS_INTERVAL_SECONDS:
+                total_generated = policy_buffer.total_generated()
                 avg_p_loss = np.mean(policy_losses) if policy_losses else float('nan')
                 avg_v_loss = np.mean(value_losses) if value_losses else float('nan')
+                
                 print("\n" + "="*20 + " STATS UPDATE " + "="*20, flush=True)
                 print(f"Time: {time.strftime('%H:%M:%S')}", flush=True)
-                print(f"Throughput: {samples_per_sec:,.2f} samples/sec", flush=True)
-                print(f"Total Generated: {current_head:,}", flush=True)
-                print(f"Buffer Fill -> Policy: {policy_buffer.get_count():,}/{BUFFER_CAPACITY:,} ({policy_buffer.get_count()/BUFFER_CAPACITY:.1%}) "
-                      f"| Value: {value_buffer.get_count():,}/{BUFFER_CAPACITY:,} ({value_buffer.get_count()/BUFFER_CAPACITY:.1%})", flush=True)
+                print(f"Total Generated: {total_generated:,}", flush=True)
+                print(f"Buffer Fill -> Policy: {policy_buffer.size():,}/{BUFFER_CAPACITY:,} ({policy_buffer.size()/BUFFER_CAPACITY:.1%}) "
+                      f"| Value: {value_buffer.size():,}/{BUFFER_CAPACITY:,} ({value_buffer.size()/BUFFER_CAPACITY:.1%})", flush=True)
                 print(f"Avg Losses (last 100) -> Policy: {avg_p_loss:.6f} | Value: {avg_v_loss:.6f}", flush=True)
-                print(f"Inference Queue Size: {inference_task_queue.qsize()}", flush=True)
+                print(f"Request Queue: {request_queue.qsize()} | Result Queue: {result_queue.qsize()}", flush=True)
                 print("="*54, flush=True)
-                last_report_time = now
-                if now - last_save_time > SAVE_INTERVAL_SECONDS:
-                    print("\n--- Saving models ---", flush=True)
-                    torch.save(policy_net.state_dict(), POLICY_MODEL_PATH)
-                    torch.save(value_net.state_dict(), VALUE_MODEL_PATH)
-                    last_save_time = now
+                last_stats_time = now
+
+            if now - last_save_time > SAVE_INTERVAL_SECONDS:
+                print("\n--- Saving models ---", flush=True)
+                torch.save(policy_net.state_dict(), POLICY_MODEL_PATH)
+                torch.save(value_net.state_dict(), VALUE_MODEL_PATH)
+                last_save_time = now
+
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.", flush=True)
     finally:
         print("Stopping all workers...", flush=True)
         solver_manager.stop()
+        print("C++ workers stopped.")
+        
+        stop_event.set()
+        # Очищаем очереди, чтобы воркеры вышли из .get()
+        while not request_queue.empty():
+            try: request_queue.get_nowait()
+            except: pass
+        while not result_queue.empty():
+            try: result_queue.get_nowait()
+            except: pass
+            
         for worker in inference_workers:
-            worker.stop()
-        for worker in inference_workers:
-            worker.join()
+            worker.join(timeout=5)
+            if worker.is_alive():
+                print(f"Terminating worker {worker.name}...", flush=True)
+                worker.terminate()
         print("All Python workers stopped.")
+        
         print("Final model saving...", flush=True)
         torch.save(policy_net.state_dict(), f"{POLICY_MODEL_PATH}.final")
         torch.save(value_net.state_dict(), f"{VALUE_MODEL_PATH}.final")
