@@ -14,9 +14,9 @@
 
 namespace ofc {
 
-// ... (вспомогательные функции и конструктор без изменений) ...
 std::vector<float> action_to_vector(const Action& action);
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng);
+
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -37,6 +37,7 @@ std::vector<float> action_to_vector(const Action& action) {
     }
     return vec;
 }
+
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng) {
     if (strategy.empty()) { return; }
     std::gamma_distribution<float> gamma(alpha, 1.0f);
@@ -53,7 +54,9 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
         }
     }
 }
+
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
+
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
                      InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue) 
     : action_limit_(action_limit), 
@@ -65,6 +68,7 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, Sha
            static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))),
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
 {}
+
 void DeepMCCFR::run_traversal() {
     uint64_t traversal_id = ++traversal_counter_;
     GameState state; 
@@ -72,6 +76,7 @@ void DeepMCCFR::run_traversal() {
     state.reset(); 
     traverse(state, 1, true, traversal_id);
 }
+
 std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view) {
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
@@ -141,36 +146,24 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         return result;
     }
 
-    // <<< ИЗМЕНЕНИЕ: Упрощаем и делаем логику канонизации более надежной >>>
-    
-    // 1. Сначала создаем каноническое состояние и его инфосет
-    std::map<int, int> suit_map_for_state;
-    GameState canonical_state = state.get_canonical({}, suit_map_for_state); // Передаем пустой вектор действий
+    std::map<int, int> suit_map;
+    GameState canonical_state = state.get_canonical(suit_map);
     std::vector<float> infoset_vec = featurize(canonical_state, traversing_player);
-
-    // 2. Теперь строим канонические векторы действий, динамически создавая карту мастей
+    
     std::vector<std::vector<float>> canonical_action_vectors;
     canonical_action_vectors.reserve(num_actions);
     
-    std::map<int, int> suit_map_for_actions;
-    int next_canonical_suit = 0;
-
     auto remap_card_safely = [&](Card& card) {
         if (card == INVALID_CARD) return;
-        int original_suit = get_suit(card);
-        // Если масть еще не встречалась, назначаем ей следующий свободный канонический номер
-        if (suit_map_for_actions.find(original_suit) == suit_map_for_actions.end()) {
-            suit_map_for_actions[original_suit] = next_canonical_suit++;
+        if (suit_map.count(get_suit(card))) {
+            card = get_rank(card) * 4 + suit_map.at(get_suit(card));
+        } else {
+            card = INVALID_CARD; 
         }
-        card = get_rank(card) * 4 + suit_map_for_actions[original_suit];
     };
 
     for (const auto& original_action : legal_actions) {
         Action canonical_action = original_action;
-        // Сбрасываем карту мастей для каждого действия, чтобы обеспечить локальную инвариантность
-        suit_map_for_actions.clear();
-        next_canonical_suit = 0;
-        // Применяем безопасное переназначение
         for (auto& placement : canonical_action.first) {
             remap_card_safely(placement.first);
         }
@@ -178,8 +171,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
     
-    // <<< КОНЕЦ ИЗМЕНЕНИЯ >>>
-
     uint64_t policy_request_id = traversal_id * 2;
     {
         py::gil_scoped_acquire acquire;
