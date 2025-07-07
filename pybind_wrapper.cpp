@@ -6,28 +6,32 @@
 #include <atomic>
 #include <vector>
 #include <memory>
+#include <iostream>
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
 #include "cpp_src/constants.hpp"
 #include "cpp_src/hand_evaluator.hpp"
+#include "cpp_src/InferenceQueue.hpp" // <<< ИЗМЕНЕНИЕ
 
 namespace py = pybind11;
 
 // Класс-менеджер для управления C++ потоками
 class SolverManager {
 public:
+    // <<< ИЗМЕНЕНИЕ: Конструктор теперь принимает Python-очереди
     SolverManager(
         size_t num_workers,
         size_t action_limit, 
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
-        ofc::PolicyInferenceCallback policy_cb, 
-        ofc::ValueInferenceCallback value_cb
-    ) {
+        py::object request_queue, // py::object для очереди
+        py::object result_queue   // py::object для очереди
+    ) : request_queue_(request_queue), result_queue_(result_queue) {
         stop_flag_.store(false);
         for (size_t i = 0; i < num_workers; ++i) {
+            // Создаем C++ решатель, передавая ему Python-очереди
             auto solver = std::make_unique<ofc::DeepMCCFR>(
-                action_limit, policy_buffer, value_buffer, policy_cb, value_cb
+                action_limit, policy_buffer, value_buffer, &request_queue_, &result_queue_
             );
             threads_.emplace_back(&SolverManager::worker_loop, this, std::move(solver));
         }
@@ -39,6 +43,7 @@ public:
 
     void stop() {
         if (!stop_flag_.exchange(true)) {
+            // Здесь не нужно ничего делать с очередями, Python сам их закроет
             for (auto& t : threads_) {
                 if (t.joinable()) {
                     t.join();
@@ -56,39 +61,61 @@ private:
 
     std::vector<std::thread> threads_;
     std::atomic<bool> stop_flag_;
+    // <<< ИЗМЕНЕНИЕ: Храним Python-объекты очередей
+    py::object request_queue_;
+    py::object result_queue_;
 };
 
 PYBIND11_MODULE(ofc_engine, m) {
-    m.doc() = "OFC Engine with C++ Thread Manager";
+    m.doc() = "OFC Engine with C++ Thread Manager and Queue-based Inference";
+
+    // <<< ИЗМЕНЕНИЕ: Регистрируем структуры для обмена данными
+    py::class_<ofc::InferenceRequest>(m, "InferenceRequest")
+        .def(py::init<>())
+        .def_readwrite("id", &ofc::InferenceRequest::id)
+        .def_readwrite("is_policy_request", &ofc::InferenceRequest::is_policy_request)
+        .def_readwrite("infoset", &ofc::InferenceRequest::infoset)
+        .def_readwrite("action_vectors", &ofc::InferenceRequest::action_vectors);
+
+    py::class_<ofc::InferenceResult>(m, "InferenceResult")
+        .def(py::init<>())
+        .def_readwrite("id", &ofc::InferenceResult::id)
+        .def_readwrite("is_policy_result", &ofc::InferenceResult::is_policy_result)
+        .def_readwrite("predictions", &ofc::InferenceResult::predictions);
 
     m.def("initialize_evaluator", []() {
         omp::HandEvaluator::initialize();
-    }, py::call_guard<py::gil_scoped_release>());
+    }, "Initializes the static hand evaluator lookup tables.", py::call_guard<py::gil_scoped_release>());
 
     py::class_<ofc::SharedReplayBuffer>(m, "ReplayBuffer")
         .def(py::init<uint64_t>(), py::arg("capacity"))
-        .def("get_count", &ofc::SharedReplayBuffer::get_count)
-        .def("get_head", &ofc::SharedReplayBuffer::get_head)
-        .def("push", &ofc::SharedReplayBuffer::push, py::arg("infoset"), py::arg("action"), py::arg("target"))
+        .def("size", &ofc::SharedReplayBuffer::size)
+        .def("total_generated", &ofc::SharedReplayBuffer::total_generated)
         .def("sample", [](ofc::SharedReplayBuffer &buffer, int batch_size) {
-            auto infosets_np = py::array_t<float>(batch_size * ofc::INFOSET_SIZE);
-            auto actions_np = py::array_t<float>(batch_size * ofc::ACTION_VECTOR_SIZE);
-            auto targets_np = py::array_t<float>(batch_size);
-            buffer.sample(
+            auto infosets_np = py::array_t<float>({batch_size, ofc::INFOSET_SIZE});
+            auto actions_np = py::array_t<float>({batch_size, ofc::ACTION_VECTOR_SIZE});
+            auto targets_np = py::array_t<float>({batch_size, 1});
+            
+            bool success = buffer.sample(
                 batch_size, 
                 static_cast<float*>(infosets_np.request().ptr), 
                 static_cast<float*>(actions_np.request().ptr),
                 static_cast<float*>(targets_np.request().ptr)
             );
-            infosets_np.resize({batch_size, ofc::INFOSET_SIZE});
-            actions_np.resize({batch_size, ofc::ACTION_VECTOR_SIZE});
-            targets_np.resize({batch_size, 1});
+
+            if (!success) {
+                return py::none();
+            }
+            
             return std::make_tuple(infosets_np, actions_np, targets_np);
-        }, py::arg("batch_size"));
+        }, py::arg("batch_size"), "Samples a batch from the buffer. Returns None if not enough samples.");
         
     py::class_<SolverManager>(m, "SolverManager")
-        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, ofc::PolicyInferenceCallback, ofc::ValueInferenceCallback>(),
-             py::arg("num_workers"), py::arg("action_limit"), py::arg("policy_buffer"), py::arg("value_buffer"),
-             py::arg("policy_callback"), py::arg("value_callback"))
+        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(),
+             py::arg("num_workers"), py::arg("action_limit"), 
+             py::arg("policy_buffer"), py::arg("value_buffer"),
+             py::arg("request_queue"), py::arg("result_queue"),
+             // <<< ИЗМЕНЕНИЕ: Отпускаем GIL при создании, т.к. конструктор запускает потоки
+             py::call_guard<py::gil_scoped_release>())
         .def("stop", &SolverManager::stop, py::call_guard<py::gil_scoped_release>());
 }
