@@ -4,6 +4,7 @@
 #include <map>
 #include <chrono>
 #include <functional> // Для std::hash
+#include <thread>
 
 namespace ofc {
 
