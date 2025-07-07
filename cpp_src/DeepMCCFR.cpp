@@ -14,7 +14,7 @@
 
 namespace ofc {
 
-// <<< ИСПРАВЛЕНИЕ: Добавляем объявления функций в начало файла
+// ... (вспомогательные функции action_to_vector и add_dirichlet_noise остаются без изменений) ...
 std::vector<float> action_to_vector(const Action& action);
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng);
 
@@ -30,8 +30,6 @@ std::vector<float> action_to_vector(const Action& action) {
         else if (row_name == "middle") slot_idx = 1;
         else if (row_name == "bottom") slot_idx = 2;
         if (slot_idx != -1 && card != INVALID_CARD) {
-            // Предполагается, что card - это индекс от 0 до 51
-            // top=0, middle=1, bottom=2, discard=3
             vec[card * 4 + slot_idx] = 1.0f;
         }
     }
@@ -40,7 +38,6 @@ std::vector<float> action_to_vector(const Action& action) {
     }
     return vec;
 }
-
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng) {
     if (strategy.empty()) { return; }
     std::gamma_distribution<float> gamma(alpha, 1.0f);
@@ -81,68 +78,49 @@ void DeepMCCFR::run_traversal() {
     traverse(state, 1, true, traversal_id);
 }
 
-// <<< ИСПРАВЛЕНИЕ: ВОТ ЭТУ ФУНКЦИЮ НУЖНО ВЕРНУТЬ >>>
 std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view) {
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
     std::vector<float> features(INFOSET_SIZE, 0.0f);
     int offset = 0;
     
-    // Общая информация об игре (3)
     features[offset++] = static_cast<float>(state.get_street());
     features[offset++] = static_cast<float>(state.get_dealer_pos());
     features[offset++] = static_cast<float>(state.get_current_player());
     
-    // Карты на руках у текущего игрока (52)
     const auto& dealt_cards = state.get_dealt_cards();
     for (Card c : dealt_cards) {
         if (c != INVALID_CARD) features[offset + c] = 1.0f;
     }
     offset += 52;
     
-    // Функция для обработки доски (моей или оппонента)
     auto process_board = [&](const Board& board, int& current_offset) {
-        // Top row (3 cards) -> 52 floats
         for(int i=0; i<3; ++i) {
             if (board.top[i] != INVALID_CARD) features[current_offset + board.top[i]] = 1.0f;
         }
         current_offset += 52;
-        // Middle row (5 cards) -> 52 floats
         for(int i=0; i<5; ++i) {
             if (board.middle[i] != INVALID_CARD) features[current_offset + board.middle[i]] = 1.0f;
         }
         current_offset += 52;
-        // Bottom row (5 cards) -> 52 floats
         for(int i=0; i<5; ++i) {
             if (board.bottom[i] != INVALID_CARD) features[current_offset + board.bottom[i]] = 1.0f;
         }
         current_offset += 52;
     };
     
-    // Моя доска (52*3 = 156)
     process_board(my_board, offset);
-    // Доска оппонента (52*3 = 156)
     process_board(opp_board, offset);
     
-    // Мои сброшенные карты (52)
     const auto& my_discards = state.get_my_discards(player_view);
     for (Card c : my_discards) {
         if (c != INVALID_CARD) features[offset + c] = 1.0f;
     }
     offset += 52;
     
-    // Количество сброшенных карт оппонента (1)
     features[offset++] = static_cast<float>(state.get_opponent_discard_count(player_view));
-    
-    // Fantasyland status for me (1)
-    features[offset++] = 0.0f; // Placeholder
-    // Fantasyland status for opponent (1)
-    features[offset++] = 0.0f; // Placeholder
-
-    // Total size check: 3 + 52 + 156 + 156 + 52 + 1 + 1 + 1 = 422.
-    // Это не соответствует 1486. Нужно будет пересмотреть структуру инфосета.
-    // Пока что оставляем так, чтобы код компилировался и работал.
-    // Логическая ошибка в размере инфосета не должна приводить к падению.
+    features[offset++] = 0.0f; // Placeholder for my fantasyland
+    features[offset++] = 0.0f; // Placeholder for opp fantasyland
 
     return features;
 }
@@ -198,7 +176,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         py::gil_scoped_acquire acquire;
         py::tuple request_tuple = py::make_tuple(
             policy_request_id, 
-            true, // is_policy_request
+            true,
             py::cast(infoset_vec), 
             py::cast(canonical_action_vectors)
         );
@@ -211,7 +189,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         py::object result_obj = result_queue_->attr("get")(); 
         py::tuple result_tuple = result_obj.cast<py::tuple>();
         uint64_t result_id = result_tuple[0].cast<uint64_t>();
-
         if (result_id != policy_request_id) {
             return {};
         }
@@ -257,9 +234,9 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         py::gil_scoped_acquire acquire;
         py::tuple request_tuple = py::make_tuple(
             value_request_id, 
-            false, // is_policy_request
+            false,
             py::cast(infoset_vec), 
-            py::none() // placeholder для action_vectors
+            py::none()
         );
         request_queue_->attr("put")(request_tuple);
     }
@@ -271,15 +248,18 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         py::tuple result_tuple = result_obj.cast<py::tuple>();
         uint64_t result_id = result_tuple[0].cast<uint64_t>();
         std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
-
         if (result_id != value_request_id || predictions.empty()) {
             return {};
         }
         value_baseline = predictions[0];
     }
 
+    // <<< ИЗМЕНЕНИЕ: Сохраняем сэмпл для Value-сети в КАЖДОМ узле >>>
+    // Таргетом является ожидаемый исход (payoff) из этого узла, который мы посчитали,
+    // усреднив исходы всех исследованных действий согласно стратегии.
     value_buffer_->push(infoset_vec, dummy_action_vec_, node_payoffs.at(current_player));
 
+    // Сохраняем сэмплы для Policy-сети
     for (int i = 0; i < num_actions; ++i) {
         float advantage = action_payoffs[i].at(current_player) - value_baseline;
         policy_buffer_->push(infoset_vec, canonical_action_vectors[i], advantage);
