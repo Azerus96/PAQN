@@ -9,23 +9,18 @@ import traceback
 from collections import deque
 import multiprocessing as mp
 
-# <<< ИЗМЕНЕНИЕ: Устанавливаем метод 'spawn' для multiprocessing >>>
-# Это САМОЕ ВАЖНОЕ ИЗМЕНЕНИЕ. Оно должно быть выполнено до создания
-# любых пулов или процессов в основном блоке скрипта.
 if __name__ == '__main__':
     if mp.get_start_method(allow_none=True) != 'spawn':
         mp.set_start_method('spawn', force=True)
 
-# Добавляем путь к скомпилированному модулю
 import sys
 sys.path.append('/content/PAQN/build')
 
-from .model import PolicyNetwork, ValueNetwork
-# <<< ИЗМЕНЕНИЕ: Импортируем новые классы из биндингов
+# <<< ИСПРАВЛЕНИЕ: Импортируем правильный класс модели
+from .model import PAQN_Network 
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager, InferenceRequest, InferenceResult
 
 # --- Настройки ---
-# <<< ИЗМЕНЕНИЕ: Более консервативная и надежная настройка воркеров
 TOTAL_CPUS = os.cpu_count() or 1
 RESERVED_CPUS = 2 if TOTAL_CPUS > 4 else 1
 NUM_INFERENCE_WORKERS = max(1, int(TOTAL_CPUS * 0.25))
@@ -40,49 +35,37 @@ ACTION_LIMIT = 1000
 POLICY_LR = 0.0002
 VALUE_LR = 0.001
 BUFFER_CAPACITY = 2_000_000
-BATCH_SIZE = 1024 # Уменьшил для стабильности на старте
-MIN_BUFFER_FILL = BATCH_SIZE * 10 # Начинаем обучение, когда есть хотя бы 10 батчей
+BATCH_SIZE = 1024
+MIN_BUFFER_FILL = BATCH_SIZE * 10
 SAVE_INTERVAL_SECONDS = 300
 STATS_INTERVAL_SECONDS = 10
-POLICY_MODEL_PATH = "/content/models/paqn_policy_model.pth"
-VALUE_MODEL_PATH = "/content/models/paqn_value_model.pth"
+MODEL_PATH = "/content/models/paqn_model.pth" # <<< ИСПРАВЛЕНИЕ: Одна модель - один путь
 
-# <<< ИЗМЕНЕНИЕ: Класс воркера теперь наследуется от mp.Process
 class InferenceWorker(mp.Process):
     def __init__(self, name, task_queue, result_queue, stop_event):
         super().__init__(name=name)
         self.task_queue = task_queue
         self.result_queue = result_queue
         self.stop_event = stop_event
-        self.policy_net = None
-        self.value_net = None
+        self.model = None # <<< ИСПРАВЛЕНИЕ: Одна модель
         self.device = None
 
     def _initialize(self):
-        """Инициализация внутри дочернего процесса."""
         print(f"[{self.name}] Started.", flush=True)
         self.device = torch.device("cpu")
-        
-        # Настраиваем потоки для torch внутри воркера
         torch.set_num_threads(1)
         os.environ['OMP_NUM_THREADS'] = '1'
         
-        self.policy_net = PolicyNetwork(INPUT_SIZE, ACTION_VECTOR_SIZE).to(self.device)
-        self.value_net = ValueNetwork(INPUT_SIZE).to(self.device)
-        
-        if os.path.exists(POLICY_MODEL_PATH):
-            self.policy_net.load_state_dict(torch.load(POLICY_MODEL_PATH, map_location=self.device))
-        if os.path.exists(VALUE_MODEL_PATH):
-            self.value_net.load_state_dict(torch.load(VALUE_MODEL_PATH, map_location=self.device))
-            
-        self.policy_net.eval()
-        self.value_net.eval()
+        # <<< ИСПРАВЛЕНИЕ: Инициализируем и загружаем одну модель
+        self.model = PAQN_Network(INPUT_SIZE, ACTION_VECTOR_SIZE).to(self.device)
+        if os.path.exists(MODEL_PATH):
+            self.model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
+        self.model.eval()
 
     def run(self):
         self._initialize()
         while not self.stop_event.is_set():
             try:
-                # <<< ИЗМЕНЕНИЕ: Получаем C++ структуру InferenceRequest
                 req: InferenceRequest = self.task_queue.get(timeout=1.0)
                 
                 if req.is_policy_request:
@@ -93,7 +76,9 @@ class InferenceWorker(mp.Process):
                         infoset_tensor = torch.tensor([req.infoset] * batch_size, dtype=torch.float32, device=self.device)
                         actions_tensor = torch.tensor(req.action_vectors, dtype=torch.float32, device=self.device)
                         with torch.inference_mode():
-                            predictions = self.policy_net(infoset_tensor, actions_tensor).cpu().numpy().flatten().tolist()
+                            # <<< ИСПРАВЛЕНИЕ: Вызываем модель для получения только логитов
+                            policy_logits, _ = self.model(infoset_tensor, actions_tensor)
+                            predictions = policy_logits.cpu().numpy().flatten().tolist()
                     
                     res = InferenceResult()
                     res.id = req.id
@@ -104,7 +89,9 @@ class InferenceWorker(mp.Process):
                 else: # Value request
                     infoset_tensor = torch.tensor([req.infoset], dtype=torch.float32, device=self.device)
                     with torch.inference_mode():
-                        prediction = self.value_net(infoset_tensor).item()
+                        # <<< ИСПРАВЛЕНИЕ: Вызываем модель для получения только value
+                        value = self.model(infoset_tensor)
+                        prediction = value.item()
                     
                     res = InferenceResult()
                     res.id = req.id
@@ -123,7 +110,7 @@ class InferenceWorker(mp.Process):
         print(f"[{self.name}] Stopped.", flush=True)
 
 def main():
-    os.makedirs(os.path.dirname(POLICY_MODEL_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     
     print("Initializing C++ hand evaluator lookup tables...", flush=True)
     initialize_evaluator()
@@ -132,29 +119,22 @@ def main():
     device = torch.device("cpu")
     print(f"Using device: {device}", flush=True)
     
-    # Главные модели для обучения
-    policy_net = PolicyNetwork(INPUT_SIZE, ACTION_VECTOR_SIZE).to(device)
-    value_net = ValueNetwork(INPUT_SIZE).to(device)
-    if os.path.exists(POLICY_MODEL_PATH):
-        policy_net.load_state_dict(torch.load(POLICY_MODEL_PATH, map_location=device))
-    if os.path.exists(VALUE_MODEL_PATH):
-        value_net.load_state_dict(torch.load(VALUE_MODEL_PATH, map_location=device))
+    # <<< ИСПРАВЛЕНИЕ: Одна модель, один оптимизатор
+    model = PAQN_Network(INPUT_SIZE, ACTION_VECTOR_SIZE).to(device)
+    if os.path.exists(MODEL_PATH):
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
         
-    policy_optimizer = optim.Adam(policy_net.parameters(), lr=POLICY_LR)
-    value_optimizer = optim.Adam(value_net.parameters(), lr=VALUE_LR)
+    optimizer = optim.Adam(model.parameters(), lr=POLICY_LR) # Можно использовать один LR или разные для групп параметров
     value_criterion = nn.MSELoss()
     policy_criterion = nn.MSELoss()
     
-    # Общие ресурсы
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
     
-    # <<< ИЗМЕНЕНИЕ: Используем multiprocessing.Queue
     request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 4)
     result_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 4)
     stop_event = mp.Event()
 
-    # Запуск воркеров инференса
     inference_workers = []
     for i in range(NUM_INFERENCE_WORKERS):
         worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_queue, stop_event)
@@ -175,44 +155,47 @@ def main():
     
     try:
         while True:
-            time.sleep(0.5) # Главный цикл может спать, работа идет в других процессах
+            time.sleep(0.5)
             
-            # Обучение Value Network
-            if value_buffer.size() >= MIN_BUFFER_FILL:
-                value_net.train()
-                batch = value_buffer.sample(BATCH_SIZE)
-                if batch:
-                    infosets_np, _, targets_np = batch
-                    infosets = torch.from_numpy(infosets_np).to(device)
-                    targets = torch.from_numpy(targets_np).to(device)
-                    
-                    value_optimizer.zero_grad()
-                    predictions = value_net(infosets)
-                    loss = value_criterion(predictions, targets)
-                    loss.backward()
-                    clip_grad_norm_(value_net.parameters(), 1.0)
-                    value_optimizer.step()
-                    value_losses.append(loss.item())
-                value_net.eval()
+            # <<< ИСПРАВЛЕНИЕ: Обучаем обе "головы" за один проход
+            if value_buffer.size() >= MIN_BUFFER_FILL and policy_buffer.size() >= MIN_BUFFER_FILL:
+                model.train()
+                
+                # Сэмплируем для value
+                v_batch = value_buffer.sample(BATCH_SIZE)
+                # Сэмплируем для policy
+                p_batch = policy_buffer.sample(BATCH_SIZE)
 
-            # Обучение Policy Network
-            if policy_buffer.size() >= MIN_BUFFER_FILL:
-                policy_net.train()
-                batch = policy_buffer.sample(BATCH_SIZE)
-                if batch:
-                    infosets_np, actions_np, advantages_np = batch
-                    infosets = torch.from_numpy(infosets_np).to(device)
-                    actions = torch.from_numpy(actions_np).to(device)
-                    advantages = torch.from_numpy(advantages_np).to(device)
+                if v_batch and p_batch:
+                    v_infosets_np, _, v_targets_np = v_batch
+                    p_infosets_np, p_actions_np, p_advantages_np = p_batch
+
+                    v_infosets = torch.from_numpy(v_infosets_np).to(device)
+                    v_targets = torch.from_numpy(v_targets_np).to(device)
+                    p_infosets = torch.from_numpy(p_infosets_np).to(device)
+                    p_actions = torch.from_numpy(p_actions_np).to(device)
+                    p_advantages = torch.from_numpy(p_advantages_np).to(device)
+
+                    optimizer.zero_grad()
                     
-                    policy_optimizer.zero_grad()
-                    logits = policy_net(infosets, actions)
-                    loss = policy_criterion(logits, advantages)
-                    loss.backward()
-                    clip_grad_norm_(policy_net.parameters(), 1.0)
-                    policy_optimizer.step()
-                    policy_losses.append(loss.item())
-                policy_net.eval()
+                    # Forward pass для value
+                    pred_values = model(v_infosets)
+                    loss_v = value_criterion(pred_values, v_targets)
+                    
+                    # Forward pass для policy
+                    pred_logits, _ = model(p_infosets, p_actions)
+                    loss_p = policy_criterion(pred_logits, p_advantages)
+                    
+                    # Суммарный loss
+                    total_loss = loss_v + loss_p
+                    total_loss.backward()
+                    clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    
+                    value_losses.append(loss_v.item())
+                    policy_losses.append(loss_p.item())
+
+                model.eval()
 
             now = time.time()
             if now - last_stats_time > STATS_INTERVAL_SECONDS:
@@ -231,9 +214,8 @@ def main():
                 last_stats_time = now
 
             if now - last_save_time > SAVE_INTERVAL_SECONDS:
-                print("\n--- Saving models ---", flush=True)
-                torch.save(policy_net.state_dict(), POLICY_MODEL_PATH)
-                torch.save(value_net.state_dict(), VALUE_MODEL_PATH)
+                print("\n--- Saving model ---", flush=True)
+                torch.save(model.state_dict(), MODEL_PATH)
                 last_save_time = now
 
     except KeyboardInterrupt:
@@ -244,7 +226,6 @@ def main():
         print("C++ workers stopped.")
         
         stop_event.set()
-        # Очищаем очереди, чтобы воркеры вышли из .get()
         while not request_queue.empty():
             try: request_queue.get_nowait()
             except: pass
@@ -260,8 +241,7 @@ def main():
         print("All Python workers stopped.")
         
         print("Final model saving...", flush=True)
-        torch.save(policy_net.state_dict(), f"{POLICY_MODEL_PATH}.final")
-        torch.save(value_net.state_dict(), f"{VALUE_MODEL_PATH}.final")
+        torch.save(model.state_dict(), f"{MODEL_PATH}.final")
         print("Training finished.")
 
 if __name__ == "__main__":
