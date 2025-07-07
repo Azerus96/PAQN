@@ -14,12 +14,12 @@ namespace ofc {
 struct TrainingSample {
     std::vector<float> infoset_vector;
     std::vector<float> action_vector;
-    float target_regret;
+    float target_value; // Переименовал для ясности
 
     TrainingSample() 
         : infoset_vector(INFOSET_SIZE), 
           action_vector(ACTION_VECTOR_SIZE, 0.0f), 
-          target_regret(0.0f) {}
+          target_value(0.0f) {}
 };
 
 class SharedReplayBuffer {
@@ -28,11 +28,13 @@ public:
         : capacity_(capacity), head_(0), count_(0)
     {
         buffer_.resize(capacity_);
-        rng_.seed(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        // <<< ИЗМЕНЕНИЕ: Используем thread_local для RNG, чтобы избежать гонок состояний
+        thread_local static std::mt19937 rng(std::chrono::high_resolution_clock::now().time_since_epoch().count() + std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        rng_ = &rng;
         std::cout << "C++: Replay Buffer created with capacity " << capacity << std::endl;
     }
 
-    void push(const std::vector<float>& infoset_vec, const std::vector<float>& action_vec, float regret) {
+    void push(const std::vector<float>& infoset_vec, const std::vector<float>& action_vec, float target) {
         std::lock_guard<std::mutex> lock(mtx_);
         uint64_t index = head_ % capacity_;
         head_++;
@@ -40,42 +42,39 @@ public:
         auto& sample = buffer_[index];
         std::copy(infoset_vec.begin(), infoset_vec.end(), sample.infoset_vector.begin());
         std::copy(action_vec.begin(), action_vec.end(), sample.action_vector.begin());
-        sample.target_regret = regret;
+        sample.target_value = target;
         
         if (count_ < capacity_) {
             count_++;
         }
     }
 
-    void sample(int batch_size, float* out_infosets, float* out_actions, float* out_regrets) {
+    // <<< ИЗМЕНЕНИЕ: Возвращает false, если сэмплирование невозможно
+    bool sample(int batch_size, float* out_infosets, float* out_actions, float* out_targets) {
         std::lock_guard<std::mutex> lock(mtx_);
         
-        // --- ВАЖНОЕ ИСПРАВЛЕНИЕ ---
-        if (count_ == 0) { // Если буфер пуст, просто заполняем нулями
-            std::fill(out_infosets, out_infosets + batch_size * INFOSET_SIZE, 0.0f);
-            std::fill(out_actions, out_actions + batch_size * ACTION_VECTOR_SIZE, 0.0f);
-            std::fill(out_regrets, out_regrets + batch_size, 0.0f);
-            return;
+        if (count_ < static_cast<uint64_t>(batch_size)) {
+            return false; // Недостаточно сэмплов для батча
         }
 
-        // Если сэмплов меньше, чем batch_size, будем брать с повторениями
         std::uniform_int_distribution<uint64_t> dist(0, count_ - 1);
 
         for (int i = 0; i < batch_size; ++i) {
-            uint64_t sample_idx = dist(rng_);
+            uint64_t sample_idx = dist(*rng_);
             const auto& sample = buffer_[sample_idx];
             std::copy(sample.infoset_vector.begin(), sample.infoset_vector.end(), out_infosets + i * INFOSET_SIZE);
             std::copy(sample.action_vector.begin(), sample.action_vector.end(), out_actions + i * ACTION_VECTOR_SIZE);
-            *(out_regrets + i) = sample.target_regret;
+            *(out_targets + i) = sample.target_value;
         }
+        return true;
     }
     
-    uint64_t get_count() {
+    uint64_t size() {
         std::lock_guard<std::mutex> lock(mtx_);
         return count_;
     }
 
-    uint64_t get_head() {
+    uint64_t total_generated() {
         std::lock_guard<std::mutex> lock(mtx_);
         return head_;
     }
@@ -86,7 +85,8 @@ private:
     uint64_t head_;
     uint64_t count_;
     std::mutex mtx_;
-    std::mt19937 rng_;
+    // <<< ИЗМЕНЕНИЕ: Храним указатель на thread_local RNG
+    std::mt19937* rng_;
 };
 
 } // namespace ofc
