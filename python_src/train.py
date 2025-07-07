@@ -9,6 +9,8 @@ import traceback
 from collections import deque
 import multiprocessing as mp
 
+# Устанавливаем метод 'spawn' для multiprocessing до любых других импортов,
+# которые могут его использовать.
 if __name__ == '__main__':
     if mp.get_start_method(allow_none=True) != 'spawn':
         mp.set_start_method('spawn', force=True)
@@ -32,7 +34,7 @@ INPUT_SIZE = 1486
 ACTION_VECTOR_SIZE = 208
 ACTION_LIMIT = 1000
 POLICY_LR = 0.0002
-VALUE_LR = 0.001
+VALUE_LR = 0.001 # Можно сделать таким же, как POLICY_LR, или оставить разным
 BUFFER_CAPACITY = 2_000_000
 BATCH_SIZE = 1024
 MIN_BUFFER_FILL = BATCH_SIZE * 10
@@ -50,21 +52,26 @@ class InferenceWorker(mp.Process):
         self.device = None
 
     def _initialize(self):
+        """Инициализация происходит ВНУТРИ дочернего процесса."""
         print(f"[{self.name}] Started.", flush=True)
         self.device = torch.device("cpu")
+        
+        # Настраиваем потоки для torch внутри воркера
         torch.set_num_threads(1)
         os.environ['OMP_NUM_THREADS'] = '1'
         
         self.model = PAQN_Network(INPUT_SIZE, ACTION_VECTOR_SIZE).to(self.device)
         if os.path.exists(MODEL_PATH):
-            self.model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
+            try:
+                self.model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
+            except Exception as e:
+                print(f"[{self.name}] Failed to load model, starting fresh: {e}", flush=True)
         self.model.eval()
 
     def run(self):
         self._initialize()
         while not self.stop_event.is_set():
             try:
-                # <<< ИЗМЕНЕНИЕ: Получаем Python tuple
                 req_id, is_policy, infoset, action_vectors = self.task_queue.get(timeout=1.0)
                 
                 if is_policy:
@@ -78,7 +85,6 @@ class InferenceWorker(mp.Process):
                             policy_logits, _ = self.model(infoset_tensor, actions_tensor)
                             predictions = policy_logits.cpu().numpy().flatten().tolist()
                     
-                    # <<< ИЗМЕНЕНИЕ: Отправляем обратно Python tuple
                     self.result_queue.put((req_id, True, predictions))
 
                 else: # Value request
@@ -87,7 +93,6 @@ class InferenceWorker(mp.Process):
                         value = self.model(infoset_tensor)
                         prediction = value.item()
                     
-                    # <<< ИЗМЕНЕНИЕ: Отправляем обратно Python tuple
                     self.result_queue.put((req_id, False, [prediction]))
 
             except mp.queues.Empty:
@@ -145,42 +150,56 @@ def main():
     
     try:
         while True:
-            time.sleep(0.5)
+            # --- Логика обучения ---
             
-            if value_buffer.size() >= MIN_BUFFER_FILL and policy_buffer.size() >= MIN_BUFFER_FILL:
-                model.train()
-                
+            # Флаг, чтобы сделать шаг оптимизатора только один раз за цикл
+            did_train_this_iteration = False
+            
+            # Обнуляем градиенты перед началом цикла обучения
+            optimizer.zero_grad()
+            
+            # --- Обучение Value Head ---
+            if value_buffer.size() >= MIN_BUFFER_FILL:
                 v_batch = value_buffer.sample(BATCH_SIZE)
-                p_batch = policy_buffer.sample(BATCH_SIZE)
-
-                if v_batch and p_batch:
+                if v_batch:
+                    if not did_train_this_iteration:
+                        model.train()
+                    did_train_this_iteration = True
+                    
                     v_infosets_np, _, v_targets_np = v_batch
-                    p_infosets_np, p_actions_np, p_advantages_np = p_batch
-
                     v_infosets = torch.from_numpy(v_infosets_np).to(device)
                     v_targets = torch.from_numpy(v_targets_np).to(device)
+
+                    pred_values = model(v_infosets)
+                    loss_v = value_criterion(pred_values, v_targets)
+                    loss_v.backward() # Накапливаем градиенты
+                    value_losses.append(loss_v.item())
+            
+            # --- Обучение Policy Head ---
+            if policy_buffer.size() >= MIN_BUFFER_FILL:
+                p_batch = policy_buffer.sample(BATCH_SIZE)
+                if p_batch:
+                    if not did_train_this_iteration:
+                        model.train()
+                    did_train_this_iteration = True
+
+                    p_infosets_np, p_actions_np, p_advantages_np = p_batch
                     p_infosets = torch.from_numpy(p_infosets_np).to(device)
                     p_actions = torch.from_numpy(p_actions_np).to(device)
                     p_advantages = torch.from_numpy(p_advantages_np).to(device)
 
-                    optimizer.zero_grad()
-                    
-                    pred_values = model(v_infosets)
-                    loss_v = value_criterion(pred_values, v_targets)
-                    
                     pred_logits, _ = model(p_infosets, p_actions)
                     loss_p = policy_criterion(pred_logits, p_advantages)
-                    
-                    total_loss = loss_v + loss_p
-                    total_loss.backward()
-                    clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    
-                    value_losses.append(loss_v.item())
+                    loss_p.backward() # Накапливаем градиенты
                     policy_losses.append(loss_p.item())
 
+            # --- Обновление весов, если было обучение в этом цикле ---
+            if did_train_this_iteration:
+                clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
                 model.eval()
 
+            # --- Вывод статистики и сохранение ---
             now = time.time()
             if now - last_stats_time > STATS_INTERVAL_SECONDS:
                 total_generated = policy_buffer.total_generated()
@@ -201,6 +220,10 @@ def main():
                 print("\n--- Saving models ---", flush=True)
                 torch.save(model.state_dict(), MODEL_PATH)
                 last_save_time = now
+            
+            # Если ничего не делали, немного поспим, чтобы не сжигать CPU
+            if not did_train_this_iteration:
+                time.sleep(0.5)
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.", flush=True)
@@ -210,6 +233,7 @@ def main():
         print("C++ workers stopped.")
         
         stop_event.set()
+        # Очищаем очереди, чтобы воркеры вышли из .get()
         while not request_queue.empty():
             try: request_queue.get_nowait()
             except: pass
