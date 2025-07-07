@@ -14,9 +14,9 @@
 
 namespace ofc {
 
+// ... (вспомогательные функции и конструктор без изменений) ...
 std::vector<float> action_to_vector(const Action& action);
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng);
-
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -37,7 +37,6 @@ std::vector<float> action_to_vector(const Action& action) {
     }
     return vec;
 }
-
 void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937& rng) {
     if (strategy.empty()) { return; }
     std::gamma_distribution<float> gamma(alpha, 1.0f);
@@ -54,9 +53,7 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
         }
     }
 }
-
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
-
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
                      InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue) 
     : action_limit_(action_limit), 
@@ -68,7 +65,6 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, Sha
            static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))),
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
 {}
-
 void DeepMCCFR::run_traversal() {
     uint64_t traversal_id = ++traversal_counter_;
     GameState state; 
@@ -76,23 +72,19 @@ void DeepMCCFR::run_traversal() {
     state.reset(); 
     traverse(state, 1, true, traversal_id);
 }
-
 std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view) {
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
     std::vector<float> features(INFOSET_SIZE, 0.0f);
     int offset = 0;
-    
     features[offset++] = static_cast<float>(state.get_street());
     features[offset++] = static_cast<float>(state.get_dealer_pos());
     features[offset++] = static_cast<float>(state.get_current_player());
-    
     const auto& dealt_cards = state.get_dealt_cards();
     for (Card c : dealt_cards) {
         if (c != INVALID_CARD) features[offset + c] = 1.0f;
     }
     offset += 52;
-    
     auto process_board = [&](const Board& board, int& current_offset) {
         for(int i=0; i<3; ++i) {
             if (board.top[i] != INVALID_CARD) features[current_offset + board.top[i]] = 1.0f;
@@ -107,20 +99,16 @@ std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view)
         }
         current_offset += 52;
     };
-    
     process_board(my_board, offset);
     process_board(opp_board, offset);
-    
     const auto& my_discards = state.get_my_discards(player_view);
     for (Card c : my_discards) {
         if (c != INVALID_CARD) features[offset + c] = 1.0f;
     }
     offset += 52;
-    
     features[offset++] = static_cast<float>(state.get_opponent_discard_count(player_view));
-    features[offset++] = 0.0f; // Placeholder for my fantasyland
-    features[offset++] = 0.0f; // Placeholder for opp fantasyland
-
+    features[offset++] = 0.0f;
+    features[offset++] = 0.0f;
     return features;
 }
 
@@ -153,30 +141,44 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         return result;
     }
 
-    std::map<int, int> suit_map;
-    // ИСПРАВЛЕНО: Передаем legal_actions в get_canonical
-    GameState canonical_state = state.get_canonical(legal_actions, suit_map);
-    std::vector<float> infoset_vec = featurize(canonical_state, traversing_player);
+    // <<< ИЗМЕНЕНИЕ: Упрощаем и делаем логику канонизации более надежной >>>
     
+    // 1. Сначала создаем каноническое состояние и его инфосет
+    std::map<int, int> suit_map_for_state;
+    GameState canonical_state = state.get_canonical({}, suit_map_for_state); // Передаем пустой вектор действий
+    std::vector<float> infoset_vec = featurize(canonical_state, traversing_player);
+
+    // 2. Теперь строим канонические векторы действий, динамически создавая карту мастей
     std::vector<std::vector<float>> canonical_action_vectors;
     canonical_action_vectors.reserve(num_actions);
-    auto remap_card = [&](Card& card) {
+    
+    std::map<int, int> suit_map_for_actions;
+    int next_canonical_suit = 0;
+
+    auto remap_card_safely = [&](Card& card) {
         if (card == INVALID_CARD) return;
-        // УЛУЧШЕНО: Добавлена проверка на наличие ключа для безопасности
-        if (suit_map.count(get_suit(card))) {
-            card = get_rank(card) * 4 + suit_map.at(get_suit(card));
-        } else {
-            // Эта ветка не должна выполняться с исправленным get_canonical,
-            // но является защитой от непредвиденных ошибок.
-            card = INVALID_CARD; 
+        int original_suit = get_suit(card);
+        // Если масть еще не встречалась, назначаем ей следующий свободный канонический номер
+        if (suit_map_for_actions.find(original_suit) == suit_map_for_actions.end()) {
+            suit_map_for_actions[original_suit] = next_canonical_suit++;
         }
+        card = get_rank(card) * 4 + suit_map_for_actions[original_suit];
     };
+
     for (const auto& original_action : legal_actions) {
         Action canonical_action = original_action;
-        for (auto& placement : canonical_action.first) remap_card(placement.first);
-        remap_card(canonical_action.second);
+        // Сбрасываем карту мастей для каждого действия, чтобы обеспечить локальную инвариантность
+        suit_map_for_actions.clear();
+        next_canonical_suit = 0;
+        // Применяем безопасное переназначение
+        for (auto& placement : canonical_action.first) {
+            remap_card_safely(placement.first);
+        }
+        remap_card_safely(canonical_action.second);
         canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
+    
+    // <<< КОНЕЦ ИЗМЕНЕНИЯ >>>
 
     uint64_t policy_request_id = traversal_id * 2;
     {
