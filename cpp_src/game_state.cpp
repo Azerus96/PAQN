@@ -2,7 +2,8 @@
 #include "constants.hpp" 
 #include <iostream>
 #include <map>
-#include <chrono> // Добавлено для неблокирующего сида
+#include <chrono>
+#include <functional> // Для std::hash
 
 namespace ofc {
 
@@ -25,8 +26,9 @@ namespace ofc {
             board.bottom.fill(INVALID_CARD);
         }
         
-        // ИЗМЕНЕНО: Используем неблокирующий сид на основе времени, чтобы избежать блокировки
-        unsigned seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        // УЛУЧШЕНО: Более надежный сид для многопоточной среды
+        unsigned seed = static_cast<unsigned>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) +
+                        static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
         std::mt19937 temp_rng(seed);
 
         deck_.resize(52);
@@ -94,11 +96,11 @@ namespace ofc {
             cards_to_place = dealt_cards_;
             generate_random_placements(cards_to_place, INVALID_CARD, out_actions, action_limit, rng);
         } else {
-            size_t limit_per_discard = action_limit > 0 ? (action_limit / 3 + 1) : 0;
-            for (int i = 0; i < 3; ++i) {
+            size_t limit_per_discard = (action_limit > 0 && dealt_cards_.size() > 1) ? (action_limit / dealt_cards_.size() + 1) : action_limit;
+            for (size_t i = 0; i < dealt_cards_.size(); ++i) {
                 cards_to_place.clear();
                 Card current_discarded = dealt_cards_[i];
-                for (int j = 0; j < 3; ++j) {
+                for (size_t j = 0; j < dealt_cards_.size(); ++j) {
                     if (i != j) cards_to_place.push_back(dealt_cards_[j]);
                 }
                 generate_random_placements(cards_to_place, current_discarded, out_actions, limit_per_discard, rng);
@@ -221,10 +223,10 @@ namespace ofc {
         }
     }
 
-    GameState GameState::get_canonical(std::map<int, int>& suit_map) const {
+    // ИСПРАВЛЕНО: Полностью переписанная функция get_canonical
+    GameState GameState::get_canonical(const std::vector<Action>& legal_actions, std::map<int, int>& suit_map) const {
         suit_map.clear();
-        GameState canonical_state = *this;
-
+        
         int transform[SUIT_COUNT] = {-1, -1, -1, -1};
         int canonical_suit_count = 0;
 
@@ -236,6 +238,7 @@ namespace ofc {
             }
         };
 
+        // 1. Собираем все известные карты из текущего состояния
         for (const auto& card : dealt_cards_) process_card_for_mapping(card);
         for (int p_idx = 0; p_idx < num_players_; ++p_idx) {
             for (const auto& card : boards_[p_idx].get_all_cards()) {
@@ -245,17 +248,29 @@ namespace ofc {
                 process_card_for_mapping(card);
             }
         }
+        
+        // 2. Собираем все карты из легальных действий
+        for (const auto& action : legal_actions) {
+            for (const auto& placement : action.first) {
+                process_card_for_mapping(placement.first);
+            }
+            process_card_for_mapping(action.second);
+        }
 
+        // 3. Назначаем канонические масти для тех, что еще не встречались
         for (int i = 0; i < SUIT_COUNT; ++i) {
             if (transform[i] == -1) {
                 transform[i] = canonical_suit_count++;
             }
         }
 
+        // 4. Заполняем suit_map для использования во внешнем коде
         for (int i = 0; i < SUIT_COUNT; ++i) {
             suit_map[i] = transform[i];
         }
 
+        // 5. Создаем каноническое состояние и применяем трансформацию
+        GameState canonical_state = *this;
         auto remap_card = [&](Card& card) {
             if (card == INVALID_CARD) return;
             card = get_rank(card) * 4 + transform[get_suit(card)];
@@ -271,29 +286,9 @@ namespace ofc {
             for (auto& card : discard_set) remap_card(card);
         }
 
+        // 6. Сортируем для приведения к единому виду
         std::sort(canonical_state.dealt_cards_.begin(), canonical_state.dealt_cards_.end());
-        for (auto& board : canonical_state.boards_) {
-            auto sort_row = [](auto& row) {
-                CardSet valid_cards;
-                for (Card c : row) {
-                    if (c != INVALID_CARD) {
-                        valid_cards.push_back(c);
-                    }
-                }
-                std::sort(valid_cards.begin(), valid_cards.end());
-                std::fill(row.begin(), row.end(), INVALID_CARD);
-                if (!valid_cards.empty()) {
-                    std::copy(valid_cards.begin(), valid_cards.end(), row.begin());
-                }
-            };
-            sort_row(board.top);
-            sort_row(board.middle);
-            sort_row(board.bottom);
-        }
-        for (auto& discard_set : canonical_state.my_discards_) {
-            std::sort(discard_set.begin(), discard_set.end());
-        }
-
+        
         return canonical_state;
     }
 }
