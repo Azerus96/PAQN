@@ -8,13 +8,14 @@
 #include <mutex>
 #include "constants.hpp"
 #include <chrono>
+#include <thread> // <<< ИСПРАВЛЕНИЕ: Добавлен недостающий заголовок
 
 namespace ofc {
 
 struct TrainingSample {
     std::vector<float> infoset_vector;
     std::vector<float> action_vector;
-    float target_value; // Переименовал для ясности
+    float target_value;
 
     TrainingSample() 
         : infoset_vector(INFOSET_SIZE), 
@@ -28,8 +29,10 @@ public:
         : capacity_(capacity), head_(0), count_(0)
     {
         buffer_.resize(capacity_);
-        // <<< ИЗМЕНЕНИЕ: Используем thread_local для RNG, чтобы избежать гонок состояний
-        thread_local static std::mt19937 rng(std::chrono::high_resolution_clock::now().time_since_epoch().count() + std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        thread_local static std::mt19937 rng(
+            static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + 
+            static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))
+        );
         rng_ = &rng;
         std::cout << "C++: Replay Buffer created with capacity " << capacity << std::endl;
     }
@@ -49,12 +52,11 @@ public:
         }
     }
 
-    // <<< ИЗМЕНЕНИЕ: Возвращает false, если сэмплирование невозможно
     bool sample(int batch_size, float* out_infosets, float* out_actions, float* out_targets) {
         std::lock_guard<std::mutex> lock(mtx_);
         
         if (count_ < static_cast<uint64_t>(batch_size)) {
-            return false; // Недостаточно сэмплов для батча
+            return false;
         }
 
         std::uniform_int_distribution<uint64_t> dist(0, count_ - 1);
@@ -85,7 +87,6 @@ private:
     uint64_t head_;
     uint64_t count_;
     std::mutex mtx_;
-    // <<< ИЗМЕНЕНИЕ: Храним указатель на thread_local RNG
     std::mt19937* rng_;
 };
 
