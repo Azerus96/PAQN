@@ -30,9 +30,8 @@ target_include_directories(ofc_engine PRIVATE
     "${PROJECT_SOURCE_DIR}/cpp_src/ompeval"
 )
 
-# pybind11_add_module уже добавляет нужные зависимости Python,
-# но мы добавим остальные явно для надежности.
 target_link_libraries(ofc_engine PRIVATE
+    pybind11::module
     ${TORCH_LIBRARIES}
     OpenMP::OpenMP_CXX
     Threads::Threads
