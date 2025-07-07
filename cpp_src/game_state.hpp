@@ -43,8 +43,7 @@ namespace ofc {
         void undo_action(const UndoInfo& undo_info, int player_view);
         
         // Возвращает каноническое представление состояния
-        // ИЗМЕНЕНО: Метод теперь принимает легальные действия для построения полной карты мастей
-        GameState get_canonical(const std::vector<Action>& legal_actions, std::map<int, int>& suit_map) const;
+        GameState get_canonical(std::map<int, int>& suit_map) const;
 
         // Геттеры для получения информации о состоянии
         int get_street() const { return street_; }
