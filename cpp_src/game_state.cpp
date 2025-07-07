@@ -226,7 +226,6 @@ namespace ofc {
     GameState GameState::get_canonical(std::map<int, int>& suit_map) const {
         suit_map.clear();
         GameState canonical_state = *this;
-
         int transform[SUIT_COUNT] = {-1, -1, -1, -1};
         int canonical_suit_count = 0;
 
