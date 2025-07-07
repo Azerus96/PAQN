@@ -36,14 +36,15 @@ class PAQN_Network(nn.Module):
         )
 
     def forward(self, infoset, action_vec=None):
+        # Пропускаем инфосет через общий ствол
+        body_out = self.body(infoset)
+        
         # Если action_vec не предоставлен, мы считаем только value
         if action_vec is None:
-            body_out = self.body(infoset)
             value = self.value_head(body_out)
             return value
 
         # Если action_vec есть, считаем и value, и policy
-        body_out = self.body(infoset)
         value = self.value_head(body_out)
         
         # Для policy head конкатенируем выход ствола с вектором действия
@@ -51,8 +52,3 @@ class PAQN_Network(nn.Module):
         policy_logit = self.policy_head(policy_input)
         
         return policy_logit, value
-
-# <<< ИЗМЕНЕНИЕ: Старые классы можно удалить или закомментировать,
-# так как они больше не используются в train.py.
-# class PolicyNetwork(...): ...
-# class ValueNetwork(...): ...
