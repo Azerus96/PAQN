@@ -7,13 +7,12 @@ from torch.nn.utils import clip_grad_norm_
 import numpy as np
 import traceback
 import threading
-from concurrent.futures import ThreadPoolExecutor
 import subprocess
 from collections import deque
 import queue
 
 from .model import PolicyNetwork, ValueNetwork
-from ofc_engine import DeepMCCFR, ReplayBuffer, initialize_evaluator
+from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
 # --- Настройки ---
 NUM_CPP_WORKERS = int(os.cpu_count() * 0.75) if (os.cpu_count() or 0) > 4 else 4
@@ -123,33 +122,22 @@ def main():
         worker = InferenceWorker(i, policy_net, value_net, device, inference_task_queue)
         worker.start()
         inference_workers.append(worker)
-    solvers = [
-        DeepMCCFR(ACTION_LIMIT, policy_buffer, value_buffer, policy_inference_callback, value_inference_callback) 
-        for _ in range(NUM_CPP_WORKERS)
-    ]
-    stop_event = threading.Event()
+
+    print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
+    solver_manager = SolverManager(
+        NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
+        policy_inference_callback, value_inference_callback
+    )
+    print("C++ workers are running in the background.", flush=True)
+    
     policy_losses = deque(maxlen=100)
     value_losses = deque(maxlen=100)
-    main_executor = ThreadPoolExecutor(max_workers=NUM_CPP_WORKERS)
-    
-    def worker_loop(solver):
-        while not stop_event.is_set():
-            try:
-                solver.run_traversal()
-            except Exception as e:
-                print(f"Exception in C++ worker thread: {e}")
-                traceback.print_exc()
-
-    print(f"Submitting {NUM_CPP_WORKERS} C++ workers to the pool...", flush=True)
-    for s in solvers:
-        main_executor.submit(worker_loop, s)
-    
     last_report_time = time.time()
     last_save_time = time.time()
     last_report_head = 0
     
     try:
-        while not stop_event.is_set():
+        while True:
             time.sleep(1.0)
             if value_buffer.get_count() >= BATCH_SIZE:
                 value_net.train()
@@ -202,8 +190,7 @@ def main():
         print("\nTraining interrupted by user.", flush=True)
     finally:
         print("Stopping all workers...", flush=True)
-        stop_event.set()
-        main_executor.shutdown(wait=True, cancel_futures=True)
+        solver_manager.stop()
         for worker in inference_workers:
             worker.stop()
         for worker in inference_workers:
