@@ -122,7 +122,6 @@ namespace ofc {
         }
     }
 
-    // --- ИЗМЕНЕНИЕ: Вернули generate_random_placements ---
     void GameState::generate_random_placements(const CardSet& cards, Card discarded, std::vector<Action>& actions, size_t limit, std::mt19937& rng) const {
         const Board& board = boards_[current_player_];
         std::vector<std::pair<std::string, int>> available_slots;
@@ -159,7 +158,7 @@ namespace ofc {
         }
     }
 
-    // --- ИЗМЕНЕНИЕ: Восстановлена логика с action_limit ---
+    // --- ИСПРАВЛЕНИЕ: Правильная реализация сбалансированного подхода ---
     void GameState::get_legal_actions(size_t action_limit, std::vector<Action>& out_actions, std::mt19937& rng) const {
         out_actions.clear();
         if (is_terminal()) return;
