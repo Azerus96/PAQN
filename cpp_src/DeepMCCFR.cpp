@@ -54,9 +54,10 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
 
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
 
-DeepMCCFR::DeepMCCFR(SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
+DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
                      InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue) 
-    : policy_buffer_(policy_buffer), 
+    : action_limit_(action_limit),
+      policy_buffer_(policy_buffer), 
       value_buffer_(value_buffer),
       request_queue_(request_queue),
       result_queue_(result_queue),
@@ -111,7 +112,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     int current_player = state.get_current_player();
     
     std::vector<Action> legal_actions;
-    state.get_legal_actions(legal_actions);
+    state.get_legal_actions(action_limit_, legal_actions, rng_);
     
     int num_actions = legal_actions.size();
     UndoInfo undo_info;
@@ -192,71 +193,50 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         add_dirichlet_noise(strategy, 0.3f, rng_);
     }
 
-    if (current_player != traversing_player) {
-        std::discrete_distribution<int> dist(strategy.begin(), strategy.end());
-        int action_idx = dist(rng_);
-        state.apply_action(legal_actions[action_idx], traversing_player, undo_info);
+    std::discrete_distribution<int> dist(strategy.begin(), strategy.end());
+    int sampled_action_idx = dist(rng_);
+
+    if (current_player == traversing_player) {
+        uint64_t value_request_id = traversal_id * 2 + 1;
+        {
+            py::gil_scoped_acquire acquire;
+            py::tuple request_tuple = py::make_tuple(
+                value_request_id, false, py::cast(raw_state_vec), py::none()
+            );
+            request_queue_->attr("put")(request_tuple);
+        }
+
+        float value_baseline = 0.0f;
+        {
+            py::gil_scoped_acquire acquire;
+            py::object result_obj = result_queue_->attr("get")();
+            py::tuple result_tuple = result_obj.cast<py::tuple>();
+            if (result_tuple[0].cast<uint64_t>() == value_request_id) {
+                std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
+                if (!predictions.empty()) {
+                    value_baseline = predictions[0];
+                }
+            }
+        }
+
+        state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
+        auto action_payoffs = traverse(state, traversing_player, false, traversal_id);
+        state.undo_action(undo_info, traversing_player);
+
+        auto it = action_payoffs.find(current_player);
+        if (it != action_payoffs.end()) {
+            float advantage = it->second - value_baseline;
+            policy_buffer_->push_raw(raw_state_vec, canonical_action_vectors[sampled_action_idx], advantage);
+            value_buffer_->push_raw(raw_state_vec, dummy_action_vec_, it->second);
+        }
+        return action_payoffs;
+
+    } else {
+        state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
         auto result = traverse(state, traversing_player, false, traversal_id);
         state.undo_action(undo_info, traversing_player);
         return result;
     }
-
-    std::vector<std::map<int, float>> action_payoffs(num_actions);
-    std::map<int, float> node_payoffs = {{0, 0.0f}, {1, 0.0f}};
-
-    for (int i = 0; i < num_actions; ++i) {
-        state.apply_action(legal_actions[i], traversing_player, undo_info);
-        action_payoffs[i] = traverse(state, traversing_player, false, traversal_id);
-        state.undo_action(undo_info, traversing_player);
-        
-        auto it = action_payoffs[i].find(current_player);
-        if (it != action_payoffs[i].end()) {
-            value_buffer_->push_raw(raw_state_vec, dummy_action_vec_, it->second);
-        } else {
-            std::cerr << "C++ Thread " << std::this_thread::get_id() << ": Empty payoff map returned for action " << i << std::endl;
-            continue;
-        }
-        
-        for(auto const& [player_idx, payoff] : action_payoffs[i]) {
-            node_payoffs[player_idx] += strategy[i] * payoff;
-        }
-    }
-    
-    uint64_t value_request_id = traversal_id * 2 + 1;
-    {
-        py::gil_scoped_acquire acquire;
-        py::tuple request_tuple = py::make_tuple(
-            value_request_id, false, py::cast(raw_state_vec), py::none()
-        );
-        request_queue_->attr("put")(request_tuple);
-    }
-
-    float value_baseline = 0.0f;
-    {
-        py::gil_scoped_acquire acquire;
-        py::object result_obj = result_queue_->attr("get")();
-        py::tuple result_tuple = result_obj.cast<py::tuple>();
-        if (result_tuple[0].cast<uint64_t>() != value_request_id) {
-            std::cerr << "C++ Thread " << std::this_thread::get_id() << ": Value ID mismatch! Expected " << value_request_id << ", got " << result_tuple[0].cast<uint64_t>() << std::endl;
-            return node_payoffs;
-        }
-        std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
-        if (predictions.empty()) {
-            std::cerr << "C++ Thread " << std::this_thread::get_id() << ": Empty value prediction received." << std::endl;
-            return node_payoffs;
-        }
-        value_baseline = predictions[0];
-    }
-
-    for (int i = 0; i < num_actions; ++i) {
-        auto it = action_payoffs[i].find(current_player);
-        if (it != action_payoffs[i].end()) {
-            float advantage = it->second - value_baseline;
-            policy_buffer_->push_raw(raw_state_vec, canonical_action_vectors[i], advantage);
-        }
-    }
-
-    return node_payoffs;
 }
 
 } // namespace ofc
