@@ -19,6 +19,7 @@ class SolverManagerImpl {
 public:
     SolverManagerImpl(
         size_t num_workers,
+        size_t action_limit,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object* request_queue,
@@ -27,7 +28,7 @@ public:
         stop_flag_.store(false);
         for (size_t i = 0; i < num_workers; ++i) {
             auto solver = std::make_unique<ofc::DeepMCCFR>(
-                policy_buffer, value_buffer, request_queue, result_queue
+                action_limit, policy_buffer, value_buffer, request_queue, result_queue
             );
             threads_.emplace_back(&SolverManagerImpl::worker_loop, this, std::move(solver));
         }
@@ -62,6 +63,7 @@ class PySolverManager {
 public:
     PySolverManager(
         size_t num_workers,
+        size_t action_limit,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
@@ -69,7 +71,7 @@ public:
     ) : request_queue_(request_queue), result_queue_(result_queue) {
         py::gil_scoped_release release;
         impl_ = std::make_unique<SolverManagerImpl>(
-            num_workers, policy_buffer, value_buffer,
+            num_workers, action_limit, policy_buffer, value_buffer,
             &request_queue_, &result_queue_
         );
     }
@@ -122,7 +124,7 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def("sample", [](ofc::SharedReplayBuffer &buffer, int batch_size) -> py::object {
             std::vector<std::vector<int>> raw_states;
             auto actions_np = py::array_t<float>({batch_size, ofc::ACTION_VECTOR_SIZE});
-            auto targets_np = py::array_t<float>({batch_size}); // ИСПРАВЛЕНИЕ: Цель - скаляр, а не вектор
+            auto targets_np = py::array_t<float>({batch_size});
             
             bool success = buffer.sample(
                 batch_size, 
@@ -139,8 +141,9 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
     py::class_<PySolverManager>(m, "SolverManager")
-        .def(py::init<size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(),
+        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(),
              py::arg("num_workers"),
+             py::arg("action_limit"),
              py::arg("policy_buffer"), py::arg("value_buffer"),
              py::arg("request_queue"), py::arg("result_queue"))
         .def("stop", &PySolverManager::stop);
