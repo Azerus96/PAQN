@@ -40,7 +40,7 @@ MIN_BUFFER_FILL_SAMPLES = int(BUFFER_CAPACITY * MIN_BUFFER_FILL_RATIO)
 
 # --- Пути и интервалы ---
 STATS_INTERVAL_SECONDS = 15
-SAVE_INTERVAL_SECONDS = 600
+SAVE_INTERVAL_SECONDS = 45
 MODEL_DIR = "/content/models"
 MODEL_PATH = os.path.join(MODEL_DIR, "paqn_model_latest.pth")
 OPPONENT_POOL_DIR = os.path.join(MODEL_DIR, "opponent_pool")
