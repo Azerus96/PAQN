@@ -16,8 +16,9 @@ namespace ofc {
 
 class DeepMCCFR {
 public:
-    // --- ИЗМЕНЕНИЕ ---: Убран action_limit из конструктора
-    DeepMCCFR(SharedReplayBuffer* policy_buffer, 
+    // --- ИЗМЕНЕНИЕ: Вернули action_limit ---
+    DeepMCCFR(size_t action_limit,
+              SharedReplayBuffer* policy_buffer, 
               SharedReplayBuffer* value_buffer, 
               InferenceRequestQueue* request_queue,
               InferenceResultQueue* result_queue);
@@ -32,6 +33,8 @@ private:
     InferenceRequestQueue* request_queue_;
     InferenceResultQueue* result_queue_;
 
+    // --- ИЗМЕНЕНИЕ: Вернули action_limit_ ---
+    size_t action_limit_;
     std::mt19937 rng_;
     std::vector<float> dummy_action_vec_;
     
