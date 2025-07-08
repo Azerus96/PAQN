@@ -9,7 +9,6 @@
 
 namespace ofc {
 
-    // Структура для отмены действия
     struct UndoInfo {
         Action action;
         int prev_street;
@@ -17,35 +16,27 @@ namespace ofc {
         CardSet dealt_cards_before_action;
     };
 
-    // Класс, представляющий полное состояние игры
     class GameState {
     public:
         GameState(int num_players = 2, int dealer_pos = -1);
         
-        // Сбрасывает состояние игры к началу новой раздачи
         void reset(int dealer_pos = -1);
 
-        // Проверяет, является ли состояние терминальным (конец игры)
         inline bool is_terminal() const {
             return street_ > 5 || boards_[0].get_card_count() == 13;
         }
 
-        // Рассчитывает итоговые очки для двух игроков
         std::pair<float, float> get_payoffs(const HandEvaluator& evaluator) const;
         
-        // Генерирует список легальных действий для текущего игрока
-        void get_legal_actions(size_t action_limit, std::vector<Action>& out_actions, std::mt19937& rng) const;
+        // --- ИЗМЕНЕНИЕ ---: Убраны лишние параметры. Всегда полный перебор.
+        void get_legal_actions(std::vector<Action>& out_actions) const;
         
-        // Применяет действие к состоянию игры
         void apply_action(const Action& action, int player_view, UndoInfo& undo_info);
         
-        // Отменяет последнее примененное действие
         void undo_action(const UndoInfo& undo_info, int player_view);
         
-        // Возвращает каноническое представление состояния
         GameState get_canonical(std::map<int, int>& suit_map) const;
 
-        // Геттеры для получения информации о состоянии
         int get_street() const { return street_; }
         int get_current_player() const { return current_player_; }
         const CardSet& get_dealt_cards() const { return dealt_cards_; }
@@ -56,11 +47,18 @@ namespace ofc {
         int get_dealer_pos() const { return dealer_pos_; }
         
     private:
-        // Внутренние вспомогательные методы
         void deal_cards();
-        void generate_random_placements(const CardSet& cards, Card discarded, std::vector<Action>& actions, size_t limit, std::mt19937& rng) const;
+        
+        void generate_all_placements_recursive(
+            const CardSet& cards_to_place,
+            const std::vector<std::pair<std::string, int>>& available_slots,
+            std::vector<int>& current_indices,
+            int start_idx,
+            int k,
+            Card discarded,
+            std::vector<Action>& out_actions
+        ) const;
 
-        // Поля класса
         int num_players_;
         int street_;
         int dealer_pos_;
