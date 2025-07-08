@@ -15,21 +15,19 @@
 
 namespace py = pybind11;
 
-// Внутренний класс, который делает всю работу. Он не знает о GIL.
 class SolverManagerImpl {
 public:
     SolverManagerImpl(
         size_t num_workers,
-        size_t action_limit, 
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
-        py::object* request_queue, // Принимаем указатели
+        py::object* request_queue,
         py::object* result_queue
     ) {
         stop_flag_.store(false);
         for (size_t i = 0; i < num_workers; ++i) {
             auto solver = std::make_unique<ofc::DeepMCCFR>(
-                action_limit, policy_buffer, value_buffer, request_queue, result_queue
+                policy_buffer, value_buffer, request_queue, result_queue
             );
             threads_.emplace_back(&SolverManagerImpl::worker_loop, this, std::move(solver));
         }
@@ -51,7 +49,6 @@ public:
 
 private:
     void worker_loop(std::unique_ptr<ofc::DeepMCCFR> solver) {
-        // Этот поток НЕ должен владеть GIL
         while (!stop_flag_.load()) {
             solver->run_traversal();
         }
@@ -61,31 +58,23 @@ private:
     std::atomic<bool> stop_flag_;
 };
 
-
-// <<< ИЗМЕНЕНИЕ: Класс-обертка для pybind11, который управляет GIL >>>
 class PySolverManager {
 public:
     PySolverManager(
         size_t num_workers,
-        size_t action_limit, 
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
         py::object result_queue
     ) : request_queue_(request_queue), result_queue_(result_queue) {
-        // Отпускаем GIL ПЕРЕД созданием потоков
         py::gil_scoped_release release;
         impl_ = std::make_unique<SolverManagerImpl>(
-            num_workers, action_limit, policy_buffer, value_buffer,
+            num_workers, policy_buffer, value_buffer,
             &request_queue_, &result_queue_
         );
     }
 
-    // Деструктор будет вызван из Python, который владеет GIL, поэтому здесь все безопасно.
-    // Когда PySolverManager уничтожается, уничтожается и impl_, и py::object очереди,
-    // и все это происходит с захваченным GIL.
     ~PySolverManager() {
-        // Захватываем GIL, чтобы безопасно остановить потоки и уничтожить impl_
         py::gil_scoped_acquire acquire;
         if (impl_) {
             impl_->stop();
@@ -93,7 +82,6 @@ public:
     }
 
     void stop() {
-        // Отпускаем GIL на время ожидания потоков
         py::gil_scoped_release release;
         if (impl_) {
             impl_->stop();
@@ -114,7 +102,7 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def(py::init<>())
         .def_readwrite("id", &ofc::InferenceRequest::id)
         .def_readwrite("is_policy_request", &ofc::InferenceRequest::is_policy_request)
-        .def_readwrite("infoset", &ofc::InferenceRequest::infoset)
+        .def_readwrite("raw_state", &ofc::InferenceRequest::raw_state)
         .def_readwrite("action_vectors", &ofc::InferenceRequest::action_vectors);
 
     py::class_<ofc::InferenceResult>(m, "InferenceResult")
@@ -132,28 +120,27 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def("size", &ofc::SharedReplayBuffer::size)
         .def("total_generated", &ofc::SharedReplayBuffer::total_generated)
         .def("sample", [](ofc::SharedReplayBuffer &buffer, int batch_size) -> py::object {
-            auto infosets_np = py::array_t<float>({batch_size, ofc::INFOSET_SIZE});
+            std::vector<std::vector<int>> raw_states;
             auto actions_np = py::array_t<float>({batch_size, ofc::ACTION_VECTOR_SIZE});
-            auto targets_np = py::array_t<float>({batch_size, 1});
+            auto targets_np = py::array_t<float>({batch_size}); // ИСПРАВЛЕНИЕ: Цель - скаляр, а не вектор
             
             bool success = buffer.sample(
                 batch_size, 
-                static_cast<float*>(infosets_np.request().ptr), 
-                static_cast<float*>(actions_np.request().ptr),
-                static_cast<float*>(targets_np.request().ptr)
+                raw_states,
+                actions_np,
+                targets_np
             );
 
             if (!success) {
                 return py::none();
             }
             
-            return py::cast(std::make_tuple(infosets_np, actions_np, targets_np));
-        }, py::arg("batch_size"), "Samples a batch from the buffer. Returns None if not enough samples.");
+            return py::cast(std::make_tuple(py::cast(raw_states), actions_np, targets_np));
+        }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
-    // <<< ИЗМЕНЕНИЕ: Биндим новый класс-обертку PySolverManager
     py::class_<PySolverManager>(m, "SolverManager")
-        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(),
-             py::arg("num_workers"), py::arg("action_limit"), 
+        .def(py::init<size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(),
+             py::arg("num_workers"),
              py::arg("policy_buffer"), py::arg("value_buffer"),
              py::arg("request_queue"), py::arg("result_queue"))
         .def("stop", &PySolverManager::stop);
