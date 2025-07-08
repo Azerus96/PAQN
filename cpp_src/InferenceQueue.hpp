@@ -16,7 +16,8 @@ namespace ofc {
 struct InferenceRequest {
     uint64_t id;
     bool is_policy_request;
-    std::vector<float> infoset;
+    // --- ИЗМЕНЕНИЕ ---: Вместо вектора float для инфосета, передаем вектор int для сырого состояния
+    std::vector<int> raw_state; 
     // Для policy-запроса, содержит векторы действий. Для value - пустой.
     std::vector<std::vector<float>> action_vectors; 
 };
@@ -30,11 +31,9 @@ struct InferenceResult {
 };
 
 // Очередь запросов (C++ -> Python)
-// Используем py::object, чтобы pybind11 сам управлял GIL при доступе к Python-объекту queue.Queue
 using InferenceRequestQueue = py::object;
 
 // Очередь результатов (Python -> C++)
-// Используем py::object по той же причине
 using InferenceResultQueue = py::object;
 
 } // namespace ofc
