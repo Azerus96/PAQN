@@ -8,17 +8,22 @@
 #include <mutex>
 #include "constants.hpp"
 #include <chrono>
-#include <thread> // <<< ИСПРАВЛЕНИЕ: Добавлен недостающий заголовок
+#include <thread>
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+
+namespace py = pybind11;
 
 namespace ofc {
 
-struct TrainingSample {
-    std::vector<float> infoset_vector;
+// --- ИЗМЕНЕНИЕ ---: Новая структура для хранения сырого состояния
+struct TrainingSampleRaw {
+    std::vector<int> raw_state;
     std::vector<float> action_vector;
     float target_value;
 
-    TrainingSample() 
-        : infoset_vector(INFOSET_SIZE), 
+    TrainingSampleRaw() 
+        : raw_state(), 
           action_vector(ACTION_VECTOR_SIZE, 0.0f), 
           target_value(0.0f) {}
 };
@@ -37,13 +42,14 @@ public:
         std::cout << "C++: Replay Buffer created with capacity " << capacity << std::endl;
     }
 
-    void push(const std::vector<float>& infoset_vec, const std::vector<float>& action_vec, float target) {
+    // --- ИЗМЕНЕНИЕ ---: Новый метод для добавления данных с сырым состоянием
+    void push_raw(const std::vector<int>& raw_state_vec, const std::vector<float>& action_vec, float target) {
         std::lock_guard<std::mutex> lock(mtx_);
         uint64_t index = head_ % capacity_;
         head_++;
 
         auto& sample = buffer_[index];
-        std::copy(infoset_vec.begin(), infoset_vec.end(), sample.infoset_vector.begin());
+        sample.raw_state = raw_state_vec;
         std::copy(action_vec.begin(), action_vec.end(), sample.action_vector.begin());
         sample.target_value = target;
         
@@ -52,7 +58,8 @@ public:
         }
     }
 
-    bool sample(int batch_size, float* out_infosets, float* out_actions, float* out_targets) {
+    // --- ИЗМЕНЕНИЕ ---: sample теперь работает с сырыми состояниями
+    bool sample(int batch_size, std::vector<std::vector<int>>& out_raw_states, py::array_t<float>& out_actions, py::array_t<float>& out_targets) {
         std::lock_guard<std::mutex> lock(mtx_);
         
         if (count_ < static_cast<uint64_t>(batch_size)) {
@@ -60,13 +67,20 @@ public:
         }
 
         std::uniform_int_distribution<uint64_t> dist(0, count_ - 1);
+        
+        auto actions_ptr = static_cast<float*>(out_actions.request().ptr);
+        auto targets_ptr = static_cast<float*>(out_targets.request().ptr);
+
+        out_raw_states.clear();
+        out_raw_states.reserve(batch_size);
 
         for (int i = 0; i < batch_size; ++i) {
             uint64_t sample_idx = dist(*rng_);
             const auto& sample = buffer_[sample_idx];
-            std::copy(sample.infoset_vector.begin(), sample.infoset_vector.end(), out_infosets + i * INFOSET_SIZE);
-            std::copy(sample.action_vector.begin(), sample.action_vector.end(), out_actions + i * ACTION_VECTOR_SIZE);
-            *(out_targets + i) = sample.target_value;
+            
+            out_raw_states.push_back(sample.raw_state);
+            std::copy(sample.action_vector.begin(), sample.action_vector.end(), actions_ptr + i * ACTION_VECTOR_SIZE);
+            *(targets_ptr + i) = sample.target_value;
         }
         return true;
     }
@@ -82,7 +96,8 @@ public:
     }
     
 private:
-    std::vector<TrainingSample> buffer_;
+    // --- ИЗМЕНЕНИЕ ---: Буфер теперь хранит новую структуру
+    std::vector<TrainingSampleRaw> buffer_;
     uint64_t capacity_;
     uint64_t head_;
     uint64_t count_;
