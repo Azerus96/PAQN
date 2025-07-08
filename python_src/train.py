@@ -32,6 +32,7 @@ NUM_CPP_WORKERS = max(1, TOTAL_CPUS - NUM_INFERENCE_WORKERS - RESERVED_CPUS)
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- Гиперпараметры ---
+ACTION_LIMIT = 200 # Разумное значение для начала. Можно увеличить до 500-1000 позже.
 ACTION_VECTOR_SIZE = 208
 LEARNING_RATE = 0.0005
 BUFFER_CAPACITY = 2_000_000
@@ -41,7 +42,7 @@ MIN_BUFFER_FILL_SAMPLES = int(BUFFER_CAPACITY * MIN_BUFFER_FILL_RATIO)
 
 # --- Пути и интервалы ---
 STATS_INTERVAL_SECONDS = 15
-SAVE_INTERVAL_SECONDS = 45
+SAVE_INTERVAL_SECONDS = 600
 MODEL_DIR = "/content/models"
 MODEL_PATH = os.path.join(MODEL_DIR, "paqn_model_latest.pth")
 OPPONENT_POOL_DIR = os.path.join(MODEL_DIR, "opponent_pool")
@@ -214,7 +215,7 @@ def main():
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
     solver_manager = SolverManager(
-        NUM_CPP_WORKERS, policy_buffer, value_buffer,
+        NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
         request_queue, result_queue
     )
     print("C++ workers are running in the background.", flush=True)
@@ -237,6 +238,7 @@ def main():
             
             # Value Head
             v_batch = value_buffer.sample(BATCH_SIZE)
+            if not v_batch: continue
             v_raw_states, _, v_targets_np = v_batch
             v_state_images = [featurize_state_optimal(decode_raw_state(rs)) for rs in v_raw_states]
             v_infosets = torch.tensor(np.array(v_state_images), device=device)
@@ -246,6 +248,7 @@ def main():
             
             # Policy Head
             p_batch = policy_buffer.sample(BATCH_SIZE)
+            if not p_batch: continue
             p_raw_states, p_actions_np, p_advantages_np = p_batch
             p_state_images = [featurize_state_optimal(decode_raw_state(rs)) for rs in p_raw_states]
             p_infosets = torch.tensor(np.array(p_state_images), device=device)
