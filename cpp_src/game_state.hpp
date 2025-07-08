@@ -28,8 +28,8 @@ namespace ofc {
 
         std::pair<float, float> get_payoffs(const HandEvaluator& evaluator) const;
         
-        // --- ИЗМЕНЕНИЕ: Убраны лишние параметры. Всегда полный перебор. ---
-        void get_legal_actions(std::vector<Action>& out_actions, std::mt19937& rng) const;
+        // --- ИСПРАВЛЕНИЕ: Правильная сигнатура с 3 аргументами ---
+        void get_legal_actions(size_t action_limit, std::vector<Action>& out_actions, std::mt19937& rng) const;
         
         void apply_action(const Action& action, int player_view, UndoInfo& undo_info);
         
@@ -59,7 +59,6 @@ namespace ofc {
             std::vector<Action>& out_actions
         ) const;
         
-        // --- ИЗМЕНЕНИЕ: Вернули generate_random_placements ---
         void generate_random_placements(const CardSet& cards, Card discarded, std::vector<Action>& actions, size_t limit, std::mt19937& rng) const;
 
         int num_players_;
