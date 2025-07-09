@@ -1,3 +1,5 @@
+--- START OF FILE PAQN-main/cpp_src/DeepMCCFR.cpp ---
+
 #include "DeepMCCFR.hpp"
 #include "constants.hpp"
 #include <stdexcept>
@@ -11,10 +13,11 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <sstream> // <-- Добавлено для ID потока
 
 namespace ofc {
 
-// ... (action_to_vector, add_dirichlet_noise, конструктор, run_traversal, featurize_state_cpp - без изменений) ...
+// ... (action_to_vector, add_dirichlet_noise, конструктор, featurize_state_cpp - без изменений) ...
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -140,6 +143,12 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
 
 
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root, uint64_t traversal_id) {
+    // --- ЛОГИРОВАНИЕ: Получаем ID потока ---
+    std::stringstream ss;
+    ss << std::this_thread::get_id();
+    std::string thread_id_str = ss.str();
+    // ---
+
     if (state.is_terminal()) {
         auto payoffs = state.get_payoffs(evaluator_);
         return {{0, payoffs.first}, {1, payoffs.second}};
@@ -191,18 +200,26 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     bool is_traversing_players_turn = (current_player == traversing_player);
 
     {
+        // --- ЛОГИРОВАНИЕ ---
+        std::cout << "[C++ TID: " << thread_id_str << "] Acquiring GIL to put requests..." << std::endl;
         py::gil_scoped_acquire acquire;
         py::tuple policy_request_tuple = py::make_tuple(
             policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors)
         );
         request_queue_->attr("put")(policy_request_tuple);
+        // --- ЛОГИРОВАНИЕ ---
+        std::cout << "[C++ TID: " << thread_id_str << "] Put POLICY request " << policy_request_id << std::endl;
 
         if (is_traversing_players_turn) {
             py::tuple value_request_tuple = py::make_tuple(
                 value_request_id, false, py::cast(infoset_vec), py::none()
             );
             request_queue_->attr("put")(value_request_tuple);
+            // --- ЛОГИРОВАНИЕ ---
+            std::cout << "[C++ TID: " << thread_id_str << "] Put VALUE request " << value_request_id << std::endl;
         }
+        // --- ЛОГИРОВАНИЕ ---
+        std::cout << "[C++ TID: " << thread_id_str << "] Releasing GIL after putting requests." << std::endl;
     }
 
     std::vector<float> logits;
@@ -213,10 +230,13 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     while(results_gotten < results_to_get) {
         bool got_item = false;
         {
+            // --- ЛОГИРОВАНИЕ ---
+            std::cout << "[C++ TID: " << thread_id_str << "] Acquiring GIL to check results (Policy: " << policy_request_id << ", Value: " << value_request_id << ")..." << std::endl;
             py::gil_scoped_acquire acquire;
             py::object policy_key = py::cast(policy_request_id);
-            // Проверяем и извлекаем результат для policy_request_id
             if (result_queue_->contains(policy_key)) {
+                // --- ЛОГИРОВАНИЕ ---
+                std::cout << "[C++ TID: " << thread_id_str << "] FOUND policy result for " << policy_request_id << std::endl;
                 py::tuple result_tuple = (*result_queue_)[policy_key].cast<py::tuple>();
                 logits = result_tuple[2].cast<std::vector<float>>();
                 result_queue_->attr("pop")(policy_key);
@@ -224,10 +244,11 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
                 got_item = true;
             }
 
-            // Проверяем и извлекаем результат для value_request_id, если он нужен
             if (is_traversing_players_turn && results_gotten < results_to_get) {
                 py::object value_key = py::cast(value_request_id);
                 if (result_queue_->contains(value_key)) {
+                    // --- ЛОГИРОВАНИЕ ---
+                    std::cout << "[C++ TID: " << thread_id_str << "] FOUND value result for " << value_request_id << std::endl;
                     py::tuple result_tuple = (*result_queue_)[value_key].cast<py::tuple>();
                     if (!result_tuple[2].is_none()) {
                         std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
@@ -240,10 +261,17 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
                     got_item = true;
                 }
             }
-        } // GIL отпускается здесь
+            // --- ЛОГИРОВАНИЕ ---
+            if (got_item) {
+                std::cout << "[C++ TID: " << thread_id_str << "] Releasing GIL after getting a result." << std::endl;
+            } else {
+                std::cout << "[C++ TID: " << thread_id_str << "] Releasing GIL, no result found." << std::endl;
+            }
+        } 
 
         if (!got_item) {
-            // Если очередь была пуста, немного поспим, чтобы не грузить CPU
+            // --- ЛОГИРОВАНИЕ ---
+            // std::cout << "[C++ TID: " << thread_id_str << "] No result, sleeping..." << std::endl;
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     }
@@ -286,7 +314,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         }
         return action_payoffs;
 
-    } else { // Ход оппонента
+    } else { 
         state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
         auto result = traverse(state, traversing_player, false, traversal_id);
         state.undo_action(undo_info, traversing_player);
