@@ -22,7 +22,12 @@ sys.path.insert(0, '/content/PAQN')
 
 from python_src.model import OFC_CNN_Network
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
-from cpp_src.constants import INFOSET_SIZE, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS
+
+# --- ИЗМЕНЕНИЕ: Определяем константы прямо здесь, убрав неработающий импорт ---
+NUM_FEATURE_CHANNELS = 16
+NUM_SUITS = 4
+NUM_RANKS = 13
+INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 
 # --- Настройки ---
 TOTAL_CPUS = os.cpu_count() or 1
