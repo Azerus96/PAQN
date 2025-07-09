@@ -214,27 +214,31 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         bool got_item = false;
         {
             py::gil_scoped_acquire acquire;
+            py::object policy_key = py::cast(policy_request_id);
             // Проверяем и извлекаем результат для policy_request_id
-            if (result_queue_->contains(policy_request_id)) {
-                py::tuple result_tuple = (*result_queue_)[policy_request_id].cast<py::tuple>();
+            if (result_queue_->contains(policy_key)) {
+                py::tuple result_tuple = (*result_queue_)[policy_key].cast<py::tuple>();
                 logits = result_tuple[2].cast<std::vector<float>>();
-                py::delitem(*result_queue_, py::cast(policy_request_id));
+                result_queue_->attr("pop")(policy_key);
                 results_gotten++;
                 got_item = true;
             }
 
             // Проверяем и извлекаем результат для value_request_id, если он нужен
-            if (is_traversing_players_turn && results_gotten < results_to_get && result_queue_->contains(value_request_id)) {
-                py::tuple result_tuple = (*result_queue_)[value_request_id].cast<py::tuple>();
-                if (!result_tuple[2].is_none()) {
-                    std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
-                    if (!predictions.empty()) {
-                        value_baseline = predictions[0];
+            if (is_traversing_players_turn && results_gotten < results_to_get) {
+                py::object value_key = py::cast(value_request_id);
+                if (result_queue_->contains(value_key)) {
+                    py::tuple result_tuple = (*result_queue_)[value_key].cast<py::tuple>();
+                    if (!result_tuple[2].is_none()) {
+                        std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
+                        if (!predictions.empty()) {
+                            value_baseline = predictions[0];
+                        }
                     }
+                    result_queue_->attr("pop")(value_key);
+                    results_gotten++;
+                    got_item = true;
                 }
-                py::delitem(*result_queue_, py::cast(value_request_id));
-                results_gotten++;
-                got_item = true;
             }
         } // GIL отпускается здесь
 
