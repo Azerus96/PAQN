@@ -1,5 +1,3 @@
-# PAQN-main/python_src/train.py
-
 import os
 import sys
 import time
@@ -22,7 +20,6 @@ if __name__ == '__main__':
 sys.path.insert(0, '/content/PAQN/build')
 sys.path.insert(0, '/content/PAQN')
 
-# --- ИЗМЕНЕНИЕ: Используем новые константы и модель ---
 from python_src.model import OFC_CNN_Network
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 from cpp_src.constants import INFOSET_SIZE, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS
@@ -53,7 +50,6 @@ MODEL_PATH = os.path.join(MODEL_DIR, "paqn_model_latest.pth")
 OPPONENT_POOL_DIR = os.path.join(MODEL_DIR, "opponent_pool")
 MAX_OPPONENTS_IN_POOL = 20
 
-# --- ИЗМЕНЕНИЕ: Класс воркера значительно упрощен ---
 class InferenceWorker(mp.Process):
     def __init__(self, name, task_queue, result_queue, stop_event):
         super().__init__(name=name)
@@ -96,6 +92,10 @@ class InferenceWorker(mp.Process):
     def run(self):
         self._initialize()
         
+        STREET_START_IDX = 9
+        STREET_END_IDX = 14
+        TURN_CHANNEL_IDX = 15
+
         while not self.stop_event.is_set():
             try:
                 batch = []
@@ -126,8 +126,7 @@ class InferenceWorker(mp.Process):
                         infoset_tensor = torch.tensor(infosets, dtype=torch.float32, device=self.device)
                         infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
                         
-                        # Определяем, чья очередь ходить по каналу TURN_CHAN
-                        turn_channel = infoset_tensor[:, 16, 0, 0]
+                        turn_channel = infoset_tensor[:, TURN_CHANNEL_IDX, 0, 0]
                         is_player_turn = turn_channel > 0.5
                         
                         values = torch.zeros(len(infosets), 1, device=self.device)
@@ -150,10 +149,12 @@ class InferenceWorker(mp.Process):
                             infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
                             actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
                             
-                            turn_channel_val = infoset_tensor[0, 16, 0, 0]
+                            street_vector = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
+                            
+                            turn_channel_val = infoset_tensor[0, TURN_CHANNEL_IDX, 0, 0]
                             model_to_use = self.latest_model if turn_channel_val > 0.5 else self.opponent_model
                             
-                            policy_logits, _ = model_to_use(infoset_tensor, actions_tensor)
+                            policy_logits, _ = model_to_use(infoset_tensor, actions_tensor, street_vector)
                             predictions = policy_logits.cpu().numpy().flatten().tolist()
                             self.result_queue.put((req_id, True, predictions))
 
@@ -218,6 +219,9 @@ def main():
     last_save_time = time.time()
     model_version = 0
     
+    STREET_START_IDX = 9
+    STREET_END_IDX = 14
+
     try:
         while True:
             if value_buffer.size() < MIN_BUFFER_FILL_SAMPLES or policy_buffer.size() < MIN_BUFFER_FILL_SAMPLES:
@@ -228,7 +232,6 @@ def main():
 
             model.train()
             
-            # --- ИЗМЕНЕНИЕ: Получаем готовые тензоры из C++ ---
             v_batch = value_buffer.sample(BATCH_SIZE)
             if not v_batch: continue
             v_infosets_np, _, v_targets_np = v_batch
@@ -243,7 +246,9 @@ def main():
             p_infosets = torch.from_numpy(p_infosets_np).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
             p_actions = torch.from_numpy(p_actions_np).to(device)
             p_advantages = torch.from_numpy(p_advantages_np).unsqueeze(1).to(device)
-            pred_logits, _ = model(p_infosets, p_actions)
+            
+            p_street_vector = p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
+            pred_logits, _ = model(p_infosets, p_actions, p_street_vector)
             loss_p = criterion(pred_logits, p_advantages)
 
             optimizer.zero_grad()
