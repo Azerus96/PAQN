@@ -158,12 +158,10 @@ namespace ofc {
         }
     }
 
-    // --- ИСПРАВЛЕНИЕ: Правильная реализация сбалансированного подхода ---
     void GameState::get_legal_actions(size_t action_limit, std::vector<Action>& out_actions, std::mt19937& rng) const {
         out_actions.clear();
         if (is_terminal()) return;
 
-        // На улицах 2-5 всегда делаем полный перебор, т.к. вариантов мало
         if (street_ > 1) {
             const Board& board = boards_[current_player_];
             std::vector<std::pair<std::string, int>> available_slots;
@@ -181,11 +179,10 @@ namespace ofc {
                 std::vector<int> indices;
                 generate_all_placements_recursive(cards_to_place, available_slots, indices, 0, 2, current_discarded, out_actions);
             }
-        } else { // На улице 1 используем сэмплирование
+        } else { 
             CardSet cards_to_place = dealt_cards_;
             generate_random_placements(cards_to_place, INVALID_CARD, out_actions, action_limit, rng);
             
-            // Убираем дубликаты, которые могли возникнуть при случайной генерации
             std::set<Action> unique_actions(out_actions.begin(), out_actions.end());
             out_actions.assign(unique_actions.begin(), unique_actions.end());
 
@@ -215,9 +212,8 @@ namespace ofc {
         }
 
         if (discarded_card != INVALID_CARD) {
-            if (current_player_ == player_view) {
-                my_discards_[current_player_].push_back(discarded_card);
-            } else {
+            my_discards_[current_player_].push_back(discarded_card);
+            if (current_player_ != player_view) {
                 opponent_discard_counts_[player_view]++;
             }
         }
@@ -234,7 +230,8 @@ namespace ofc {
 
     void GameState::undo_action(const UndoInfo& undo_info, int player_view) {
         street_ = undo_info.prev_street;
-        current_player_ = undo_info.prev_current_player;
+        int player_who_acted = undo_info.prev_current_player;
+        current_player_ = player_who_acted;
 
         deck_.insert(deck_.end(), dealt_cards_.begin(), dealt_cards_.end());
         dealt_cards_ = undo_info.dealt_cards_before_action;
@@ -245,15 +242,14 @@ namespace ofc {
         for (const auto& p : placements) {
             const std::string& row = p.second.first;
             int idx = p.second.second;
-            if (row == "top") boards_[current_player_].top[idx] = INVALID_CARD;
-            else if (row == "middle") boards_[current_player_].middle[idx] = INVALID_CARD;
-            else if (row == "bottom") boards_[current_player_].bottom[idx] = INVALID_CARD;
+            if (row == "top") boards_[player_who_acted].top[idx] = INVALID_CARD;
+            else if (row == "middle") boards_[player_who_acted].middle[idx] = INVALID_CARD;
+            else if (row == "bottom") boards_[player_who_acted].bottom[idx] = INVALID_CARD;
         }
 
         if (discarded_card != INVALID_CARD) {
-            if (current_player_ == player_view) {
-                my_discards_[current_player_].pop_back();
-            } else {
+            my_discards_[player_who_acted].pop_back();
+            if (player_who_acted != player_view) {
                 opponent_discard_counts_[player_view]--;
             }
         }
@@ -273,7 +269,7 @@ namespace ofc {
     GameState GameState::get_canonical(std::map<int, int>& suit_map) const {
         suit_map.clear();
         GameState canonical_state = *this;
-        int transform[SUIT_COUNT] = {-1, -1, -1, -1};
+        int transform[NUM_SUITS] = {-1, -1, -1, -1};
         int canonical_suit_count = 0;
 
         auto process_card_for_mapping = [&](Card card) {
@@ -294,13 +290,13 @@ namespace ofc {
             }
         }
 
-        for (int i = 0; i < SUIT_COUNT; ++i) {
+        for (int i = 0; i < NUM_SUITS; ++i) {
             if (transform[i] == -1) {
                 transform[i] = canonical_suit_count++;
             }
         }
 
-        for (int i = 0; i < SUIT_COUNT; ++i) {
+        for (int i = 0; i < NUM_SUITS; ++i) {
             suit_map[i] = transform[i];
         }
 
