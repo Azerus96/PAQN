@@ -28,7 +28,6 @@ namespace ofc {
 
         std::pair<float, float> get_payoffs(const HandEvaluator& evaluator) const;
         
-        // --- ИСПРАВЛЕНИЕ: Правильная сигнатура с 3 аргументами ---
         void get_legal_actions(size_t action_limit, std::vector<Action>& out_actions, std::mt19937& rng) const;
         
         void apply_action(const Action& action, int player_view, UndoInfo& undo_info);
@@ -42,9 +41,10 @@ namespace ofc {
         const CardSet& get_dealt_cards() const { return dealt_cards_; }
         const Board& get_player_board(int player_idx) const { return boards_[player_idx]; }
         const Board& get_opponent_board(int player_idx) const { return boards_[(player_idx + 1) % num_players_]; }
-        const CardSet& get_my_discards(int player_idx) const { return my_discards_[player_idx]; }
-        int get_opponent_discard_count(int player_idx) const { return opponent_discard_counts_[player_idx]; }
         int get_dealer_pos() const { return dealer_pos_; }
+
+        const CardSet& get_my_discards(int player_idx) const { return my_discards_[player_idx]; }
+        int get_opponent_discard_count(int player_idx) const { return opponent_discard_counts_[(player_idx + 1) % num_players_]; }
         
     private:
         void deal_cards();
