@@ -150,7 +150,7 @@ class InferenceWorker(mp.Process):
                             values[~is_player_turn] = self.opponent_model(infoset_tensor[~is_player_turn])
 
                         for i, req_id in enumerate(value_requests.keys()):
-                            self.result_queue.put((req_id, False, [values[i].item()]))
+                            self.result_queue[req_id] = (req_id, False, [values[i].item()])
 
                     # --- ПРАВИЛЬНАЯ БАТЧЕВАЯ ОБРАБОТКА POLICY ЗАПРОСОВ ---
                     if policy_requests:
@@ -160,7 +160,7 @@ class InferenceWorker(mp.Process):
                         
                         for req_id, (infoset, action_vectors) in policy_requests.items():
                             if not action_vectors:
-                                self.result_queue.put((req_id, True, []))
+                                self.result_queue[req_id] = (req_id, True, [])
                                 continue
                             
                             # Определяем, какую модель использовать, по каналу хода
@@ -205,7 +205,7 @@ class InferenceWorker(mp.Process):
                             for i, req_id in enumerate(req_ids_ordered):
                                 count = action_counts[i]
                                 result_slice = predictions[current_pos : current_pos + count].tolist()
-                                self.result_queue.put((req_id, True, result_slice))
+                                self.result_queue[req_id] = (req_id, True, result_slice)
                                 current_pos += count
 
             except (KeyboardInterrupt, SystemExit):
@@ -250,20 +250,20 @@ def main():
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
     
-    request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 4)
-    result_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 4)
+    request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 8) # Можно увеличить
+    result_dict = mp.Manager().dict()
     stop_event = mp.Event()
 
     inference_workers = []
     for i in range(NUM_INFERENCE_WORKERS):
-        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_queue, stop_event)
+        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_dict, stop_event)
         worker.start()
         inference_workers.append(worker)
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
     solver_manager = SolverManager(
         NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
-        request_queue, result_queue
+        request_queue, result_dict
     )
     print("C++ workers are running in the background.", flush=True)
     
@@ -328,7 +328,7 @@ def main():
                 print(f"Buffer Fill -> Policy: {policy_buffer.size():,}/{BUFFER_CAPACITY:,} ({policy_buffer.size()/BUFFER_CAPACITY:.1%}) "
                       f"| Value: {value_buffer.size():,}/{BUFFER_CAPACITY:,} ({value_buffer.size()/BUFFER_CAPACITY:.1%})", flush=True)
                 print(f"Avg Losses (last 100) -> Policy: {avg_p_loss:.6f} | Value: {avg_v_loss:.6f}", flush=True)
-                print(f"Request Queue: {request_queue.qsize()} | Result Queue: {result_queue.qsize()}", flush=True)
+                print(f"Request Queue: {request_queue.qsize()} | Result Dict: {len(result_dict)}", flush=True)
                 print("="*54, flush=True)
                 last_stats_time = now
 
