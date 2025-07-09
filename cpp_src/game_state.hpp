@@ -44,7 +44,11 @@ namespace ofc {
         int get_dealer_pos() const { return dealer_pos_; }
 
         const CardSet& get_my_discards(int player_idx) const { return my_discards_[player_idx]; }
-        int get_opponent_discard_count(int player_idx) const { return opponent_discard_counts_[(player_idx + 1) % num_players_]; }
+        
+        // --- ИЗМЕНЕНИЕ: Метод теперь вычисляет значение на лету, а не берет из поля ---
+        int get_opponent_discard_count(int player_idx) const { 
+            return my_discards_[(player_idx + 1) % num_players_].size(); 
+        }
         
     private:
         void deal_cards();
@@ -69,6 +73,7 @@ namespace ofc {
         CardSet deck_;
         CardSet dealt_cards_;
         std::vector<CardSet> my_discards_;
-        std::vector<int> opponent_discard_counts_;
+        // --- ИЗМЕНЕНИЕ: Удалено избыточное и багованное поле ---
+        // std::vector<int> opponent_discard_counts_; 
     };
 }
