@@ -1,5 +1,3 @@
-// PAQN-main/pybind_wrapper.cpp
-
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
@@ -21,7 +19,7 @@ class SolverManagerImpl {
 public:
     SolverManagerImpl(
         size_t num_workers,
-        size_t action_limit, // --- ИЗМЕНЕНИЕ: Добавлен action_limit ---
+        size_t action_limit,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object* request_queue,
@@ -29,7 +27,6 @@ public:
     ) {
         stop_flag_.store(false);
         for (size_t i = 0; i < num_workers; ++i) {
-            // --- ИЗМЕНЕНИЕ: Передаем action_limit в конструктор ---
             auto solver = std::make_unique<ofc::DeepMCCFR>(
                 action_limit, policy_buffer, value_buffer, request_queue, result_queue
             );
@@ -66,7 +63,7 @@ class PySolverManager {
 public:
     PySolverManager(
         size_t num_workers,
-        size_t action_limit, // --- ИЗМЕНЕНИЕ: Добавлен action_limit ---
+        size_t action_limit,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
@@ -74,7 +71,7 @@ public:
     ) : request_queue_(request_queue), result_queue_(result_queue) {
         py::gil_scoped_release release;
         impl_ = std::make_unique<SolverManagerImpl>(
-            num_workers, action_limit, policy_buffer, value_buffer, // --- ИЗМЕНЕНИЕ: Передаем action_limit ---
+            num_workers, action_limit, policy_buffer, value_buffer,
             &request_queue_, &result_queue_
         );
     }
@@ -96,14 +93,12 @@ public:
 private:
     py::object request_queue_;
     py::object result_queue_;
-    std::unique_ptr<PySolverManagerImpl> impl_;
+    std::unique_ptr<SolverManagerImpl> impl_;
 };
 
 
 PYBIND11_MODULE(ofc_engine, m) {
     m.doc() = "OFC Engine with C++ Thread Manager and Queue-based Inference";
-
-    // --- ИЗМЕНЕНИЕ: Структуры запроса/ответа больше не нужны в Python ---
 
     m.def("initialize_evaluator", []() {
         omp::HandEvaluator::initialize();
@@ -113,7 +108,6 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def(py::init<uint64_t>(), py::arg("capacity"))
         .def("size", &ofc::SharedReplayBuffer::size)
         .def("total_generated", &ofc::SharedReplayBuffer::total_generated)
-        // --- ИЗМЕНЕНИЕ: sample теперь принимает готовые numpy массивы ---
         .def("sample", [](ofc::SharedReplayBuffer &buffer, int batch_size) -> py::object {
             auto infosets_np = py::array_t<float>({batch_size, ofc::INFOSET_SIZE});
             auto actions_np = py::array_t<float>({batch_size, ofc::ACTION_VECTOR_SIZE});
@@ -134,7 +128,6 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
     py::class_<PySolverManager>(m, "SolverManager")
-        // --- ИЗМЕНЕНИЕ: Обновлен конструктор ---
         .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(),
              py::arg("num_workers"),
              py::arg("action_limit"),
