@@ -9,13 +9,16 @@ import numpy as np
 import traceback
 from collections import deque
 import multiprocessing as mp
+import queue  # Используем стандартную очередь для get_nowait
 import random
 import glob
 
 if __name__ == '__main__':
+    # Устанавливаем метод 'spawn' для создания процессов, это важно для CUDA и стабильности
     if mp.get_start_method(allow_none=True) != 'spawn':
         mp.set_start_method('spawn', force=True)
 
+# Добавляем пути к модулям
 sys.path.insert(0, '/content/PAQN/build')
 sys.path.insert(0, '/content/PAQN')
 
@@ -26,19 +29,23 @@ from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 # --- Настройки ---
 TOTAL_CPUS = os.cpu_count() or 1
 RESERVED_CPUS = 2 if TOTAL_CPUS > 4 else 1
-NUM_INFERENCE_WORKERS = max(1, int(TOTAL_CPUS * 0.20))
+# Оптимальное распределение: много C++ генераторов, несколько мощных Python обработчиков
+NUM_INFERENCE_WORKERS = max(1, int(TOTAL_CPUS * 0.25)) # 25% ядер под инференс
 NUM_CPP_WORKERS = max(1, TOTAL_CPUS - NUM_INFERENCE_WORKERS - RESERVED_CPUS)
 
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- Гиперпараметры ---
-ACTION_LIMIT = 200 # Разумное значение для начала. Можно увеличить до 500-1000 позже.
-ACTION_VECTOR_SIZE = 208
+ACTION_LIMIT = 250
 LEARNING_RATE = 0.0005
 BUFFER_CAPACITY = 2_000_000
 BATCH_SIZE = 2048
 MIN_BUFFER_FILL_RATIO = 0.05
 MIN_BUFFER_FILL_SAMPLES = int(BUFFER_CAPACITY * MIN_BUFFER_FILL_RATIO)
+
+# --- Гиперпараметры для пакетной обработки ---
+MAX_BATCH_SIZE = 256  # Максимальный размер пакета для нейросети
+BATCH_TIMEOUT_MS = 2.0 # Макс. время ожидания (в мс) для сбора пакета
 
 # --- Пути и интервалы ---
 STATS_INTERVAL_SECONDS = 15
@@ -133,38 +140,85 @@ class InferenceWorker(mp.Process):
 
         while not self.stop_event.is_set():
             try:
-                if time.time() - last_model_check_time > 60:
-                    self._load_models()
-                    last_model_check_time = time.time()
-
-                req_id, is_policy, raw_state, action_vectors = self.task_queue.get(timeout=1.0)
+                # --- НОВАЯ ЛОГИКА ПАКЕТНОЙ ОБРАБОТКИ ---
+                batch = []
+                start_time = time.time()
+                # Собираем пакет, пока он не заполнится или не истечет таймаут
+                while (len(batch) < MAX_BATCH_SIZE and 
+                       (time.time() - start_time) * 1000 < BATCH_TIMEOUT_MS):
+                    try:
+                        # Используем неблокирующий get, чтобы не зависать
+                        item = self.task_queue.get_nowait()
+                        batch.append(item)
+                    except queue.Empty:
+                        # Если очередь пуста, но пакет уже не пустой, выходим и обрабатываем
+                        if batch:
+                            break
+                        # Если и пакет пуст, немного ждем, чтобы не грузить CPU
+                        time.sleep(0.0005)
                 
-                game_dict = decode_raw_state(raw_state)
-                state_image = featurize_state_optimal(game_dict)
-                
-                current_player_id = game_dict['current_player']
-                active_model = self.latest_model if current_player_id == 0 else self.opponent_model
+                if not batch:
+                    continue
 
-                if is_policy:
-                    if not action_vectors:
-                        predictions = []
+                # Разделяем пакет на policy и value запросы
+                policy_requests = {}
+                value_requests = {}
+                for req in batch:
+                    req_id, is_policy, raw_state, action_vectors = req
+                    if is_policy:
+                        policy_requests[req_id] = (raw_state, action_vectors)
                     else:
-                        batch_size = len(action_vectors)
-                        state_image_tensor = torch.tensor(np.array([state_image] * batch_size), dtype=torch.float32, device=self.device)
-                        actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
-                        with torch.inference_mode():
-                            policy_logits, _ = active_model(state_image_tensor, actions_tensor)
-                            predictions = policy_logits.cpu().numpy().flatten().tolist()
-                    self.result_queue.put((req_id, True, predictions))
-                else:
-                    state_image_tensor = torch.tensor(np.array([state_image]), dtype=torch.float32, device=self.device)
-                    with torch.inference_mode():
-                        value = active_model(state_image_tensor)
-                        prediction = value.item()
-                    self.result_queue.put((req_id, False, [prediction]))
+                        value_requests[req_id] = raw_state
 
-            except mp.queues.Empty:
-                continue
+                # Обрабатываем value-запросы
+                if value_requests:
+                    raw_states = list(value_requests.values())
+                    game_dicts = [decode_raw_state(rs) for rs in raw_states]
+                    
+                    # Определяем, какую модель использовать для каждого запроса
+                    models_to_use = [self.latest_model if gd['current_player'] == 0 else self.opponent_model for gd in game_dicts]
+                    
+                    state_images = [featurize_state_optimal(gd) for gd in game_dicts]
+                    state_tensor = torch.tensor(np.array(state_images), dtype=torch.float32, device=self.device)
+                    
+                    with torch.inference_mode():
+                        # Мы не можем смешивать модели в одном батче, поэтому обрабатываем последовательно
+                        # (на CPU это не так критично, как на GPU)
+                        all_values = []
+                        for i, model_to_use in enumerate(models_to_use):
+                            val = model_to_use(state_tensor[i:i+1])
+                            all_values.append(val.item())
+
+                    for i, req_id in enumerate(value_requests.keys()):
+                        self.result_queue.put((req_id, False, [all_values[i]]))
+
+                # Обрабатываем policy-запросы
+                if policy_requests:
+                    req_ids = list(policy_requests.keys())
+                    raw_states = [r[0] for r in policy_requests.values()]
+                    all_action_vectors = [r[1] for r in policy_requests.values()]
+                    
+                    game_dicts = [decode_raw_state(rs) for rs in raw_states]
+                    models_to_use = [self.latest_model if gd['current_player'] == 0 else self.opponent_model for gd in game_dicts]
+
+                    with torch.inference_mode():
+                        for i, req_id in enumerate(req_ids):
+                            action_vectors = all_action_vectors[i]
+                            if not action_vectors:
+                                self.result_queue.put((req_id, True, []))
+                                continue
+                            
+                            model_to_use = models_to_use[i]
+                            state_image = featurize_state_optimal(game_dicts[i])
+                            
+                            num_actions = len(action_vectors)
+                            state_tensor = torch.tensor(np.array([state_image] * num_actions), dtype=torch.float32, device=self.device)
+                            actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
+                            
+                            policy_logits, _ = model_to_use(state_tensor, actions_tensor)
+                            predictions = policy_logits.cpu().numpy().flatten().tolist()
+                            self.result_queue.put((req_id, True, predictions))
+
             except (KeyboardInterrupt, SystemExit):
                 break
             except Exception:
@@ -172,6 +226,7 @@ class InferenceWorker(mp.Process):
                 traceback.print_exc()
         
         print(f"[{self.name}] Stopped.", flush=True)
+
 
 def update_opponent_pool(model_version):
     if not os.path.exists(MODEL_PATH): return
@@ -229,14 +284,14 @@ def main():
     try:
         while True:
             if value_buffer.size() < MIN_BUFFER_FILL_SAMPLES or policy_buffer.size() < MIN_BUFFER_FILL_SAMPLES:
+                print(f"Waiting for buffers to fill... Policy: {policy_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}, Value: {value_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}", end='\r')
                 time.sleep(1)
-                last_stats_time = time.time()
+                last_stats_time = time.time() # Сбрасываем таймер статистики, пока ждем
                 continue
 
             model.train()
-            optimizer.zero_grad()
             
-            # Value Head
+            # --- Обучение Value Head ---
             v_batch = value_buffer.sample(BATCH_SIZE)
             if not v_batch: continue
             v_raw_states, _, v_targets_np = v_batch
@@ -246,7 +301,7 @@ def main():
             pred_values = model(v_infosets)
             loss_v = criterion(pred_values, v_targets)
             
-            # Policy Head
+            # --- Обучение Policy Head ---
             p_batch = policy_buffer.sample(BATCH_SIZE)
             if not p_batch: continue
             p_raw_states, p_actions_np, p_advantages_np = p_batch
@@ -257,6 +312,8 @@ def main():
             pred_logits, _ = model(p_infosets, p_actions)
             loss_p = criterion(pred_logits, p_advantages)
 
+            # --- Обновление весов ---
+            optimizer.zero_grad()
             total_loss = loss_v + loss_p
             total_loss.backward()
             clip_grad_norm_(model.parameters(), 1.0)
@@ -294,12 +351,14 @@ def main():
         print("\nTraining interrupted by user.", flush=True)
     finally:
         print("Stopping all workers...", flush=True)
+        stop_event.set()
+        time.sleep(2) # Даем время воркерам заметить событие
+        
+        # Сначала останавливаем C++ генераторы
         solver_manager.stop()
         print("C++ workers stopped.")
         
-        stop_event.set()
-        time.sleep(2)
-        
+        # Затем останавливаем Python обработчики
         for worker in inference_workers:
             worker.join(timeout=5)
             if worker.is_alive():
