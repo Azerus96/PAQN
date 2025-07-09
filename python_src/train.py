@@ -1,3 +1,5 @@
+--- START OF FILE PAQN-main/python_src/train.py ---
+
 import os
 import sys
 import time
@@ -111,19 +113,19 @@ class InferenceWorker(mp.Process):
 
         while not self.stop_event.is_set():
             try:
-                batch = []
-                start_time = time.time()
-                while (len(batch) < MAX_BATCH_SIZE and 
-                       (time.time() - start_time) * 1000 < BATCH_TIMEOUT_MS):
-                    try:
-                        item = self.task_queue.get_nowait()
-                        batch.append(item)
-                    except queue.Empty:
-                        if batch: break
-                        time.sleep(0.0005)
-                
-                if not batch: continue
+                # --- ЛОГИРОВАНИЕ: Упрощаем получение задач для отладки ---
+                # Используем блокирующий get(), чтобы не усложнять логику таймаутами
+                try:
+                    # Ждем задачу не более 1 секунды, чтобы можно было проверить stop_event
+                    item = self.task_queue.get(timeout=1)
+                    batch = [item]
+                except queue.Empty:
+                    continue # Если задач нет, просто проверяем stop_event и идем на новую итерацию
 
+                # --- ЛОГИРОВАНИЕ: Выводим информацию о полученной задаче ---
+                req_id, is_policy, _, _ = batch[0]
+                print(f"[{self.name}] Got request {req_id} (is_policy={is_policy})", flush=True)
+                
                 policy_requests = {}
                 value_requests = {}
                 for req in batch:
@@ -134,7 +136,6 @@ class InferenceWorker(mp.Process):
                         value_requests[req_id] = infoset
 
                 with torch.inference_mode():
-                    # --- Обработка Value запросов (остается как было, т.к. эффективно) ---
                     if value_requests:
                         infosets = list(value_requests.values())
                         infoset_tensor = torch.tensor(infosets, dtype=torch.float32, device=self.device)
@@ -151,33 +152,31 @@ class InferenceWorker(mp.Process):
 
                         for i, req_id in enumerate(value_requests.keys()):
                             self.result_queue[req_id] = (req_id, False, [values[i].item()])
+                            # --- ЛОГИРОВАНИЕ: Выводим информацию об отправке результата ---
+                            print(f"[{self.name}] Sent VALUE result for {req_id}", flush=True)
 
-                    # --- ПРАВИЛЬНАЯ БАТЧЕВАЯ ОБРАБОТКА POLICY ЗАПРОСОВ ---
                     if policy_requests:
-                        # Разделяем запросы для основной модели и для оппонента
                         latest_model_reqs = {}
                         opponent_model_reqs = {}
                         
                         for req_id, (infoset, action_vectors) in policy_requests.items():
                             if not action_vectors:
                                 self.result_queue[req_id] = (req_id, True, [])
+                                print(f"[{self.name}] Sent EMPTY policy result for {req_id}", flush=True)
                                 continue
                             
-                            # Определяем, какую модель использовать, по каналу хода
                             turn_channel_val = infoset[TURN_CHANNEL_IDX * NUM_SUITS * NUM_RANKS]
                             if turn_channel_val > 0.5:
                                 latest_model_reqs[req_id] = (infoset, action_vectors)
                             else:
                                 opponent_model_reqs[req_id] = (infoset, action_vectors)
 
-                        # Обрабатываем каждую группу запросов отдельно
                         for model, reqs in [(self.latest_model, latest_model_reqs), (self.opponent_model, opponent_model_reqs)]:
                             if not reqs:
                                 continue
 
                             all_infosets = []
                             all_actions = []
-                            all_streets = []
                             action_counts = []
                             req_ids_ordered = []
 
@@ -185,27 +184,24 @@ class InferenceWorker(mp.Process):
                                 num_actions = len(action_vectors)
                                 action_counts.append(num_actions)
                                 req_ids_ordered.append(req_id)
-                                
-                                # Собираем все в один большой список
                                 all_infosets.extend([infoset] * num_actions)
                                 all_actions.extend(action_vectors)
 
-                            # Создаем большие тензоры
                             infoset_tensor = torch.tensor(all_infosets, dtype=torch.float32, device=self.device)
                             infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
                             actions_tensor = torch.tensor(all_actions, dtype=torch.float32, device=self.device)
                             street_vector = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
                             
-                            # Один вызов модели для всего батча
                             policy_logits, _ = model(infoset_tensor, actions_tensor, street_vector)
                             
-                            # Разбираем результаты обратно по запросам
                             predictions = policy_logits.cpu().numpy().flatten()
                             current_pos = 0
                             for i, req_id in enumerate(req_ids_ordered):
                                 count = action_counts[i]
                                 result_slice = predictions[current_pos : current_pos + count].tolist()
                                 self.result_queue[req_id] = (req_id, True, result_slice)
+                                # --- ЛОГИРОВАНИЕ: Выводим информацию об отправке результата ---
+                                print(f"[{self.name}] Sent POLICY result for {req_id}", flush=True)
                                 current_pos += count
 
             except (KeyboardInterrupt, SystemExit):
@@ -216,6 +212,7 @@ class InferenceWorker(mp.Process):
         
         print(f"[{self.name}] Stopped.", flush=True)
 
+# ... (остальная часть файла main() остается без изменений) ...
 def update_opponent_pool(model_version):
     if not os.path.exists(MODEL_PATH): return
     pool_files = sorted(glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth")), key=os.path.getmtime)
