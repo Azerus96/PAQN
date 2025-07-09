@@ -1,14 +1,20 @@
 #pragma once
-#include <pybind11/pybind11.h>
-#include "game_state.hpp"
-#include "hand_evaluator.hpp"
-#include "SharedReplayBuffer.hpp"
-#include "InferenceQueue.hpp"
+
+// --- ИСПРАВЛЕНИЕ: Добавляем базовые заголовки ДО pybind11 ---
+#include <cstddef> // Определяет std::size_t
 #include <vector>
 #include <map>
 #include <memory>
 #include <random>
 #include <atomic>
+// --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+#include <pybind11/pybind11.h>
+#include "game_state.hpp"
+#include "hand_evaluator.hpp"
+#include "SharedReplayBuffer.hpp"
+#include "InferenceQueue.hpp"
+
 
 namespace py = pybind11;
 
