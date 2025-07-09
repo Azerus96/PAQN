@@ -1,11 +1,16 @@
 #pragma once
+
+// --- ИСПРАВЛЕНИЕ: Добавляем базовые заголовки ДО pybind11 ---
+#include <cstddef>
+#include <vector>
+#include <string>
+#include <cstdint>
+// --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <variant>
-#include <vector>
-#include <string>
-#include <cstdint>
 #include "constants.hpp"
 
 namespace py = pybind11;
@@ -26,6 +31,6 @@ struct InferenceResult {
 };
 
 using InferenceRequestQueue = py::object;
-using InferenceResultQueue = py::object; // <--- ИЗМЕНЕНИЕ: py::dict -> py::object
+using InferenceResultQueue = py::object;
 
 } // namespace ofc
