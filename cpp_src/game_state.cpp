@@ -15,7 +15,7 @@ namespace ofc {
         dealt_cards_.reserve(5);
         my_discards_.resize(num_players);
         for(auto& v : my_discards_) v.reserve(4);
-        opponent_discard_counts_.resize(num_players);
+        // --- ИЗМЕНЕНИЕ: Удалена инициализация opponent_discard_counts_ ---
         boards_.resize(num_players);
         reset(dealer_pos);
     }
@@ -46,7 +46,7 @@ namespace ofc {
         for (auto& discards : my_discards_) {
             discards.clear();
         }
-        std::fill(opponent_discard_counts_.begin(), opponent_discard_counts_.end(), 0);
+        // --- ИЗМЕНЕНИЕ: Удален сброс opponent_discard_counts_ ---
         deal_cards();
     }
 
@@ -211,11 +211,9 @@ namespace ofc {
             else if (row == "bottom") boards_[current_player_].bottom[idx] = card;
         }
 
+        // --- ИЗМЕНЕНИЕ: Упрощенная и корректная логика сброса ---
         if (discarded_card != INVALID_CARD) {
             my_discards_[current_player_].push_back(discarded_card);
-            if (current_player_ != player_view) {
-                opponent_discard_counts_[player_view]++;
-            }
         }
 
         if (current_player_ == dealer_pos_) street_++;
@@ -247,11 +245,9 @@ namespace ofc {
             else if (row == "bottom") boards_[player_who_acted].bottom[idx] = INVALID_CARD;
         }
 
+        // --- ИЗМЕНЕНИЕ: Упрощенная и корректная логика отмены сброса ---
         if (discarded_card != INVALID_CARD) {
             my_discards_[player_who_acted].pop_back();
-            if (player_who_acted != player_view) {
-                opponent_discard_counts_[player_view]--;
-            }
         }
     }
 
