@@ -23,7 +23,7 @@ public:
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object* request_queue,
-        py::object* result_queue
+        py::dict* result_queue
     ) {
         stop_flag_.store(false);
         for (size_t i = 0; i < num_workers; ++i) {
@@ -66,13 +66,13 @@ public:
         size_t action_limit,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
-        py::object request_queue,
-        py::object result_queue
-    ) : request_queue_(request_queue), result_queue_(result_queue) {
+        py::object request_queue, // py::object для очереди
+        py::dict result_dict      // py::dict для словаря результатов
+    ) : request_queue_(request_queue), result_queue_(result_dict) {
         py::gil_scoped_release release;
         impl_ = std::make_unique<SolverManagerImpl>(
             num_workers, action_limit, policy_buffer, value_buffer,
-            &request_queue_, &result_queue_
+            &request_queue_, &result_dict
         );
     }
 
@@ -91,8 +91,8 @@ public:
     }
 
 private:
-    py::object request_queue_;
-    py::object result_queue_;
+    py::object request_queue_; // Очередь запросов
+    py::dict result_queue_;    // Словарь результатов
     std::unique_ptr<SolverManagerImpl> impl_;
 };
 
@@ -128,7 +128,7 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
     py::class_<PySolverManager>(m, "SolverManager")
-        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(),
+        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::dict>(),
              py::arg("num_workers"),
              py::arg("action_limit"),
              py::arg("policy_buffer"), py::arg("value_buffer"),
