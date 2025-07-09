@@ -26,6 +26,6 @@ struct InferenceResult {
 };
 
 using InferenceRequestQueue = py::object;
-using InferenceResultQueue = py::dict; // <--- ИЗМЕНЕНИЕ: Теперь это словарь
+using InferenceResultQueue = py::object; // <--- ИЗМЕНЕНИЕ: py::dict -> py::object
 
 } // namespace ofc
