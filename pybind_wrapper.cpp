@@ -22,12 +22,11 @@ public:
         size_t action_limit,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
-        py::object request_queue, // Принимаем по значению
-        py::dict result_queue     // Принимаем по значению
-    ) : request_queue_(request_queue), result_queue_(result_queue) { // Сохраняем копии
+        py::object request_queue,
+        py::object result_queue
+    ) : request_queue_(request_queue), result_queue_(result_queue) {
         stop_flag_.store(false);
         for (size_t i = 0; i < num_workers; ++i) {
-            // Передаем сохраненные копии в конструктор DeepMCCFR
             auto solver = std::make_unique<ofc::DeepMCCFR>(
                 action_limit, policy_buffer, value_buffer, &request_queue_, &result_queue_
             );
@@ -58,9 +57,8 @@ private:
 
     std::vector<std::thread> threads_;
     std::atomic<bool> stop_flag_;
-    // Храним объекты pybind здесь, чтобы они были живы, пока работают потоки
     py::object request_queue_;
-    py::dict result_queue_;
+    py::object result_queue_;
 };
 
 class PySolverManager {
@@ -71,13 +69,12 @@ public:
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
-        py::dict result_dict
+        py::object result_obj // Принимаем как py::object
     ) {
         py::gil_scoped_release release;
-        // Просто передаем объекты дальше
         impl_ = std::make_unique<SolverManagerImpl>(
             num_workers, action_limit, policy_buffer, value_buffer,
-            request_queue, result_dict
+            request_queue, result_obj
         );
     }
 
@@ -131,7 +128,7 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
     py::class_<PySolverManager>(m, "SolverManager")
-        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::dict>(),
+        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(), // <--- ИЗМЕНЕНИЕ: py::dict -> py::object
              py::arg("num_workers"),
              py::arg("action_limit"),
              py::arg("policy_buffer"), py::arg("value_buffer"),
