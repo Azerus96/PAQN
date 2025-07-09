@@ -23,7 +23,7 @@ public:
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object* request_queue,
-        py::dict* result_queue
+        ofc::InferenceResultQueue* result_queue // Используем тип из InferenceQueue.hpp
     ) {
         stop_flag_.store(false);
         for (size_t i = 0; i < num_workers; ++i) {
