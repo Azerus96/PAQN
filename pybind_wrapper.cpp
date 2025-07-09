@@ -22,13 +22,14 @@ public:
         size_t action_limit,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
-        py::object* request_queue,
-        ofc::InferenceResultQueue* result_queue // Используем тип из InferenceQueue.hpp
-    ) {
+        py::object request_queue, // Принимаем по значению
+        py::dict result_queue     // Принимаем по значению
+    ) : request_queue_(request_queue), result_queue_(result_queue) { // Сохраняем копии
         stop_flag_.store(false);
         for (size_t i = 0; i < num_workers; ++i) {
+            // Передаем сохраненные копии в конструктор DeepMCCFR
             auto solver = std::make_unique<ofc::DeepMCCFR>(
-                action_limit, policy_buffer, value_buffer, request_queue, result_queue
+                action_limit, policy_buffer, value_buffer, &request_queue_, &result_queue_
             );
             threads_.emplace_back(&SolverManagerImpl::worker_loop, this, std::move(solver));
         }
@@ -57,6 +58,9 @@ private:
 
     std::vector<std::thread> threads_;
     std::atomic<bool> stop_flag_;
+    // Храним объекты pybind здесь, чтобы они были живы, пока работают потоки
+    py::object request_queue_;
+    py::dict result_queue_;
 };
 
 class PySolverManager {
@@ -66,13 +70,14 @@ public:
         size_t action_limit,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
-        py::object request_queue, // py::object для очереди
-        py::dict result_dict      // py::dict для словаря результатов
-    ) : request_queue_(request_queue), result_queue_(result_dict) {
+        py::object request_queue,
+        py::dict result_dict
+    ) {
         py::gil_scoped_release release;
+        // Просто передаем объекты дальше
         impl_ = std::make_unique<SolverManagerImpl>(
             num_workers, action_limit, policy_buffer, value_buffer,
-            &request_queue_, &result_dict
+            request_queue, result_dict
         );
     }
 
@@ -91,8 +96,6 @@ public:
     }
 
 private:
-    py::object request_queue_; // Очередь запросов
-    py::dict result_queue_;    // Словарь результатов
     std::unique_ptr<SolverManagerImpl> impl_;
 };
 
