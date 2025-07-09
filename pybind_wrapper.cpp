@@ -50,6 +50,7 @@ public:
 
 private:
     void worker_loop(std::unique_ptr<ofc::DeepMCCFR> solver) {
+        // GIL здесь не нужен, так как DeepMCCFR управляет им внутри себя
         while (!stop_flag_.load()) {
             solver->run_traversal();
         }
@@ -69,9 +70,9 @@ public:
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
-        py::object result_obj // Принимаем как py::object
+        py::object result_obj
     ) {
-        py::gil_scoped_release release;
+        // НЕ освобождаем GIL здесь. Конструктор должен выполняться с GIL.
         impl_ = std::make_unique<SolverManagerImpl>(
             num_workers, action_limit, policy_buffer, value_buffer,
             request_queue, result_obj
@@ -79,13 +80,16 @@ public:
     }
 
     ~PySolverManager() {
+        // GIL нужен для безопасного вызова stop() и уничтожения impl_
         py::gil_scoped_acquire acquire;
         if (impl_) {
+            // stop() внутри себя освободит GIL для join()
             impl_->stop();
         }
     }
 
     void stop() {
+        // Освобождаем GIL для длительной операции join() внутри stop()
         py::gil_scoped_release release;
         if (impl_) {
             impl_->stop();
@@ -128,7 +132,7 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
     py::class_<PySolverManager>(m, "SolverManager")
-        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(), // <--- ИЗМЕНЕНИЕ: py::dict -> py::object
+        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(),
              py::arg("num_workers"),
              py::arg("action_limit"),
              py::arg("policy_buffer"), py::arg("value_buffer"),
