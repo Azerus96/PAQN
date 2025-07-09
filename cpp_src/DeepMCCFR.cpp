@@ -1,5 +1,3 @@
-// PAQN-main/cpp_src/DeepMCCFR.cpp
-
 #include "DeepMCCFR.hpp"
 #include "constants.hpp"
 #include <stdexcept>
@@ -16,7 +14,6 @@
 
 namespace ofc {
 
-// ... (функции action_to_vector и add_dirichlet_noise остаются без изменений) ...
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -55,7 +52,6 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
     }
 }
 
-
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
 
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
@@ -78,14 +74,16 @@ void DeepMCCFR::run_traversal() {
     traverse(state, 1, true, traversal_id);
 }
 
-// ... (featurize_state_cpp остается без изменений) ...
 std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int player_view) {
     std::vector<float> features(INFOSET_SIZE, 0.0f);
     
+    // Каналы карт
     const int P_BOARD_TOP = 0, P_BOARD_MID = 1, P_BOARD_BOT = 2, P_HAND = 3;
     const int O_BOARD_TOP = 4, O_BOARD_MID = 5, O_BOARD_BOT = 6;
     const int P_DISCARDS = 7, DECK_REMAINING = 8;
+    // Каналы улиц (one-hot)
     const int IS_STREET_1 = 9, IS_STREET_2 = 10, IS_STREET_3 = 11, IS_STREET_4 = 12, IS_STREET_5 = 13;
+    // Скалярные каналы
     const int O_DISCARD_COUNT = 14, TURN = 15;
     
     const int plane_size = NUM_SUITS * NUM_RANKS;
@@ -101,18 +99,23 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
 
+    // Каналы 0-2: Карты игрока на доске
     for (Card c : my_board.top) set_card(P_BOARD_TOP, c);
     for (Card c : my_board.middle) set_card(P_BOARD_MID, c);
     for (Card c : my_board.bottom) set_card(P_BOARD_BOT, c);
     
+    // Канал 3: Карты игрока в руке
     for (Card c : state.get_dealt_cards()) set_card(P_HAND, c);
 
+    // Каналы 4-6: Карты оппонента на доске
     for (Card c : opp_board.top) set_card(O_BOARD_TOP, c);
     for (Card c : opp_board.middle) set_card(O_BOARD_MID, c);
     for (Card c : opp_board.bottom) set_card(O_BOARD_BOT, c);
 
+    // Канал 7: Свои сброшенные карты
     for (Card c : state.get_my_discards(player_view)) set_card(P_DISCARDS, c);
 
+    // Канал 8: Оставшиеся в колоде карты
     std::vector<bool> known_cards(52, false);
     auto mark_known = [&](Card c) { if (c != INVALID_CARD) known_cards[c] = true; };
     for (Card c : my_board.get_all_cards()) mark_known(c);
@@ -126,15 +129,18 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
         }
     }
 
+    // Каналы 9-13: Улица (one-hot encoding)
     int street = state.get_street();
     if (street >= 1 && street <= 5) {
         int street_channel = IS_STREET_1 + (street - 1);
         std::fill(features.begin() + street_channel * plane_size, features.begin() + (street_channel + 1) * plane_size, 1.0f);
     }
 
+    // Канал 14: Количество сброшенных карт оппонента
     float opp_discard_val = static_cast<float>(state.get_opponent_discard_count(player_view)) / 4.0f;
     std::fill(features.begin() + O_DISCARD_COUNT * plane_size, features.begin() + (O_DISCARD_COUNT + 1) * plane_size, opp_discard_val);
 
+    // Канал 15: Чей ход
     if (state.get_current_player() == player_view) {
         std::fill(features.begin() + TURN * plane_size, features.begin() + (TURN + 1) * plane_size, 1.0f);
     }
@@ -214,20 +220,19 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     int results_to_get = is_traversing_players_turn ? 2 : 1;
     int results_gotten = 0;
 
-    // --- ИЗМЕНЕНИЕ: Неблокирующий цикл получения результатов ---
     while(results_gotten < results_to_get) {
         py::object result_obj;
         {
             py::gil_scoped_acquire acquire;
-            // Используем неблокирующий get с таймаутом
+            auto queue_module = py::module_::import("queue");
+            auto PyExc_Empty = queue_module.attr("Empty");
+            
             try {
                 result_obj = result_queue_->attr("get")(/* blocking */ py::bool_(true), /* timeout */ py::float_(0.001)); // 1ms timeout
             } catch (const py::error_already_set& e) {
                 if (e.matches(PyExc_Empty)) {
-                    // Очередь пуста, это нормально. Отпускаем GIL и ждем.
                     result_obj = py::none();
                 } else {
-                    // Другая ошибка, пробрасываем ее
                     throw;
                 }
             }
@@ -247,17 +252,13 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
                 }
                 results_gotten++;
             } else {
-                // Это может произойти, если другой поток забрал наш результат.
-                // Просто вернем его в очередь.
                 py::gil_scoped_acquire acquire;
                 result_queue_->attr("put")(result_obj);
             }
         } else {
-            // Если очередь была пуста, немного поспим, чтобы не грузить CPU
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     }
-    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     std::vector<float> strategy(num_actions);
     if (!logits.empty() && logits.size() == num_actions) {
