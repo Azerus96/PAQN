@@ -74,34 +74,80 @@ void DeepMCCFR::run_traversal() {
     traverse(state, 1, true, traversal_id);
 }
 
-std::vector<int> DeepMCCFR::serialize_state(const GameState& state, int player_view) {
-    std::vector<int> raw_state;
-    raw_state.reserve(100);
+std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int player_view) {
+    std::vector<float> features(INFOSET_SIZE, 0.0f);
+    
+    // Каналы карт
+    const int P_BOARD_TOP = 0, P_BOARD_MID = 1, P_BOARD_BOT = 2, P_HAND = 3;
+    const int O_BOARD_TOP = 4, O_BOARD_MID = 5, O_BOARD_BOT = 6;
+    const int P_DISCARDS = 7, DECK_REMAINING = 8;
+    // Каналы улиц (one-hot)
+    const int IS_STREET_1 = 9, IS_STREET_2 = 10, IS_STREET_3 = 11, IS_STREET_4 = 12, IS_STREET_5 = 13;
+    // Скалярные каналы
+    const int O_DISCARD_COUNT = 14, TURN = 15;
+    
+    const int plane_size = NUM_SUITS * NUM_RANKS;
+
+    auto set_card = [&](int channel, Card card) {
+        if (card != INVALID_CARD) {
+            int suit = get_suit(card);
+            int rank = get_rank(card);
+            features[channel * plane_size + suit * NUM_RANKS + rank] = 1.0f;
+        }
+    };
 
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
 
-    raw_state.push_back(state.get_street());
-    raw_state.push_back(state.get_current_player());
-    raw_state.push_back(player_view);
-
-    const auto& hand = state.get_dealt_cards();
-    raw_state.push_back(hand.size());
-    for (Card c : hand) raw_state.push_back(c);
-
-    for (Card c : my_board.top) raw_state.push_back(c);
-    for (Card c : my_board.middle) raw_state.push_back(c);
-    for (Card c : my_board.bottom) raw_state.push_back(c);
-
-    for (Card c : opp_board.top) raw_state.push_back(c);
-    for (Card c : opp_board.middle) raw_state.push_back(c);
-    for (Card c : opp_board.bottom) raw_state.push_back(c);
+    // Каналы 0-2: Карты игрока на доске
+    for (Card c : my_board.top) set_card(P_BOARD_TOP, c);
+    for (Card c : my_board.middle) set_card(P_BOARD_MID, c);
+    for (Card c : my_board.bottom) set_card(P_BOARD_BOT, c);
     
-    raw_state.push_back(0); // is_player_fantasyland
-    raw_state.push_back(0); // is_opponent_fantasyland
+    // Канал 3: Карты игрока в руке
+    for (Card c : state.get_dealt_cards()) set_card(P_HAND, c);
 
-    return raw_state;
+    // Каналы 4-6: Карты оппонента на доске
+    for (Card c : opp_board.top) set_card(O_BOARD_TOP, c);
+    for (Card c : opp_board.middle) set_card(O_BOARD_MID, c);
+    for (Card c : opp_board.bottom) set_card(O_BOARD_BOT, c);
+
+    // Канал 7: Свои сброшенные карты
+    for (Card c : state.get_my_discards(player_view)) set_card(P_DISCARDS, c);
+
+    // Канал 8: Оставшиеся в колоде карты
+    std::vector<bool> known_cards(52, false);
+    auto mark_known = [&](Card c) { if (c != INVALID_CARD) known_cards[c] = true; };
+    for (Card c : my_board.get_all_cards()) mark_known(c);
+    for (Card c : opp_board.get_all_cards()) mark_known(c);
+    for (Card c : state.get_dealt_cards()) mark_known(c);
+    for (Card c : state.get_my_discards(player_view)) mark_known(c);
+    
+    for (int c = 0; c < 52; ++c) {
+        if (!known_cards[c]) {
+            set_card(DECK_REMAINING, c);
+        }
+    }
+
+    // Каналы 9-13: Улица (one-hot encoding)
+    int street = state.get_street();
+    if (street >= 1 && street <= 5) {
+        int street_channel = IS_STREET_1 + (street - 1);
+        std::fill(features.begin() + street_channel * plane_size, features.begin() + (street_channel + 1) * plane_size, 1.0f);
+    }
+
+    // Канал 14: Количество сброшенных карт оппонента
+    float opp_discard_val = static_cast<float>(state.get_opponent_discard_count(player_view)) / 4.0f;
+    std::fill(features.begin() + O_DISCARD_COUNT * plane_size, features.begin() + (O_DISCARD_COUNT + 1) * plane_size, opp_discard_val);
+
+    // Канал 15: Чей ход
+    if (state.get_current_player() == player_view) {
+        std::fill(features.begin() + TURN * plane_size, features.begin() + (TURN + 1) * plane_size, 1.0f);
+    }
+
+    return features;
 }
+
 
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root, uint64_t traversal_id) {
     if (state.is_terminal()) {
@@ -126,7 +172,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
     std::map<int, int> suit_map;
     GameState canonical_state = state.get_canonical(suit_map);
-    std::vector<int> raw_state_vec = serialize_state(canonical_state, current_player);
+    std::vector<float> infoset_vec = featurize_state_cpp(canonical_state, current_player);
     
     std::vector<std::vector<float>> canonical_action_vectors;
     canonical_action_vectors.reserve(num_actions);
@@ -154,7 +200,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     {
         py::gil_scoped_acquire acquire;
         py::tuple request_tuple = py::make_tuple(
-            policy_request_id, true, py::cast(raw_state_vec), py::cast(canonical_action_vectors)
+            policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors)
         );
         request_queue_->attr("put")(request_tuple);
     }
@@ -201,7 +247,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         {
             py::gil_scoped_acquire acquire;
             py::tuple request_tuple = py::make_tuple(
-                value_request_id, false, py::cast(raw_state_vec), py::none()
+                value_request_id, false, py::cast(infoset_vec), py::none()
             );
             request_queue_->attr("put")(request_tuple);
         }
@@ -226,8 +272,8 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         auto it = action_payoffs.find(current_player);
         if (it != action_payoffs.end()) {
             float advantage = it->second - value_baseline;
-            policy_buffer_->push_raw(raw_state_vec, canonical_action_vectors[sampled_action_idx], advantage);
-            value_buffer_->push_raw(raw_state_vec, dummy_action_vec_, it->second);
+            policy_buffer_->push(infoset_vec, canonical_action_vectors[sampled_action_idx], advantage);
+            value_buffer_->push(infoset_vec, dummy_action_vec_, it->second);
         }
         return action_payoffs;
 
