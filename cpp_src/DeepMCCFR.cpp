@@ -77,13 +77,10 @@ void DeepMCCFR::run_traversal() {
 std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int player_view) {
     std::vector<float> features(INFOSET_SIZE, 0.0f);
     
-    // Каналы карт
     const int P_BOARD_TOP = 0, P_BOARD_MID = 1, P_BOARD_BOT = 2, P_HAND = 3;
     const int O_BOARD_TOP = 4, O_BOARD_MID = 5, O_BOARD_BOT = 6;
     const int P_DISCARDS = 7, DECK_REMAINING = 8;
-    // Каналы улиц (one-hot)
     const int IS_STREET_1 = 9, IS_STREET_2 = 10, IS_STREET_3 = 11, IS_STREET_4 = 12, IS_STREET_5 = 13;
-    // Скалярные каналы
     const int O_DISCARD_COUNT = 14, TURN = 15;
     
     const int plane_size = NUM_SUITS * NUM_RANKS;
@@ -99,23 +96,18 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
 
-    // Каналы 0-2: Карты игрока на доске
     for (Card c : my_board.top) set_card(P_BOARD_TOP, c);
     for (Card c : my_board.middle) set_card(P_BOARD_MID, c);
     for (Card c : my_board.bottom) set_card(P_BOARD_BOT, c);
     
-    // Канал 3: Карты игрока в руке
     for (Card c : state.get_dealt_cards()) set_card(P_HAND, c);
 
-    // Каналы 4-6: Карты оппонента на доске
     for (Card c : opp_board.top) set_card(O_BOARD_TOP, c);
     for (Card c : opp_board.middle) set_card(O_BOARD_MID, c);
     for (Card c : opp_board.bottom) set_card(O_BOARD_BOT, c);
 
-    // Канал 7: Свои сброшенные карты
     for (Card c : state.get_my_discards(player_view)) set_card(P_DISCARDS, c);
 
-    // Канал 8: Оставшиеся в колоде карты
     std::vector<bool> known_cards(52, false);
     auto mark_known = [&](Card c) { if (c != INVALID_CARD) known_cards[c] = true; };
     for (Card c : my_board.get_all_cards()) mark_known(c);
@@ -129,18 +121,15 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
         }
     }
 
-    // Каналы 9-13: Улица (one-hot encoding)
     int street = state.get_street();
     if (street >= 1 && street <= 5) {
         int street_channel = IS_STREET_1 + (street - 1);
         std::fill(features.begin() + street_channel * plane_size, features.begin() + (street_channel + 1) * plane_size, 1.0f);
     }
 
-    // Канал 14: Количество сброшенных карт оппонента
     float opp_discard_val = static_cast<float>(state.get_opponent_discard_count(player_view)) / 4.0f;
     std::fill(features.begin() + O_DISCARD_COUNT * plane_size, features.begin() + (O_DISCARD_COUNT + 1) * plane_size, opp_discard_val);
 
-    // Канал 15: Чей ход
     if (state.get_current_player() == player_view) {
         std::fill(features.begin() + TURN * plane_size, features.begin() + (TURN + 1) * plane_size, 1.0f);
     }
@@ -183,6 +172,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         if (it != suit_map.end()) {
             card = get_rank(card) * 4 + it->second;
         } else {
+            // This should not happen for valid cards in hand, but as a safeguard:
             card = INVALID_CARD; 
         }
     };
@@ -197,24 +187,54 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     }
     
     uint64_t policy_request_id = traversal_id * 2;
+    uint64_t value_request_id = traversal_id * 2 + 1;
+    bool is_traversing_players_turn = (current_player == traversing_player);
+
+    // --- ИЗМЕНЕНИЕ: Отправляем все запросы сразу ---
     {
         py::gil_scoped_acquire acquire;
-        py::tuple request_tuple = py::make_tuple(
+        // Policy запрос
+        py::tuple policy_request_tuple = py::make_tuple(
             policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors)
         );
-        request_queue_->attr("put")(request_tuple);
+        request_queue_->attr("put")(policy_request_tuple);
+
+        // Value запрос (если нужен)
+        if (is_traversing_players_turn) {
+            py::tuple value_request_tuple = py::make_tuple(
+                value_request_id, false, py::cast(infoset_vec), py::none()
+            );
+            request_queue_->attr("put")(value_request_tuple);
+        }
     }
 
+    // --- ИЗМЕНЕНИЕ: Получаем результаты, обрабатывая их не по порядку ---
     std::vector<float> logits;
-    {
+    float value_baseline = 0.0f;
+    int results_to_get = is_traversing_players_turn ? 2 : 1;
+
+    for (int i = 0; i < results_to_get; ++i) {
         py::gil_scoped_acquire acquire;
-        py::object result_obj = result_queue_->attr("get")(); 
+        py::object result_obj = result_queue_->attr("get")();
         py::tuple result_tuple = result_obj.cast<py::tuple>();
-        if (result_tuple[0].cast<uint64_t>() != policy_request_id) {
-            std::cerr << "C++ Thread " << std::this_thread::get_id() << ": Policy ID mismatch! Expected " << policy_request_id << ", got " << result_tuple[0].cast<uint64_t>() << std::endl;
-            return {};
+        uint64_t result_id = result_tuple[0].cast<uint64_t>();
+        
+        if (result_id == policy_request_id) {
+            logits = result_tuple[2].cast<std::vector<float>>();
+        } else if (result_id == value_request_id) {
+            std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
+            if (!predictions.empty()) {
+                value_baseline = predictions[0];
+            }
+        } else {
+            // Это может случиться, если get() таймаутится и другой поток подхватывает.
+            // В нашем случае get() блокирующий, так что это ошибка.
+            std::cerr << "C++ Thread " << std::this_thread::get_id() 
+                      << ": ID mismatch! Expected " << policy_request_id << " or " << value_request_id
+                      << ", got " << result_id << std::endl;
+            // Вернемся в цикл, чтобы получить правильный результат
+            i--; 
         }
-        logits = result_tuple[2].cast<std::vector<float>>();
     }
 
     std::vector<float> strategy(num_actions);
@@ -235,36 +255,14 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
     }
 
-    if (is_root && current_player == traversing_player) {
+    if (is_root && is_traversing_players_turn) {
         add_dirichlet_noise(strategy, 0.3f, rng_);
     }
 
     std::discrete_distribution<int> dist(strategy.begin(), strategy.end());
     int sampled_action_idx = dist(rng_);
 
-    if (current_player == traversing_player) {
-        uint64_t value_request_id = traversal_id * 2 + 1;
-        {
-            py::gil_scoped_acquire acquire;
-            py::tuple request_tuple = py::make_tuple(
-                value_request_id, false, py::cast(infoset_vec), py::none()
-            );
-            request_queue_->attr("put")(request_tuple);
-        }
-
-        float value_baseline = 0.0f;
-        {
-            py::gil_scoped_acquire acquire;
-            py::object result_obj = result_queue_->attr("get")();
-            py::tuple result_tuple = result_obj.cast<py::tuple>();
-            if (result_tuple[0].cast<uint64_t>() == value_request_id) {
-                std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
-                if (!predictions.empty()) {
-                    value_baseline = predictions[0];
-                }
-            }
-        }
-
+    if (is_traversing_players_turn) {
         state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
         auto action_payoffs = traverse(state, traversing_player, false, traversal_id);
         state.undo_action(undo_info, traversing_player);
@@ -277,7 +275,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         }
         return action_payoffs;
 
-    } else {
+    } else { // Ход оппонента
         state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
         auto result = traverse(state, traversing_player, false, traversal_id);
         state.undo_action(undo_info, traversing_player);
