@@ -1,3 +1,5 @@
+// PAQN-main/cpp_src/DeepMCCFR.cpp
+
 #include "DeepMCCFR.hpp"
 #include "constants.hpp"
 #include <stdexcept>
@@ -14,6 +16,7 @@
 
 namespace ofc {
 
+// ... (функции action_to_vector и add_dirichlet_noise остаются без изменений) ...
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -52,6 +55,7 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
     }
 }
 
+
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
 
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
@@ -74,6 +78,7 @@ void DeepMCCFR::run_traversal() {
     traverse(state, 1, true, traversal_id);
 }
 
+// ... (featurize_state_cpp остается без изменений) ...
 std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int player_view) {
     std::vector<float> features(INFOSET_SIZE, 0.0f);
     
@@ -172,7 +177,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         if (it != suit_map.end()) {
             card = get_rank(card) * 4 + it->second;
         } else {
-            // This should not happen for valid cards in hand, but as a safeguard:
             card = INVALID_CARD; 
         }
     };
@@ -190,16 +194,13 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     uint64_t value_request_id = traversal_id * 2 + 1;
     bool is_traversing_players_turn = (current_player == traversing_player);
 
-    // --- ИЗМЕНЕНИЕ: Отправляем все запросы сразу ---
     {
         py::gil_scoped_acquire acquire;
-        // Policy запрос
         py::tuple policy_request_tuple = py::make_tuple(
             policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors)
         );
         request_queue_->attr("put")(policy_request_tuple);
 
-        // Value запрос (если нужен)
         if (is_traversing_players_turn) {
             py::tuple value_request_tuple = py::make_tuple(
                 value_request_id, false, py::cast(infoset_vec), py::none()
@@ -208,34 +209,55 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         }
     }
 
-    // --- ИЗМЕНЕНИЕ: Получаем результаты, обрабатывая их не по порядку ---
     std::vector<float> logits;
     float value_baseline = 0.0f;
     int results_to_get = is_traversing_players_turn ? 2 : 1;
+    int results_gotten = 0;
 
-    for (int i = 0; i < results_to_get; ++i) {
-        py::gil_scoped_acquire acquire;
-        py::object result_obj = result_queue_->attr("get")();
-        py::tuple result_tuple = result_obj.cast<py::tuple>();
-        uint64_t result_id = result_tuple[0].cast<uint64_t>();
-        
-        if (result_id == policy_request_id) {
-            logits = result_tuple[2].cast<std::vector<float>>();
-        } else if (result_id == value_request_id) {
-            std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
-            if (!predictions.empty()) {
-                value_baseline = predictions[0];
+    // --- ИЗМЕНЕНИЕ: Неблокирующий цикл получения результатов ---
+    while(results_gotten < results_to_get) {
+        py::object result_obj;
+        {
+            py::gil_scoped_acquire acquire;
+            // Используем неблокирующий get с таймаутом
+            try {
+                result_obj = result_queue_->attr("get")(/* blocking */ py::bool_(true), /* timeout */ py::float_(0.001)); // 1ms timeout
+            } catch (const py::error_already_set& e) {
+                if (e.matches(PyExc_Empty)) {
+                    // Очередь пуста, это нормально. Отпускаем GIL и ждем.
+                    result_obj = py::none();
+                } else {
+                    // Другая ошибка, пробрасываем ее
+                    throw;
+                }
+            }
+        } // GIL отпускается здесь
+
+        if (!result_obj.is_none()) {
+            py::tuple result_tuple = result_obj.cast<py::tuple>();
+            uint64_t result_id = result_tuple[0].cast<uint64_t>();
+            
+            if (result_id == policy_request_id) {
+                logits = result_tuple[2].cast<std::vector<float>>();
+                results_gotten++;
+            } else if (result_id == value_request_id) {
+                std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
+                if (!predictions.empty()) {
+                    value_baseline = predictions[0];
+                }
+                results_gotten++;
+            } else {
+                // Это может произойти, если другой поток забрал наш результат.
+                // Просто вернем его в очередь.
+                py::gil_scoped_acquire acquire;
+                result_queue_->attr("put")(result_obj);
             }
         } else {
-            // Это может случиться, если get() таймаутится и другой поток подхватывает.
-            // В нашем случае get() блокирующий, так что это ошибка.
-            std::cerr << "C++ Thread " << std::this_thread::get_id() 
-                      << ": ID mismatch! Expected " << policy_request_id << " or " << value_request_id
-                      << ", got " << result_id << std::endl;
-            // Вернемся в цикл, чтобы получить правильный результат
-            i--; 
+            // Если очередь была пуста, немного поспим, чтобы не грузить CPU
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     }
+    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     std::vector<float> strategy(num_actions);
     if (!logits.empty() && logits.size() == num_actions) {
