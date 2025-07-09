@@ -16,7 +16,6 @@ namespace ofc {
 
 class DeepMCCFR {
 public:
-    // --- ИЗМЕНЕНИЕ: Вернули action_limit ---
     DeepMCCFR(size_t action_limit,
               SharedReplayBuffer* policy_buffer, 
               SharedReplayBuffer* value_buffer, 
@@ -33,7 +32,6 @@ private:
     InferenceRequestQueue* request_queue_;
     InferenceResultQueue* result_queue_;
 
-    // --- ИЗМЕНЕНИЕ: Вернули action_limit_ ---
     size_t action_limit_;
     std::mt19937 rng_;
     std::vector<float> dummy_action_vec_;
@@ -41,7 +39,7 @@ private:
     static std::atomic<uint64_t> traversal_counter_;
 
     std::map<int, float> traverse(GameState& state, int traversing_player, bool is_root, uint64_t traversal_id);
-    std::vector<int> serialize_state(const GameState& state, int player_view);
+    std::vector<float> featurize_state_cpp(const GameState& state, int player_view);
 };
 
 }
