@@ -1,14 +1,18 @@
 #pragma once
 
+// --- ИСПРАВЛЕНИЕ: Добавляем базовые заголовки ДО pybind11 ---
+#include <cstddef>
 #include <vector>
 #include <string>
 #include <random>
 #include <algorithm>
 #include <iostream>
 #include <mutex>
-#include "constants.hpp"
 #include <chrono>
 #include <thread>
+// --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+#include "constants.hpp"
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
