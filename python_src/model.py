@@ -2,7 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cpp_src.constants import NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS, ACTION_VECTOR_SIZE
+# --- ИЗМЕНЕНИЕ: Убираем неработающий импорт и определяем константы здесь ---
+NUM_FEATURE_CHANNELS = 16
+NUM_SUITS = 4
+NUM_RANKS = 13
+ACTION_VECTOR_SIZE = 208
 
 class OFC_CNN_Network(nn.Module):
     def __init__(self, hidden_size=512):
@@ -33,6 +37,7 @@ class OFC_CNN_Network(nn.Module):
             nn.Linear(hidden_size // 2, 1)
         )
         
+        # Входной размер для Policy Head учитывает вектор состояния, вектор действия и вектор улицы
         policy_input_size = hidden_size + ACTION_VECTOR_SIZE + 5 
         
         self.policy_head = nn.Sequential(
@@ -48,6 +53,7 @@ class OFC_CNN_Network(nn.Module):
         flat_out = conv_out.view(conv_out.size(0), -1)
         body_out = self.body_fc(flat_out)
         
+        # Value head оценивает только состояние
         if action_vec is None:
             value = self.value_head(body_out)
             return value
