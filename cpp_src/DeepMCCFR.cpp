@@ -214,36 +214,27 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         bool got_item = false;
         {
             py::gil_scoped_acquire acquire;
-            auto queue_module = py::module_::import("queue");
-            auto PyExc_Empty = queue_module.attr("Empty");
-            
-            try {
-                py::object result_obj = result_queue_->attr("get_nowait")();
-                
-                // Если мы здесь, значит, получили объект. Обработаем его внутри GIL.
+            // Проверяем и извлекаем результат для policy_request_id
+            if (result_queue_->contains(policy_request_id)) {
+                py::tuple result_tuple = (*result_queue_)[policy_request_id].cast<py::tuple>();
+                logits = result_tuple[2].cast<std::vector<float>>();
+                py::delitem(*result_queue_, py::cast(policy_request_id));
+                results_gotten++;
                 got_item = true;
-                py::tuple result_tuple = result_obj.cast<py::tuple>();
-                uint64_t result_id = result_tuple[0].cast<uint64_t>();
-                
-                if (result_id == policy_request_id) {
-                    logits = result_tuple[2].cast<std::vector<float>>();
-                    results_gotten++;
-                } else if (result_id == value_request_id) {
+            }
+
+            // Проверяем и извлекаем результат для value_request_id, если он нужен
+            if (is_traversing_players_turn && results_gotten < results_to_get && result_queue_->contains(value_request_id)) {
+                py::tuple result_tuple = (*result_queue_)[value_request_id].cast<py::tuple>();
+                if (!result_tuple[2].is_none()) {
                     std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
                     if (!predictions.empty()) {
                         value_baseline = predictions[0];
                     }
-                    results_gotten++;
-                } else {
-                    // Не наш результат, вернем в очередь
-                    result_queue_->attr("put")(result_obj);
                 }
-            } catch (const py::error_already_set& e) {
-                if (!e.matches(PyExc_Empty)) {
-                    // Другая ошибка, пробрасываем ее
-                    throw;
-                }
-                // Если очередь пуста (e.matches(PyExc_Empty)), ничего не делаем, got_item останется false
+                py::delitem(*result_queue_, py::cast(value_request_id));
+                results_gotten++;
+                got_item = true;
             }
         } // GIL отпускается здесь
 
