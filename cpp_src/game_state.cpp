@@ -15,7 +15,6 @@ namespace ofc {
         dealt_cards_.reserve(5);
         my_discards_.resize(num_players);
         for(auto& v : my_discards_) v.reserve(4);
-        // --- ИЗМЕНЕНИЕ: Удалена инициализация opponent_discard_counts_ ---
         boards_.resize(num_players);
         reset(dealer_pos);
     }
@@ -46,7 +45,6 @@ namespace ofc {
         for (auto& discards : my_discards_) {
             discards.clear();
         }
-        // --- ИЗМЕНЕНИЕ: Удален сброс opponent_discard_counts_ ---
         deal_cards();
     }
 
@@ -183,8 +181,9 @@ namespace ofc {
             CardSet cards_to_place = dealt_cards_;
             generate_random_placements(cards_to_place, INVALID_CARD, out_actions, action_limit, rng);
             
-            std::set<Action> unique_actions(out_actions.begin(), out_actions.end());
-            out_actions.assign(unique_actions.begin(), unique_actions.end());
+            // --- ИЗМЕНЕНИЕ: Замена std::set на std::sort + std::unique ---
+            std::sort(out_actions.begin(), out_actions.end());
+            out_actions.erase(std::unique(out_actions.begin(), out_actions.end()), out_actions.end());
 
             if (action_limit > 0 && out_actions.size() > action_limit) {
                 std::shuffle(out_actions.begin(), out_actions.end(), rng);
@@ -211,7 +210,6 @@ namespace ofc {
             else if (row == "bottom") boards_[current_player_].bottom[idx] = card;
         }
 
-        // --- ИЗМЕНЕНИЕ: Упрощенная и корректная логика сброса ---
         if (discarded_card != INVALID_CARD) {
             my_discards_[current_player_].push_back(discarded_card);
         }
@@ -245,7 +243,6 @@ namespace ofc {
             else if (row == "bottom") boards_[player_who_acted].bottom[idx] = INVALID_CARD;
         }
 
-        // --- ИЗМЕНЕНИЕ: Упрощенная и корректная логика отмены сброса ---
         if (discarded_card != INVALID_CARD) {
             my_discards_[player_who_acted].pop_back();
         }
