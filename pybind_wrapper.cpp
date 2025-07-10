@@ -2,7 +2,6 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/functional.h>
-#include <pybind11/iostream.h> // <-- ДОБАВЛЕН ЭТОТ ЗАГОЛОВОК
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -24,12 +23,13 @@ public:
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
-        py::object result_queue
-    ) : request_queue_(request_queue), result_queue_(result_queue) {
+        py::object result_queue,
+        py::object log_queue
+    ) : request_queue_(request_queue), result_queue_(result_queue), log_queue_(log_queue) {
         stop_flag_.store(false);
         for (size_t i = 0; i < num_workers; ++i) {
             auto solver = std::make_unique<ofc::DeepMCCFR>(
-                action_limit, policy_buffer, value_buffer, &request_queue_, &result_queue_
+                action_limit, policy_buffer, value_buffer, &request_queue_, &result_queue_, &log_queue_
             );
             threads_.emplace_back(&SolverManagerImpl::worker_loop, this, std::move(solver));
         }
@@ -51,7 +51,6 @@ public:
 
 private:
     void worker_loop(std::unique_ptr<ofc::DeepMCCFR> solver) {
-        // GIL здесь не нужен, так как DeepMCCFR управляет им внутри себя
         while (!stop_flag_.load()) {
             solver->run_traversal();
         }
@@ -61,6 +60,7 @@ private:
     std::atomic<bool> stop_flag_;
     py::object request_queue_;
     py::object result_queue_;
+    py::object log_queue_;
 };
 
 class PySolverManager {
@@ -71,26 +71,23 @@ public:
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
-        py::object result_obj
+        py::object result_obj,
+        py::object log_queue
     ) {
-        // НЕ освобождаем GIL здесь. Конструктор должен выполняться с GIL.
         impl_ = std::make_unique<SolverManagerImpl>(
             num_workers, action_limit, policy_buffer, value_buffer,
-            request_queue, result_obj
+            request_queue, result_obj, log_queue
         );
     }
 
     ~PySolverManager() {
-        // GIL нужен для безопасного вызова stop() и уничтожения impl_
         py::gil_scoped_acquire acquire;
         if (impl_) {
-            // stop() внутри себя освободит GIL для join()
             impl_->stop();
         }
     }
 
     void stop() {
-        // Освобождаем GIL для длительной операции join() внутри stop()
         py::gil_scoped_release release;
         if (impl_) {
             impl_->stop();
@@ -104,10 +101,6 @@ private:
 
 PYBIND11_MODULE(ofc_engine, m) {
     m.doc() = "OFC Engine with C++ Thread Manager and Queue-based Inference";
-
-    // --- ИЗМЕНЕНИЕ: Эта строка перенаправляет std::cout из C++ в stdout Python ---
-    py::add_ostream_redirect(m, "ostream_redirect");
-    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     m.def("initialize_evaluator", []() {
         omp::HandEvaluator::initialize();
@@ -137,10 +130,11 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
     py::class_<PySolverManager>(m, "SolverManager")
-        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(),
+        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object, py::object>(),
              py::arg("num_workers"),
              py::arg("action_limit"),
              py::arg("policy_buffer"), py::arg("value_buffer"),
-             py::arg("request_queue"), py::arg("result_queue"))
+             py::arg("request_queue"), py::arg("result_queue"),
+             py::arg("log_queue"))
         .def("stop", &PySolverManager::stop);
 }
