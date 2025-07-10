@@ -25,18 +25,32 @@ public:
         py::object request_queue,
         py::object result_queue,
         py::object log_queue
-    ) : request_queue_(request_queue), result_queue_(result_queue), log_queue_(log_queue) {
-        stop_flag_.store(false);
-        for (size_t i = 0; i < num_workers; ++i) {
-            auto solver = std::make_unique<ofc::DeepMCCFR>(
-                action_limit, policy_buffer, value_buffer, &request_queue_, &result_queue_, &log_queue_
-            );
-            threads_.emplace_back(&SolverManagerImpl::worker_loop, this, std::move(solver));
-        }
+    ) : num_workers_(num_workers),
+        action_limit_(action_limit),
+        policy_buffer_(policy_buffer),
+        value_buffer_(value_buffer),
+        request_queue_(request_queue), 
+        result_queue_(result_queue), 
+        log_queue_(log_queue) 
+    {
+        stop_flag_.store(true); // Изначально остановлен
     }
 
     ~SolverManagerImpl() {
         stop();
+    }
+
+    void start() {
+        if (!stop_flag_.exchange(false)) {
+            // Уже был запущен
+            return;
+        }
+        for (size_t i = 0; i < num_workers_; ++i) {
+            auto solver = std::make_unique<ofc::DeepMCCFR>(
+                action_limit_, policy_buffer_, value_buffer_, &request_queue_, &result_queue_, &log_queue_
+            );
+            threads_.emplace_back(&SolverManagerImpl::worker_loop, this, std::move(solver));
+        }
     }
 
     void stop() {
@@ -46,6 +60,7 @@ public:
                     t.join();
                 }
             }
+            threads_.clear();
         }
     }
 
@@ -55,6 +70,11 @@ private:
             solver->run_traversal();
         }
     }
+
+    size_t num_workers_;
+    size_t action_limit_;
+    ofc::SharedReplayBuffer* policy_buffer_;
+    ofc::SharedReplayBuffer* value_buffer_;
 
     std::vector<std::thread> threads_;
     std::atomic<bool> stop_flag_;
@@ -74,6 +94,7 @@ public:
         py::object result_obj,
         py::object log_queue
     ) {
+        // Конструктор теперь просто сохраняет аргументы, GIL удерживается
         impl_ = std::make_unique<SolverManagerImpl>(
             num_workers, action_limit, policy_buffer, value_buffer,
             request_queue, result_obj, log_queue
@@ -84,6 +105,14 @@ public:
         py::gil_scoped_acquire acquire;
         if (impl_) {
             impl_->stop();
+        }
+    }
+
+    void start() {
+        // А вот start мы вызываем, отпустив GIL
+        py::gil_scoped_release release;
+        if (impl_) {
+            impl_->start();
         }
     }
 
@@ -135,9 +164,8 @@ PYBIND11_MODULE(ofc_engine, m) {
              py::arg("action_limit"),
              py::arg("policy_buffer"), py::arg("value_buffer"),
              py::arg("request_queue"), py::arg("result_queue"),
-             py::arg("log_queue"),
-             // --- ИЗМЕНЕНИЕ: Освобождаем GIL на время выполнения конструктора ---
-             py::call_guard<py::gil_scoped_release>()
+             py::arg("log_queue")
         )
+        .def("start", &PySolverManager::start)
         .def("stop", &PySolverManager::stop);
 }
