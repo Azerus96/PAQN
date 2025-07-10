@@ -135,6 +135,9 @@ PYBIND11_MODULE(ofc_engine, m) {
              py::arg("action_limit"),
              py::arg("policy_buffer"), py::arg("value_buffer"),
              py::arg("request_queue"), py::arg("result_queue"),
-             py::arg("log_queue"))
+             py::arg("log_queue"),
+             // --- ИЗМЕНЕНИЕ: Освобождаем GIL на время выполнения конструктора ---
+             py::call_guard<py::gil_scoped_release>()
+        )
         .def("stop", &PySolverManager::stop);
 }
