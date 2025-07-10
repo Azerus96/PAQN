@@ -55,25 +55,29 @@ MIN_BUFFER_FILL_SAMPLES = int(BUFFER_CAPACITY * MIN_BUFFER_FILL_RATIO)
 
 # --- Пути и интервалы ---
 STATS_INTERVAL_SECONDS = 15
-SAVE_INTERVAL_SECONDS = 60 # Увеличим интервал сохранения
+SAVE_INTERVAL_SECONDS = 60
 MODEL_DIR = "/content/models"
 MODEL_PATH = os.path.join(MODEL_DIR, "paqn_model_latest.pth")
 OPPONENT_POOL_DIR = os.path.join(MODEL_DIR, "opponent_pool")
 MAX_OPPONENTS_IN_POOL = 20
 
 class InferenceWorker(mp.Process):
-    def __init__(self, name, task_queue, result_queue, stop_event):
+    def __init__(self, name, task_queue, result_queue, log_queue, stop_event):
         super().__init__(name=name)
         self.task_queue = task_queue
         self.result_queue = result_queue
+        self.log_queue = log_queue
         self.stop_event = stop_event
         self.latest_model = None
         self.opponent_model = None
         self.device = None
         self.opponent_pool_files = []
 
+    def _log(self, message):
+        self.log_queue.put(message)
+
     def _initialize(self):
-        print(f"[{self.name}] Started.", flush=True)
+        self._log(f"[{self.name}] Started.")
         self.device = torch.device("cpu")
         torch.set_num_threads(1)
         os.environ['OMP_NUM_THREADS'] = '1'
@@ -98,7 +102,7 @@ class InferenceWorker(mp.Process):
             else:
                 self.opponent_model.load_state_dict(self.latest_model.state_dict())
         except Exception as e:
-            print(f"[{self.name}] Failed to load models: {e}", flush=True)
+            self._log(f"[{self.name}] Failed to load models: {e}")
 
     def run(self):
         self._initialize()
@@ -109,15 +113,12 @@ class InferenceWorker(mp.Process):
 
         while not self.stop_event.is_set():
             try:
-                # --- ИЗМЕНЕНИЕ: Упрощенная логика для отладки. Обрабатываем по одному запросу. ---
                 try:
-                    # Ждем задачу не более 1 секунды, чтобы можно было проверить stop_event
                     req_id, is_policy, infoset, action_vectors = self.task_queue.get(timeout=1)
                 except queue.Empty:
-                    continue # Если задач нет, просто проверяем stop_event и идем на новую итерацию
+                    continue
 
-                # --- ЛОГИРОВАНИЕ: Выводим информацию о полученной задаче ---
-                print(f"[{self.name}] Got request {req_id} (is_policy={is_policy})", flush=True)
+                self._log(f"[{self.name}] Got request {req_id} (is_policy={is_policy})")
                 
                 with torch.inference_mode():
                     infoset_tensor = torch.tensor([infoset], dtype=torch.float32, device=self.device)
@@ -130,7 +131,7 @@ class InferenceWorker(mp.Process):
                     if is_policy:
                         if not action_vectors:
                             self.result_queue[req_id] = (req_id, True, [])
-                            print(f"[{self.name}] Sent EMPTY policy result for {req_id}", flush=True)
+                            self._log(f"[{self.name}] Sent EMPTY policy result for {req_id}")
                             continue
 
                         num_actions = len(action_vectors)
@@ -142,23 +143,24 @@ class InferenceWorker(mp.Process):
                         predictions = policy_logits.cpu().numpy().flatten().tolist()
                         
                         self.result_queue[req_id] = (req_id, True, predictions)
-                        print(f"[{self.name}] Sent POLICY result for {req_id}", flush=True)
+                        self._log(f"[{self.name}] Sent POLICY result for {req_id}")
                     else: # is_value
                         value = model_to_use(infoset_tensor)
                         self.result_queue[req_id] = (req_id, False, [value.item()])
-                        print(f"[{self.name}] Sent VALUE result for {req_id}", flush=True)
+                        self._log(f"[{self.name}] Sent VALUE result for {req_id}")
 
             except (KeyboardInterrupt, SystemExit):
                 break
             except Exception:
-                print(f"---!!! EXCEPTION IN {self.name} !!!---", flush=True)
-                traceback.print_exc()
+                self._log(f"---!!! EXCEPTION IN {self.name} !!!---")
+                exc_info = traceback.format_exc()
+                for line in exc_info.split('\n'):
+                    self._log(line)
         
-        print(f"[{self.name}] Stopped.", flush=True)
+        self._log(f"[{self.name}] Stopped.")
 
 def update_opponent_pool(model_version):
     if not os.path.exists(MODEL_PATH): return
-    # --- ИСПРАВЛЕНИЕ: Используем torch.load для загрузки state_dict, а не всей модели ---
     state_dict_to_save = torch.load(MODEL_PATH)
     pool_files = sorted(glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth")), key=os.path.getmtime)
     while len(pool_files) >= MAX_OPPONENTS_IN_POOL:
@@ -192,20 +194,22 @@ def main():
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
     
-    request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 16) # Увеличим очередь
-    result_dict = mp.Manager().dict()
+    manager = mp.Manager()
+    request_queue = manager.Queue(maxsize=NUM_CPP_WORKERS * 16)
+    result_dict = manager.dict()
+    log_queue = manager.Queue()
     stop_event = mp.Event()
 
     inference_workers = []
     for i in range(NUM_INFERENCE_WORKERS):
-        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_dict, stop_event)
+        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_dict, log_queue, stop_event)
         worker.start()
         inference_workers.append(worker)
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
     solver_manager = SolverManager(
         NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
-        request_queue, result_dict
+        request_queue, result_dict, log_queue
     )
     print("C++ workers are running in the background.", flush=True)
     
@@ -220,10 +224,16 @@ def main():
 
     try:
         while True:
+            while not log_queue.empty():
+                try:
+                    print(log_queue.get_nowait(), flush=True)
+                except queue.Empty:
+                    break
+
             if value_buffer.size() < MIN_BUFFER_FILL_SAMPLES or policy_buffer.size() < MIN_BUFFER_FILL_SAMPLES:
-                print(f"Waiting for buffers to fill... Policy: {policy_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}, Value: {value_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}", end='\r')
+                print(f"Waiting for buffers to fill... Policy: {policy_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}, Value: {value_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}  ", end='\r', flush=True)
                 time.sleep(1)
-                last_stats_time = time.time() # Сбрасываем таймер статистики, пока ждем
+                last_stats_time = time.time()
                 continue
 
             model.train()
@@ -260,6 +270,12 @@ def main():
 
             now = time.time()
             if now - last_stats_time > STATS_INTERVAL_SECONDS:
+                while not log_queue.empty():
+                    try:
+                        print(log_queue.get_nowait(), flush=True)
+                    except queue.Empty:
+                        break
+                
                 total_generated = policy_buffer.total_generated()
                 avg_p_loss = np.mean(policy_losses) if policy_losses else float('nan')
                 avg_v_loss = np.mean(value_losses) if value_losses else float('nan')
