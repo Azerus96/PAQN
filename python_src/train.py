@@ -50,7 +50,6 @@ ACTION_LIMIT = 4
 LEARNING_RATE = 0.0005
 BUFFER_CAPACITY = 2_000_000
 BATCH_SIZE = 8192
-# --- ИЗМЕНЕНИЕ 1: Уменьшаем порог для быстрого старта ---
 MIN_BUFFER_FILL_RATIO = 0.001
 MIN_BUFFER_FILL_SAMPLES = int(BUFFER_CAPACITY * MIN_BUFFER_FILL_RATIO)
 
@@ -212,6 +211,8 @@ def main():
         NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
         request_queue, result_dict, log_queue
     )
+    # --- НОВАЯ СТРОКА: Запускаем потоки здесь ---
+    solver_manager.start()
     print("C++ workers are running in the background.", flush=True)
     
     policy_losses = deque(maxlen=100)
