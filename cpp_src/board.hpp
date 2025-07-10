@@ -1,6 +1,3 @@
-// D2CFR-main/cpp_src/board.hpp (ОРИГИНАЛЬНАЯ ВЕРСИЯ ИЗ ВАШЕГО АРХИВА)
-// Просто используйте тот файл, который был у вас до всех экспериментов.
-// Я привожу его здесь для полноты.
 #pragma once
 #include "card.hpp"
 #include "hand_evaluator.hpp"
@@ -13,6 +10,7 @@ namespace ofc {
 
     class Board {
     public:
+        // --- ИСПРАВЛЕНИЕ: Возвращаем std::array вместо поврежденных типов ---
         std::array<Card, 3> top;
         std::array<Card, 5> middle;
         std::array<Card, 5> bottom;
@@ -44,6 +42,7 @@ namespace ofc {
             return get_all_cards().size();
         }
 
+        // --- ОСТАЛЬНАЯ ЧАСТЬ ФАЙЛА ОСТАЕТСЯ БЕЗ ИЗМЕНЕНИЙ (как в вашем "оригинальном" файле) ---
         inline bool is_foul(const HandEvaluator& evaluator) const {
             if (get_card_count() != 13) return false;
             
