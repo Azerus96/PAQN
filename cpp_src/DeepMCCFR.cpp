@@ -15,7 +15,6 @@
 
 namespace ofc {
 
-// ... (action_to_vector, add_dirichlet_noise, featurize_state_cpp - без изменений) ...
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -200,7 +199,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     
     uint64_t policy_request_id = traversal_id * 2;
     uint64_t value_request_id = traversal_id * 2 + 1;
-    bool is_traversing_players_turn = (current_player == traversing_player);
 
     {
         log("Acquiring GIL to put requests...");
@@ -211,19 +209,18 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         request_queue_->attr("put")(policy_request_tuple);
         log("Put POLICY request " + std::to_string(policy_request_id));
 
-        if (is_traversing_players_turn) {
-            py::tuple value_request_tuple = py::make_tuple(
-                value_request_id, false, py::cast(infoset_vec), py::none()
-            );
-            request_queue_->attr("put")(value_request_tuple);
-            log("Put VALUE request " + std::to_string(value_request_id));
-        }
+        py::tuple value_request_tuple = py::make_tuple(
+            value_request_id, false, py::cast(infoset_vec), py::none()
+        );
+        request_queue_->attr("put")(value_request_tuple);
+        log("Put VALUE request " + std::to_string(value_request_id));
+        
         log("Releasing GIL after putting requests.");
     }
 
     std::vector<float> logits;
     float value_baseline = 0.0f;
-    int results_to_get = is_traversing_players_turn ? 2 : 1;
+    int results_to_get = 2;
     int results_gotten = 0;
 
     while(results_gotten < results_to_get) {
@@ -241,7 +238,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
                 got_item = true;
             }
 
-            if (is_traversing_players_turn && results_gotten < results_to_get) {
+            if (results_gotten < results_to_get) {
                 py::object value_key = py::cast(value_request_id);
                 if (result_queue_->contains(value_key)) {
                     log("FOUND value result for " + std::to_string(value_request_id));
@@ -287,32 +284,24 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
     }
 
-    if (is_root && is_traversing_players_turn) {
+    if (is_root) {
         add_dirichlet_noise(strategy, 0.3f, rng_);
     }
 
     std::discrete_distribution<int> dist(strategy.begin(), strategy.end());
     int sampled_action_idx = dist(rng_);
 
-    if (is_traversing_players_turn) {
-        state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
-        auto action_payoffs = traverse(state, traversing_player, false, traversal_id);
-        state.undo_action(undo_info, traversing_player);
+    state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
+    auto action_payoffs = traverse(state, traversing_player, false, traversal_id);
+    state.undo_action(undo_info, traversing_player);
 
-        auto it = action_payoffs.find(current_player);
-        if (it != action_payoffs.end()) {
-            float advantage = it->second - value_baseline;
-            policy_buffer_->push(infoset_vec, canonical_action_vectors[sampled_action_idx], advantage);
-            value_buffer_->push(infoset_vec, dummy_action_vec_, it->second);
-        }
-        return action_payoffs;
-
-    } else { 
-        state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
-        auto result = traverse(state, traversing_player, false, traversal_id);
-        state.undo_action(undo_info, traversing_player);
-        return result;
+    auto it = action_payoffs.find(current_player);
+    if (it != action_payoffs.end()) {
+        float advantage = it->second - value_baseline;
+        policy_buffer_->push(infoset_vec, canonical_action_vectors[sampled_action_idx], advantage);
+        value_buffer_->push(infoset_vec, dummy_action_vec_, it->second);
     }
+    return action_payoffs;
 }
 
 } // namespace ofc
