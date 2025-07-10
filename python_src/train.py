@@ -63,19 +63,16 @@ OPPONENT_POOL_DIR = os.path.join(MODEL_DIR, "opponent_pool")
 MAX_OPPONENTS_IN_POOL = 20
 
 class InferenceWorker(mp.Process):
-    # --- ИЗМЕНЕНИЕ 3: Принимаем state_dicts вместо пустых аргументов ---
-    def __init__(self, name, task_queue, result_queue, log_queue, stop_event, latest_state_dict, opponent_state_dicts):
+    def __init__(self, name, task_queue, result_queue, log_queue, stop_event):
         super().__init__(name=name)
         self.task_queue = task_queue
         self.result_queue = result_queue
         self.log_queue = log_queue
         self.stop_event = stop_event
-        # --- ИЗМЕНЕНИЕ 3: Сохраняем state_dicts ---
-        self.latest_state_dict = latest_state_dict
-        self.opponent_state_dicts = opponent_state_dicts
         self.latest_model = None
         self.opponent_model = None
         self.device = None
+        self.opponent_pool_files = []
 
     def _log(self, message):
         self.log_queue.put(message)
@@ -89,26 +86,24 @@ class InferenceWorker(mp.Process):
         self.latest_model = OFC_CNN_Network().to(self.device)
         self.opponent_model = OFC_CNN_Network().to(self.device)
         
-        # --- ИЗМЕНЕНИЕ 3: Загружаем модели из переданных state_dicts ---
-        self._load_models_from_state_dicts()
+        self._load_models()
         
         self.latest_model.eval()
         self.opponent_model.eval()
 
-    def _load_models_from_state_dicts(self):
+    def _load_models(self):
         try:
-            if self.latest_state_dict:
-                self.latest_model.load_state_dict(self.latest_state_dict)
+            if os.path.exists(MODEL_PATH):
+                self.latest_model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
             
-            if self.opponent_state_dicts:
-                # Выбираем случайную модель оппонента из пула
-                opponent_state_dict = random.choice(self.opponent_state_dicts)
-                self.opponent_model.load_state_dict(opponent_state_dict)
-            elif self.latest_state_dict:
-                # Если пул оппонентов пуст, используем последнюю модель
-                self.opponent_model.load_state_dict(self.latest_state_dict)
+            self.opponent_pool_files = glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth"))
+            if self.opponent_pool_files:
+                opponent_path = random.choice(self.opponent_pool_files)
+                self.opponent_model.load_state_dict(torch.load(opponent_path, map_location=self.device))
+            else:
+                self.opponent_model.load_state_dict(self.latest_model.state_dict())
         except Exception as e:
-            self._log(f"[{self.name}] Failed to load models from state_dicts: {e}")
+            self._log(f"[{self.name}] Failed to load models: {e}")
 
     def run(self):
         self._initialize()
@@ -206,29 +201,11 @@ def main():
     log_queue = manager.Queue()
     stop_event = mp.Event()
 
-    # --- ИЗМЕНЕНИЕ 3: Загружаем модели один раз здесь ---
-    latest_state_dict = model.state_dict() if os.path.exists(MODEL_PATH) else None
-    opponent_state_dicts = []
-    opponent_pool_files = glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth"))
-    if opponent_pool_files:
-        for p in opponent_pool_files:
-            try:
-                opponent_state_dicts.append(torch.load(p, map_location=device))
-            except Exception as e:
-                print(f"Warning: could not load opponent model {p}: {e}", flush=True)
-    
     inference_workers = []
     for i in range(NUM_INFERENCE_WORKERS):
-        # --- ИЗМЕНЕНИЕ 3: Передаем state_dicts в воркеры ---
-        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_dict, log_queue, stop_event, latest_state_dict, opponent_state_dicts)
+        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_dict, log_queue, stop_event)
         worker.start()
         inference_workers.append(worker)
-
-    # --- ИЗМЕНЕНИЕ 2: Добавляем лог и паузу для инициализации воркеров ---
-    print("Waiting for inference workers to initialize...", flush=True)
-    time.sleep(10) # Даем им 10 секунд на запуск
-    print("Inference workers should be ready.", flush=True)
-    # --- КОНЕЦ ИЗМЕНЕНИЯ 2 ---
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
     solver_manager = SolverManager(
@@ -255,7 +232,8 @@ def main():
                     break
 
             if value_buffer.size() < MIN_BUFFER_FILL_SAMPLES or policy_buffer.size() < MIN_BUFFER_FILL_SAMPLES:
-                print(f"Waiting for buffers to fill... Policy: {policy_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}, Value: {value_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}  ", end='\r', flush=True)
+                # --- ИЗМЕНЕНИЕ 2: Добавляем total_generated для диагностики ---
+                print(f"Waiting... Policy: {policy_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES} | Value: {value_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES} | Total Gen: {policy_buffer.total_generated()} ", end='\r', flush=True)
                 time.sleep(1)
                 last_stats_time = time.time()
                 continue
