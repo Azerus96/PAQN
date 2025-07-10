@@ -1,5 +1,3 @@
---- START OF FILE PAQN-main/cpp_src/DeepMCCFR.cpp ---
-
 #include "DeepMCCFR.hpp"
 #include "constants.hpp"
 #include <stdexcept>
