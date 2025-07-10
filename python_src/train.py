@@ -1,5 +1,3 @@
---- START OF FILE PAQN-main/python_src/train.py ---
-
 import os
 import sys
 import time
@@ -54,8 +52,6 @@ BUFFER_CAPACITY = 2_000_000
 BATCH_SIZE = 8192
 MIN_BUFFER_FILL_RATIO = 0.05
 MIN_BUFFER_FILL_SAMPLES = int(BUFFER_CAPACITY * MIN_BUFFER_FILL_RATIO)
-MAX_BATCH_SIZE = 2048
-BATCH_TIMEOUT_MS = 2.0
 
 # --- Пути и интервалы ---
 STATS_INTERVAL_SECONDS = 15
@@ -113,96 +109,44 @@ class InferenceWorker(mp.Process):
 
         while not self.stop_event.is_set():
             try:
-                # --- ЛОГИРОВАНИЕ: Упрощаем получение задач для отладки ---
-                # Используем блокирующий get(), чтобы не усложнять логику таймаутами
+                # --- ИЗМЕНЕНИЕ: Упрощенная логика для отладки. Обрабатываем по одному запросу. ---
                 try:
                     # Ждем задачу не более 1 секунды, чтобы можно было проверить stop_event
-                    item = self.task_queue.get(timeout=1)
-                    batch = [item]
+                    req_id, is_policy, infoset, action_vectors = self.task_queue.get(timeout=1)
                 except queue.Empty:
                     continue # Если задач нет, просто проверяем stop_event и идем на новую итерацию
 
                 # --- ЛОГИРОВАНИЕ: Выводим информацию о полученной задаче ---
-                req_id, is_policy, _, _ = batch[0]
                 print(f"[{self.name}] Got request {req_id} (is_policy={is_policy})", flush=True)
                 
-                policy_requests = {}
-                value_requests = {}
-                for req in batch:
-                    req_id, is_policy, infoset, action_vectors = req
-                    if is_policy:
-                        policy_requests[req_id] = (infoset, action_vectors)
-                    else:
-                        value_requests[req_id] = infoset
-
                 with torch.inference_mode():
-                    if value_requests:
-                        infosets = list(value_requests.values())
-                        infoset_tensor = torch.tensor(infosets, dtype=torch.float32, device=self.device)
-                        infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
+                    infoset_tensor = torch.tensor([infoset], dtype=torch.float32, device=self.device)
+                    infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
+                    
+                    turn_channel_val = infoset[TURN_CHANNEL_IDX * NUM_SUITS * NUM_RANKS]
+                    is_player_turn = turn_channel_val > 0.5
+                    model_to_use = self.latest_model if is_player_turn else self.opponent_model
+
+                    if is_policy:
+                        if not action_vectors:
+                            self.result_queue[req_id] = (req_id, True, [])
+                            print(f"[{self.name}] Sent EMPTY policy result for {req_id}", flush=True)
+                            continue
+
+                        num_actions = len(action_vectors)
+                        infoset_batch = infoset_tensor.repeat(num_actions, 1, 1, 1)
+                        actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
+                        street_vector = infoset_batch[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
                         
-                        turn_channel = infoset_tensor[:, TURN_CHANNEL_IDX, 0, 0]
-                        is_player_turn = turn_channel > 0.5
+                        policy_logits, _ = model_to_use(infoset_batch, actions_tensor, street_vector)
+                        predictions = policy_logits.cpu().numpy().flatten().tolist()
                         
-                        values = torch.zeros(len(infosets), 1, device=self.device)
-                        if torch.any(is_player_turn):
-                            values[is_player_turn] = self.latest_model(infoset_tensor[is_player_turn])
-                        if torch.any(~is_player_turn):
-                            values[~is_player_turn] = self.opponent_model(infoset_tensor[~is_player_turn])
-
-                        for i, req_id in enumerate(value_requests.keys()):
-                            self.result_queue[req_id] = (req_id, False, [values[i].item()])
-                            # --- ЛОГИРОВАНИЕ: Выводим информацию об отправке результата ---
-                            print(f"[{self.name}] Sent VALUE result for {req_id}", flush=True)
-
-                    if policy_requests:
-                        latest_model_reqs = {}
-                        opponent_model_reqs = {}
-                        
-                        for req_id, (infoset, action_vectors) in policy_requests.items():
-                            if not action_vectors:
-                                self.result_queue[req_id] = (req_id, True, [])
-                                print(f"[{self.name}] Sent EMPTY policy result for {req_id}", flush=True)
-                                continue
-                            
-                            turn_channel_val = infoset[TURN_CHANNEL_IDX * NUM_SUITS * NUM_RANKS]
-                            if turn_channel_val > 0.5:
-                                latest_model_reqs[req_id] = (infoset, action_vectors)
-                            else:
-                                opponent_model_reqs[req_id] = (infoset, action_vectors)
-
-                        for model, reqs in [(self.latest_model, latest_model_reqs), (self.opponent_model, opponent_model_reqs)]:
-                            if not reqs:
-                                continue
-
-                            all_infosets = []
-                            all_actions = []
-                            action_counts = []
-                            req_ids_ordered = []
-
-                            for req_id, (infoset, action_vectors) in reqs.items():
-                                num_actions = len(action_vectors)
-                                action_counts.append(num_actions)
-                                req_ids_ordered.append(req_id)
-                                all_infosets.extend([infoset] * num_actions)
-                                all_actions.extend(action_vectors)
-
-                            infoset_tensor = torch.tensor(all_infosets, dtype=torch.float32, device=self.device)
-                            infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
-                            actions_tensor = torch.tensor(all_actions, dtype=torch.float32, device=self.device)
-                            street_vector = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
-                            
-                            policy_logits, _ = model(infoset_tensor, actions_tensor, street_vector)
-                            
-                            predictions = policy_logits.cpu().numpy().flatten()
-                            current_pos = 0
-                            for i, req_id in enumerate(req_ids_ordered):
-                                count = action_counts[i]
-                                result_slice = predictions[current_pos : current_pos + count].tolist()
-                                self.result_queue[req_id] = (req_id, True, result_slice)
-                                # --- ЛОГИРОВАНИЕ: Выводим информацию об отправке результата ---
-                                print(f"[{self.name}] Sent POLICY result for {req_id}", flush=True)
-                                current_pos += count
+                        self.result_queue[req_id] = (req_id, True, predictions)
+                        print(f"[{self.name}] Sent POLICY result for {req_id}", flush=True)
+                    else: # is_value
+                        value = model_to_use(infoset_tensor)
+                        self.result_queue[req_id] = (req_id, False, [value.item()])
+                        print(f"[{self.name}] Sent VALUE result for {req_id}", flush=True)
 
             except (KeyboardInterrupt, SystemExit):
                 break
@@ -212,14 +156,15 @@ class InferenceWorker(mp.Process):
         
         print(f"[{self.name}] Stopped.", flush=True)
 
-# ... (остальная часть файла main() остается без изменений) ...
 def update_opponent_pool(model_version):
     if not os.path.exists(MODEL_PATH): return
+    # --- ИСПРАВЛЕНИЕ: Используем torch.load для загрузки state_dict, а не всей модели ---
+    state_dict_to_save = torch.load(MODEL_PATH)
     pool_files = sorted(glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth")), key=os.path.getmtime)
     while len(pool_files) >= MAX_OPPONENTS_IN_POOL:
         os.remove(pool_files.pop(0))
     new_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"paqn_model_v{model_version}.pth")
-    torch.save(torch.load(MODEL_PATH), new_opponent_path)
+    torch.save(state_dict_to_save, new_opponent_path)
     print(f"Added model version {model_version} to opponent pool.")
 
 def main():
@@ -247,7 +192,7 @@ def main():
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
     
-    request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 8) # Можно увеличить
+    request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 16) # Увеличим очередь
     result_dict = mp.Manager().dict()
     stop_event = mp.Event()
 
