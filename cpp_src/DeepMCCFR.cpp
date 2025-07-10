@@ -265,7 +265,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         } 
 
         if (!got_item) {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 
