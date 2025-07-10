@@ -1,13 +1,11 @@
 #pragma once
 
-// --- ИСПРАВЛЕНИЕ: Добавляем базовые заголовки ДО pybind11 ---
-#include <cstddef> // Определяет std::size_t
+#include <cstddef>
 #include <vector>
 #include <map>
 #include <memory>
 #include <random>
 #include <atomic>
-// --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
 #include <pybind11/pybind11.h>
 #include "game_state.hpp"
@@ -15,10 +13,11 @@
 #include "SharedReplayBuffer.hpp"
 #include "InferenceQueue.hpp"
 
-
 namespace py = pybind11;
 
 namespace ofc {
+
+using LogQueue = py::object;
 
 class DeepMCCFR {
 public:
@@ -26,7 +25,8 @@ public:
               SharedReplayBuffer* policy_buffer, 
               SharedReplayBuffer* value_buffer, 
               InferenceRequestQueue* request_queue,
-              InferenceResultQueue* result_queue);
+              InferenceResultQueue* result_queue,
+              LogQueue* log_queue);
     
     void run_traversal();
 
@@ -37,6 +37,7 @@ private:
     
     InferenceRequestQueue* request_queue_;
     InferenceResultQueue* result_queue_;
+    LogQueue* log_queue_;
 
     size_t action_limit_;
     std::mt19937 rng_;
