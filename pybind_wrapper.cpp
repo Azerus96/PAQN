@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/functional.h>
+#include <pybind11/iostream.h> // <-- ДОБАВЛЕН ЭТОТ ЗАГОЛОВОК
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -103,6 +104,10 @@ private:
 
 PYBIND11_MODULE(ofc_engine, m) {
     m.doc() = "OFC Engine with C++ Thread Manager and Queue-based Inference";
+
+    // --- ИЗМЕНЕНИЕ: Эта строка перенаправляет std::cout из C++ в stdout Python ---
+    py::add_ostream_redirect(m, "ostream_redirect");
+    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     m.def("initialize_evaluator", []() {
         omp::HandEvaluator::initialize();
