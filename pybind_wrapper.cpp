@@ -7,6 +7,9 @@
 #include <vector>
 #include <memory>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <condition_variable>
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
 #include "cpp_src/constants.hpp"
@@ -15,28 +18,49 @@
 
 namespace py = pybind11;
 
-class SolverManagerImpl {
+// --- НОВЫЙ КЛАСС: Потокобезопасный C++ мост для результатов ---
+class ResultBridge {
 public:
-    SolverManagerImpl(
+    void add_result(uint64_t id, py::tuple result) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        results_[id] = result;
+        cv_.notify_all();
+    }
+
+    py::tuple get_result(uint64_t id) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [this, id] { return results_.count(id); });
+        py::tuple result = results_[id];
+        results_.erase(id);
+        return result;
+    }
+
+private:
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::map<uint64_t, py::tuple> results_;
+};
+
+class SolverManager {
+public:
+    SolverManager(
         size_t num_workers,
         size_t action_limit,
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
-        py::object request_queue,
-        py::list result_queues,
+        py::object request_queue, // Это Python mp.Queue
         py::object log_queue
     ) : num_workers_(num_workers),
         action_limit_(action_limit),
         policy_buffer_(policy_buffer),
         value_buffer_(value_buffer),
-        request_queue_(request_queue), 
-        result_queues_(result_queues), 
-        log_queue_(log_queue) 
+        request_queue_(request_queue),
+        log_queue_(log_queue)
     {
         stop_flag_.store(true);
     }
 
-    ~SolverManagerImpl() {
+    ~SolverManager() {
         stop();
     }
 
@@ -44,13 +68,26 @@ public:
         if (!stop_flag_.exchange(false)) {
             return;
         }
+
+        // --- НОВАЯ ЛОГИКА: Создаем C++ мост для результатов ---
+        result_bridge_ = std::make_shared<ResultBridge>();
+
         for (size_t i = 0; i < num_workers_; ++i) {
-            py::object personal_queue = result_queues_[i];
+            // --- НОВАЯ ЛОГИКА: Создаем коллбэки для каждого потока ---
+            auto request_cb = [this](uint64_t id, bool is_policy, const std::vector<float>& infoset, const std::vector<std::vector<float>>& actions) {
+                py::gil_scoped_acquire acquire;
+                py::tuple request_tuple = py::make_tuple(id, is_policy, py::cast(infoset), py::cast(actions));
+                this->request_queue_.attr("put")(request_tuple);
+            };
+
+            auto result_cb = [this](uint64_t id) -> py::tuple {
+                return this->result_bridge_->get_result(id);
+            };
+
             auto solver = std::make_unique<ofc::DeepMCCFR>(
-                action_limit_, policy_buffer_, value_buffer_, &request_queue_, 
-                &personal_queue, i, &log_queue_
+                action_limit_, policy_buffer_, value_buffer_, request_cb, result_cb
             );
-            threads_.emplace_back(&SolverManagerImpl::worker_loop, this, std::move(solver));
+            threads_.emplace_back(&SolverManager::worker_loop, this, std::move(solver));
         }
     }
 
@@ -65,10 +102,15 @@ public:
         }
     }
 
+    // --- НОВЫЙ МЕТОД: Python будет вызывать его для передачи результатов ---
+    void add_result(uint64_t id, py::tuple result) {
+        if (result_bridge_) {
+            result_bridge_->add_result(id, result);
+        }
+    }
+
 private:
     void worker_loop(std::unique_ptr<ofc::DeepMCCFR> solver) {
-        // --- ИЗМЕНЕНИЕ: Убран gil_scoped_acquire отсюда ---
-        // Теперь он находится внутри run_traversal
         while (!stop_flag_.load()) {
             solver->run_traversal();
         }
@@ -81,55 +123,15 @@ private:
 
     std::vector<std::thread> threads_;
     std::atomic<bool> stop_flag_;
+    
     py::object request_queue_;
-    py::list result_queues_;
     py::object log_queue_;
-};
-
-class PySolverManager {
-public:
-    PySolverManager(
-        size_t num_workers,
-        size_t action_limit,
-        ofc::SharedReplayBuffer* policy_buffer, 
-        ofc::SharedReplayBuffer* value_buffer,
-        py::object request_queue,
-        py::list result_queues,
-        py::object log_queue
-    ) {
-        impl_ = std::make_unique<SolverManagerImpl>(
-            num_workers, action_limit, policy_buffer, value_buffer,
-            request_queue, result_queues, log_queue
-        );
-    }
-
-    ~PySolverManager() {
-        py::gil_scoped_acquire acquire;
-        if (impl_) {
-            impl_->stop();
-        }
-    }
-
-    void start() {
-        if (impl_) {
-            impl_->start();
-        }
-    }
-
-    void stop() {
-        py::gil_scoped_release release;
-        if (impl_) {
-            impl_->stop();
-        }
-    }
-
-private:
-    std::unique_ptr<SolverManagerImpl> impl_;
+    std::shared_ptr<ResultBridge> result_bridge_;
 };
 
 
 PYBIND11_MODULE(ofc_engine, m) {
-    m.doc() = "OFC Engine with C++ Thread Manager and Queue-based Inference";
+    m.doc() = "OFC Engine with C++ Thread Manager and callback-based Inference";
 
     m.def("initialize_evaluator", []() {
         omp::HandEvaluator::initialize();
@@ -158,14 +160,15 @@ PYBIND11_MODULE(ofc_engine, m) {
             return py::cast(std::make_tuple(infosets_np, actions_np, targets_np));
         }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
-    py::class_<PySolverManager>(m, "SolverManager")
-        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::list, py::object>(),
+    py::class_<SolverManager>(m, "SolverManager")
+        .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::object>(),
              py::arg("num_workers"),
              py::arg("action_limit"),
              py::arg("policy_buffer"), py::arg("value_buffer"),
-             py::arg("request_queue"), py::arg("result_queues"),
+             py::arg("request_queue"),
              py::arg("log_queue")
         )
-        .def("start", &PySolverManager::start)
-        .def("stop", &PySolverManager::stop);
+        .def("start", &SolverManager::start, py::call_guard<py::gil_scoped_release>())
+        .def("stop", &SolverManager::stop, py::call_guard<py::gil_scoped_release>())
+        .def("add_result", &SolverManager::add_result);
 }
