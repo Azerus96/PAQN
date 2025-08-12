@@ -23,7 +23,6 @@ public:
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
-        // --- ИЗМЕНЕНИЕ: Принимаем список очередей для результатов ---
         py::list result_queues,
         py::object log_queue
     ) : num_workers_(num_workers),
@@ -34,7 +33,7 @@ public:
         result_queues_(result_queues), 
         log_queue_(log_queue) 
     {
-        stop_flag_.store(true); // Изначально остановлен
+        stop_flag_.store(true);
     }
 
     ~SolverManagerImpl() {
@@ -43,11 +42,9 @@ public:
 
     void start() {
         if (!stop_flag_.exchange(false)) {
-            // Уже был запущен
             return;
         }
         for (size_t i = 0; i < num_workers_; ++i) {
-            // --- ИЗМЕНЕНИЕ: Передаем каждому воркеру его персональную очередь и ID ---
             py::object personal_queue = result_queues_[i];
             auto solver = std::make_unique<ofc::DeepMCCFR>(
                 action_limit_, policy_buffer_, value_buffer_, &request_queue_, 
@@ -83,7 +80,6 @@ private:
     std::vector<std::thread> threads_;
     std::atomic<bool> stop_flag_;
     py::object request_queue_;
-    // --- ИЗМЕНЕНИЕ: Храним список очередей ---
     py::list result_queues_;
     py::object log_queue_;
 };
@@ -96,7 +92,6 @@ public:
         ofc::SharedReplayBuffer* policy_buffer, 
         ofc::SharedReplayBuffer* value_buffer,
         py::object request_queue,
-        // --- ИЗМЕНЕНИЕ: Принимаем список очередей ---
         py::list result_queues,
         py::object log_queue
     ) {
@@ -107,20 +102,24 @@ public:
     }
 
     ~PySolverManager() {
-        py::gil_scoped_acquire acquire;
+        // При уничтожении объекта из Python, GIL уже захвачен
         if (impl_) {
+            // stop() внутри себя отпустит GIL для join()
             impl_->stop();
         }
     }
 
     void start() {
-        py::gil_scoped_release release;
+        // --- ИЗМЕНЕНИЕ: УБРАН py::gil_scoped_release ---
+        // Метод start() быстрый и работает с Python объектами, GIL должен быть удержан.
         if (impl_) {
             impl_->start();
         }
     }
 
     void stop() {
+        // А вот stop() долгий и блокирующий, и он не трогает Python объекты.
+        // Здесь освобождать GIL ПРАВИЛЬНО и ВАЖНО.
         py::gil_scoped_release release;
         if (impl_) {
             impl_->stop();
@@ -163,7 +162,6 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
     py::class_<PySolverManager>(m, "SolverManager")
-        // --- ИЗМЕНЕНИЕ: Обновлена сигнатура конструктора ---
         .def(py::init<size_t, size_t, ofc::SharedReplayBuffer*, ofc::SharedReplayBuffer*, py::object, py::list, py::object>(),
              py::arg("num_workers"),
              py::arg("action_limit"),
