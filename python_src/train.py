@@ -12,12 +12,13 @@ import multiprocessing as mp
 import queue
 import random
 import glob
+import threading # <-- Используем threading для моста
 
 if __name__ == '__main__':
     if mp.get_start_method(allow_none=True) != 'spawn':
         mp.set_start_method('spawn', force=True)
 
-# Исправляем пути, если необходимо
+# ... (настройка путей без изменений) ...
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..'))
 build_dir = os.path.join(project_root, 'build')
@@ -31,13 +32,12 @@ if build_dir not in sys.path:
 from python_src.model import OFC_CNN_Network
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
-# --- Константы ---
+# ... (константы и настройки без изменений) ...
 NUM_FEATURE_CHANNELS = 16
 NUM_SUITS = 4
 NUM_RANKS = 13
 INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 
-# --- Настройки ---
 TOTAL_CPUS = os.cpu_count() or 88
 RESERVED_CPUS = 4
 NUM_INFERENCE_WORKERS = 30
@@ -45,36 +45,33 @@ NUM_CPP_WORKERS = 40
 
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
-# --- Гиперпараметры ---
 ACTION_LIMIT = 4
 LEARNING_RATE = 0.0005
 BUFFER_CAPACITY = 1_000_000
-# --- ИЗМЕНЕНИЕ: Увеличены BATCH_SIZE и порог для начала обучения ---
 BATCH_SIZE = 256
 MIN_BUFFER_FILL_SAMPLES = 50000
 
-# --- Пути и интервалы ---
 STATS_INTERVAL_SECONDS = 15
-SAVE_INTERVAL_SECONDS = 300 # Сохраняем реже, чтобы не перегружать диск
+SAVE_INTERVAL_SECONDS = 300
 MODEL_DIR = "/content/models"
 MODEL_PATH = os.path.join(MODEL_DIR, "paqn_model_latest.pth")
 VERSION_FILE = os.path.join(MODEL_DIR, "latest_version.txt")
 OPPONENT_POOL_DIR = os.path.join(MODEL_DIR, "opponent_pool")
 MAX_OPPONENTS_IN_POOL = 20
 
+
 class InferenceWorker(mp.Process):
-    # --- ИЗМЕНЕНИЕ: Принимаем список очередей для результатов ---
-    def __init__(self, name, task_queue, result_queues, log_queue, stop_event):
+    # --- ИЗМЕНЕНИЕ: Конструктор теперь принимает очередь результатов ---
+    def __init__(self, name, task_queue, result_queue, log_queue, stop_event):
         super().__init__(name=name)
         self.task_queue = task_queue
-        self.result_queues = result_queues
+        self.result_queue = result_queue # Это теперь mp.Queue
         self.log_queue = log_queue
         self.stop_event = stop_event
         self.latest_model = None
         self.opponent_model = None
         self.device = None
         self.opponent_pool_files = []
-        # --- ИЗМЕНЕНИЕ: Добавляем отслеживание версий ---
         self.model_version = -1
         self.last_version_check_time = 0
         self.request_counter = 0
@@ -98,21 +95,18 @@ class InferenceWorker(mp.Process):
 
     def _load_models(self):
         try:
-            # Загружаем основную модель
             if os.path.exists(MODEL_PATH):
                 self.latest_model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
                 self._log(f"Loaded latest model (version {self.model_version}).")
             else:
                 self._log("No latest model found, using initialized weights.")
 
-            # Обновляем пул оппонентов и выбираем случайного
             self.opponent_pool_files = glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth"))
             if self.opponent_pool_files:
                 opponent_path = random.choice(self.opponent_pool_files)
                 self.opponent_model.load_state_dict(torch.load(opponent_path, map_location=self.device))
                 self._log(f"Loaded opponent model: {os.path.basename(opponent_path)}")
             else:
-                # Если пул пуст, используем последнюю модель как оппонента
                 self.opponent_model.load_state_dict(self.latest_model.state_dict())
                 self._log("Opponent pool is empty, using latest model as opponent.")
 
@@ -120,10 +114,8 @@ class InferenceWorker(mp.Process):
             self._log(f"!!! FAILED to load models: {e}")
             traceback.print_exc()
 
-    # --- ИЗМЕНЕНИЕ: Новый метод для проверки обновлений ---
     def _check_for_updates(self):
         self.request_counter += 1
-        # Проверяем не чаще, чем раз в 5 секунд, и не на каждый запрос
         if self.request_counter % 100 != 0 and time.time() - self.last_version_check_time < 5:
             return
 
@@ -150,13 +142,12 @@ class InferenceWorker(mp.Process):
         while not self.stop_event.is_set():
             try:
                 try:
-                    # --- ИЗМЕНЕНИЕ: Получаем worker_id из запроса ---
-                    req_id, is_policy, infoset, action_vectors, worker_id = self.task_queue.get(timeout=1)
+                    # --- ИЗМЕНЕНИЕ: worker_id больше не нужен, C++ его не знает ---
+                    req_id, is_policy, infoset, action_vectors = self.task_queue.get(timeout=1)
                 except queue.Empty:
-                    self._check_for_updates() # Проверяем обновления даже если нет задач
+                    self._check_for_updates()
                     continue
 
-                # --- ИЗМЕНЕНИЕ: Проверяем обновления после получения задачи ---
                 self._check_for_updates()
                 
                 with torch.inference_mode():
@@ -183,8 +174,8 @@ class InferenceWorker(mp.Process):
                         value = model_to_use(infoset_tensor)
                         result = (req_id, False, [value.item()])
                     
-                    # --- ИЗМЕНЕНИЕ: Отправляем результат в персональную очередь C++ воркера ---
-                    self.result_queues[worker_id].put(result)
+                    # --- ИЗМЕНЕНИЕ: Кладем результат в общую очередь результатов ---
+                    self.result_queue.put(result)
 
             except (KeyboardInterrupt, SystemExit):
                 break
@@ -196,6 +187,7 @@ class InferenceWorker(mp.Process):
         
         self._log("Stopped.")
 
+# ... update_opponent_pool без изменений ...
 def update_opponent_pool(model_version):
     if not os.path.exists(MODEL_PATH): return
     state_dict_to_save = torch.load(MODEL_PATH)
@@ -209,6 +201,23 @@ def update_opponent_pool(model_version):
     new_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"paqn_model_v{model_version}.pth")
     torch.save(state_dict_to_save, new_opponent_path)
     print(f"Added model version {model_version} to opponent pool.")
+
+
+# --- НОВАЯ ФУНКЦИЯ: Поток-мост для результатов ---
+def result_bridge_thread(result_queue, solver_manager, stop_event):
+    """Перекладывает результаты из mp.Queue в C++ мост."""
+    print("[Bridge] Result bridge thread started.")
+    while not stop_event.is_set():
+        try:
+            req_id, is_policy, predictions = result_queue.get(timeout=1)
+            # Передаем результат в C++
+            solver_manager.add_result(req_id, (req_id, is_policy, predictions))
+        except queue.Empty:
+            continue
+        except (KeyboardInterrupt, SystemExit):
+            break
+    print("[Bridge] Result bridge thread stopped.")
+
 
 def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -240,25 +249,28 @@ def main():
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
     
-    manager = mp.Manager()
-    request_queue = manager.Queue(maxsize=NUM_CPP_WORKERS * 16)
-    # --- ИЗМЕНЕНИЕ: Создаем список персональных очередей для результатов ---
-    result_queues = [manager.Queue(maxsize=2) for _ in range(NUM_CPP_WORKERS)]
-    log_queue = manager.Queue()
+    # --- ИЗМЕНЕНИЕ: Используем простые mp.Queue вместо Manager ---
+    request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 16)
+    result_queue = mp.Queue(maxsize=NUM_INFERENCE_WORKERS * 4)
+    log_queue = mp.Queue()
     stop_event = mp.Event()
 
     inference_workers = []
     for i in range(NUM_INFERENCE_WORKERS):
-        # --- ИЗМЕНЕНИЕ: Передаем список очередей в воркер ---
-        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_queues, log_queue, stop_event)
+        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_queue, log_queue, stop_event)
         worker.start()
         inference_workers.append(worker)
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
     solver_manager = SolverManager(
         NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
-        request_queue, result_queues, log_queue
+        request_queue, log_queue
     )
+    
+    # --- НОВАЯ ЛОГИКА: Запускаем поток-мост ---
+    bridge = threading.Thread(target=result_bridge_thread, args=(result_queue, solver_manager, stop_event))
+    bridge.start()
+
     solver_manager.start()
     print("C++ workers are running in the background.", flush=True)
     
@@ -272,7 +284,6 @@ def main():
 
     try:
         while True:
-            # Логирование вынесено в отдельный блок, чтобы не мешать основному циклу
             if time.time() - last_stats_time > STATS_INTERVAL_SECONDS:
                 while not log_queue.empty():
                     try:
@@ -291,7 +302,7 @@ def main():
                 print(f"Buffer Fill -> Policy: {policy_buffer.size():,}/{BUFFER_CAPACITY:,} ({policy_buffer.size()/BUFFER_CAPACITY:.1%}) "
                       f"| Value: {value_buffer.size():,}/{BUFFER_CAPACITY:,} ({value_buffer.size()/BUFFER_CAPACITY:.1%})", flush=True)
                 print(f"Avg Losses (last 100) -> Policy: {avg_p_loss:.6f} | Value: {avg_v_loss:.6f}", flush=True)
-                print(f"Request Queue: {request_queue.qsize()}", flush=True)
+                print(f"Request Queue: {request_queue.qsize()} | Result Queue: {result_queue.qsize()}", flush=True)
                 print("="*54, flush=True)
                 last_stats_time = time.time()
 
@@ -351,6 +362,10 @@ def main():
         print("Stopping C++ workers...", flush=True)
         solver_manager.stop()
         print("C++ workers stopped.")
+        
+        print("Stopping bridge thread...", flush=True)
+        bridge.join()
+        print("Bridge thread stopped.")
         
         print("Stopping Python workers...", flush=True)
         for worker in inference_workers:
