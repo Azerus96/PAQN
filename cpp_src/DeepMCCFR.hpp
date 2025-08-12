@@ -18,6 +18,8 @@ namespace py = pybind11;
 namespace ofc {
 
 using LogQueue = py::object;
+// --- ИЗМЕНЕНИЕ: Добавляем тип для персональной очереди результатов ---
+using PersonalResultQueue = py::object;
 
 class DeepMCCFR {
 public:
@@ -25,7 +27,9 @@ public:
               SharedReplayBuffer* policy_buffer, 
               SharedReplayBuffer* value_buffer, 
               InferenceRequestQueue* request_queue,
-              InferenceResultQueue* result_queue,
+              // --- ИЗМЕНЕНИЕ: Принимаем указатель на персональную очередь и ID ---
+              PersonalResultQueue* personal_result_queue,
+              uint64_t worker_id,
               LogQueue* log_queue);
     
     void run_traversal();
@@ -36,7 +40,9 @@ private:
     SharedReplayBuffer* value_buffer_;
     
     InferenceRequestQueue* request_queue_;
-    InferenceResultQueue* result_queue_;
+    // --- ИЗМЕНЕНИЕ: Храним указатель на свою очередь и свой ID ---
+    PersonalResultQueue* personal_result_queue_;
+    uint64_t worker_id_;
     LogQueue* log_queue_;
 
     size_t action_limit_;
