@@ -18,7 +18,6 @@
 
 namespace py = pybind11;
 
-// Потокобезопасный C++ мост для ожидания результатов
 class ResultBridge {
 public:
     void add_result(uint64_t id, py::tuple result) {
@@ -29,9 +28,22 @@ public:
 
     py::tuple get_result(uint64_t id) {
         std::unique_lock<std::mutex> lock(mtx_);
-        // Освобождаем GIL на время ожидания результата
-        cv_.wait(lock, py::gil_scoped_release(), [this, id] { return results_.count(id); });
-        py::tuple result = results_[id];
+        
+        // --- ИСПРАВЛЕНИЕ: Правильный паттерн освобождения GIL ---
+        // Если результата еще нет, мы будем ждать.
+        // Для этого мы создаем новый блок, чтобы ограничить время жизни
+        // объекта gil_scoped_release.
+        if (results_.find(id) == results_.end()) {
+            // Создаем объект, который освобождает GIL.
+            py::gil_scoped_release release;
+            // Теперь ждем. Поток спит, не удерживая ни мьютекс, ни GIL.
+            cv_.wait(lock, [this, id] { return results_.count(id); });
+        }
+        // Когда мы выходим из блока if, 'release' уничтожается,
+        // и GIL автоматически захватывается обратно.
+        // Мы все еще владеем мьютексом 'lock'.
+        
+        py::tuple result = results_.at(id);
         results_.erase(id);
         return result;
     }
@@ -72,13 +84,11 @@ public:
 
         for (size_t i = 0; i < num_workers_; ++i) {
             auto request_cb = [this](uint64_t id, bool is_policy, const std::vector<float>& infoset, const std::vector<std::vector<float>>& actions) {
-                // Этот коллбэк вызывается с захваченным GIL
                 py::tuple request_tuple = py::make_tuple(id, is_policy, py::cast(infoset), py::cast(actions));
                 this->request_queue_.attr("put")(request_tuple);
             };
 
             auto result_cb = [this](uint64_t id) -> py::tuple {
-                // Этот коллбэк вызывается с захваченным GIL
                 return this->result_bridge_->get_result(id);
             };
 
@@ -108,7 +118,6 @@ public:
 
 private:
     void worker_loop(std::unique_ptr<ofc::DeepMCCFR> solver) {
-        // Захватываем GIL один раз для всего жизненного цикла потока
         py::gil_scoped_acquire acquire;
         while (!stop_flag_.load()) {
             solver->run_traversal();
@@ -140,7 +149,7 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def("size", &ofc::SharedReplayBuffer::size)
         .def("total_generated", &ofc::SharedReplayBuffer::total_generated)
         .def("sample", [](ofc::SharedReplayBuffer &buffer, int batch_size) -> py::object {
-            py::gil_scoped_release release; // Сэмплирование - это C++ операция
+            py::gil_scoped_release release;
             auto infosets_np = py::array_t<float>({batch_size, ofc::INFOSET_SIZE});
             auto actions_np = py::array_t<float>({batch_size, ofc::ACTION_VECTOR_SIZE});
             auto targets_np = py::array_t<float>({batch_size});
@@ -151,7 +160,8 @@ PYBIND11_MODULE(ofc_engine, m) {
                 actions_np,
                 targets_np
             );
-
+            
+            py::gil_scoped_acquire acquire;
             if (!success) {
                 return py::none();
             }
@@ -166,7 +176,7 @@ PYBIND11_MODULE(ofc_engine, m) {
              py::arg("policy_buffer"), py::arg("value_buffer"),
              py::arg("request_queue")
         )
-        .def("start", &SolverManager::start)
-        .def("stop", &SolverManager::stop)
+        .def("start", &SolverManager::start, py::call_guard<py::gil_scoped_release>())
+        .def("stop", &SolverManager::stop, py::call_guard<py::gil_scoped_release>())
         .def("add_result", &SolverManager::add_result);
 }
