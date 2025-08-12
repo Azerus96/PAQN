@@ -55,14 +55,16 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
 
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
 
+// --- ИЗМЕНЕНИЕ: Обновлен конструктор ---
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
-                     InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue,
-                     LogQueue* log_queue) 
+                     InferenceRequestQueue* request_queue, PersonalResultQueue* personal_result_queue,
+                     uint64_t worker_id, LogQueue* log_queue) 
     : action_limit_(action_limit),
       policy_buffer_(policy_buffer), 
       value_buffer_(value_buffer),
       request_queue_(request_queue),
-      result_queue_(result_queue),
+      personal_result_queue_(personal_result_queue),
+      worker_id_(worker_id),
       log_queue_(log_queue),
       rng_(static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + 
            static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))),
@@ -142,15 +144,6 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
 
 
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root, uint64_t traversal_id) {
-    std::stringstream ss;
-    ss << "[C++ TID: " << std::this_thread::get_id() << "] ";
-    std::string prefix = ss.str();
-    
-    auto log = [&](const std::string& message) {
-        py::gil_scoped_acquire acquire;
-        log_queue_->attr("put")(py::str(prefix + message));
-    };
-
     if (state.is_terminal()) {
         auto payoffs = state.get_payoffs(evaluator_);
         return {{0, payoffs.first}, {1, payoffs.second}};
@@ -201,70 +194,49 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     uint64_t value_request_id = traversal_id * 2 + 1;
 
     {
-        log("Acquiring GIL to put requests...");
         py::gil_scoped_acquire acquire;
+        // --- ИЗМЕНЕНИЕ: Добавляем worker_id в кортеж запроса ---
         py::tuple policy_request_tuple = py::make_tuple(
-            policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors)
+            policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors), worker_id_
         );
         request_queue_->attr("put")(policy_request_tuple);
-        log("Put POLICY request " + std::to_string(policy_request_id));
 
         py::tuple value_request_tuple = py::make_tuple(
-            value_request_id, false, py::cast(infoset_vec), py::none()
+            value_request_id, false, py::cast(infoset_vec), py::none(), worker_id_
         );
         request_queue_->attr("put")(value_request_tuple);
-        log("Put VALUE request " + std::to_string(value_request_id));
-        
-        log("Releasing GIL after putting requests.");
     }
 
     std::vector<float> logits;
     float value_baseline = 0.0f;
-    int results_to_get = 2;
-    int results_gotten = 0;
 
-    while(results_gotten < results_to_get) {
-        bool got_item = false;
+    // --- ИЗМЕНЕНИЕ: Полностью переделан механизм получения результатов ---
+    // Теперь мы просто делаем два блокирующих вызова к нашей персональной очереди
+    for (int i = 0; i < 2; ++i) {
+        py::object result_obj;
         {
-            log("Acquiring GIL to check results (Policy: " + std::to_string(policy_request_id) + ", Value: " + std::to_string(value_request_id) + ")...");
-            py::gil_scoped_acquire acquire;
-            py::object policy_key = py::cast(policy_request_id);
-            if (result_queue_->contains(policy_key)) {
-                log("FOUND policy result for " + std::to_string(policy_request_id));
-                py::tuple result_tuple = (*result_queue_)[policy_key].cast<py::tuple>();
-                logits = result_tuple[2].cast<std::vector<float>>();
-                result_queue_->attr("pop")(policy_key);
-                results_gotten++;
-                got_item = true;
-            }
-
-            if (results_gotten < results_to_get) {
-                py::object value_key = py::cast(value_request_id);
-                if (result_queue_->contains(value_key)) {
-                    log("FOUND value result for " + std::to_string(value_request_id));
-                    py::tuple result_tuple = (*result_queue_)[value_key].cast<py::tuple>();
-                    if (!result_tuple[2].is_none()) {
-                        std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
-                        if (!predictions.empty()) {
-                            value_baseline = predictions[0];
-                        }
-                    }
-                    result_queue_->attr("pop")(value_key);
-                    results_gotten++;
-                    got_item = true;
+            // Отпускаем GIL на время ожидания
+            py::gil_scoped_release release;
+            result_obj = personal_result_queue_->attr("get")();
+        }
+        
+        py::gil_scoped_acquire acquire;
+        py::tuple result_tuple = result_obj.cast<py::tuple>();
+        uint64_t result_id = result_tuple[0].cast<uint64_t>();
+        bool is_policy_result = result_tuple[1].cast<bool>();
+        
+        if (is_policy_result) {
+            logits = result_tuple[2].cast<std::vector<float>>();
+        } else { // is_value_result
+            if (!result_tuple[2].is_none()) {
+                std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
+                if (!predictions.empty()) {
+                    value_baseline = predictions[0];
                 }
             }
-            if (got_item) {
-                log("Releasing GIL after getting a result.");
-            } else {
-                log("Releasing GIL, no result found.");
-            }
-        } 
-
-        if (!got_item) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
+    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     std::vector<float> strategy(num_actions);
     if (!logits.empty() && logits.size() == num_actions) {
