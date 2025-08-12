@@ -49,35 +49,41 @@ print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Py
 ACTION_LIMIT = 4
 LEARNING_RATE = 0.0005
 BUFFER_CAPACITY = 1_000_000
-BATCH_SIZE = 10
-# MIN_BUFFER_FILL_RATIO = 0.001
-MIN_BUFFER_FILL_SAMPLES = 10
+# --- ИЗМЕНЕНИЕ: Увеличены BATCH_SIZE и порог для начала обучения ---
+BATCH_SIZE = 256
+MIN_BUFFER_FILL_SAMPLES = 50000
 
 # --- Пути и интервалы ---
 STATS_INTERVAL_SECONDS = 15
-SAVE_INTERVAL_SECONDS = 60
+SAVE_INTERVAL_SECONDS = 300 # Сохраняем реже, чтобы не перегружать диск
 MODEL_DIR = "/content/models"
 MODEL_PATH = os.path.join(MODEL_DIR, "paqn_model_latest.pth")
+VERSION_FILE = os.path.join(MODEL_DIR, "latest_version.txt")
 OPPONENT_POOL_DIR = os.path.join(MODEL_DIR, "opponent_pool")
 MAX_OPPONENTS_IN_POOL = 20
 
 class InferenceWorker(mp.Process):
-    def __init__(self, name, task_queue, result_queue, log_queue, stop_event):
+    # --- ИЗМЕНЕНИЕ: Принимаем список очередей для результатов ---
+    def __init__(self, name, task_queue, result_queues, log_queue, stop_event):
         super().__init__(name=name)
         self.task_queue = task_queue
-        self.result_queue = result_queue
+        self.result_queues = result_queues
         self.log_queue = log_queue
         self.stop_event = stop_event
         self.latest_model = None
         self.opponent_model = None
         self.device = None
         self.opponent_pool_files = []
+        # --- ИЗМЕНЕНИЕ: Добавляем отслеживание версий ---
+        self.model_version = -1
+        self.last_version_check_time = 0
+        self.request_counter = 0
 
     def _log(self, message):
-        self.log_queue.put(message)
+        self.log_queue.put(f"[{self.name}] {message}")
 
     def _initialize(self):
-        self._log(f"[{self.name}] Started.")
+        self._log("Started.")
         self.device = torch.device("cpu")
         torch.set_num_threads(1)
         os.environ['OMP_NUM_THREADS'] = '1'
@@ -92,17 +98,47 @@ class InferenceWorker(mp.Process):
 
     def _load_models(self):
         try:
+            # Загружаем основную модель
             if os.path.exists(MODEL_PATH):
                 self.latest_model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
-            
+                self._log(f"Loaded latest model (version {self.model_version}).")
+            else:
+                self._log("No latest model found, using initialized weights.")
+
+            # Обновляем пул оппонентов и выбираем случайного
             self.opponent_pool_files = glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth"))
             if self.opponent_pool_files:
                 opponent_path = random.choice(self.opponent_pool_files)
                 self.opponent_model.load_state_dict(torch.load(opponent_path, map_location=self.device))
+                self._log(f"Loaded opponent model: {os.path.basename(opponent_path)}")
             else:
+                # Если пул пуст, используем последнюю модель как оппонента
                 self.opponent_model.load_state_dict(self.latest_model.state_dict())
+                self._log("Opponent pool is empty, using latest model as opponent.")
+
         except Exception as e:
-            self._log(f"[{self.name}] Failed to load models: {e}")
+            self._log(f"!!! FAILED to load models: {e}")
+            traceback.print_exc()
+
+    # --- ИЗМЕНЕНИЕ: Новый метод для проверки обновлений ---
+    def _check_for_updates(self):
+        self.request_counter += 1
+        # Проверяем не чаще, чем раз в 5 секунд, и не на каждый запрос
+        if self.request_counter % 100 != 0 and time.time() - self.last_version_check_time < 5:
+            return
+
+        self.last_version_check_time = time.time()
+        try:
+            if os.path.exists(VERSION_FILE):
+                with open(VERSION_FILE, 'r') as f:
+                    latest_version = int(f.read())
+                if latest_version > self.model_version:
+                    self._log(f"New model version detected ({latest_version}). Reloading models...")
+                    self.model_version = latest_version
+                    self._load_models()
+        except (IOError, ValueError) as e:
+            self._log(f"Could not check for model update: {e}")
+
 
     def run(self):
         self._initialize()
@@ -114,11 +150,14 @@ class InferenceWorker(mp.Process):
         while not self.stop_event.is_set():
             try:
                 try:
-                    req_id, is_policy, infoset, action_vectors = self.task_queue.get(timeout=1)
+                    # --- ИЗМЕНЕНИЕ: Получаем worker_id из запроса ---
+                    req_id, is_policy, infoset, action_vectors, worker_id = self.task_queue.get(timeout=1)
                 except queue.Empty:
+                    self._check_for_updates() # Проверяем обновления даже если нет задач
                     continue
 
-                self._log(f"[{self.name}] Got request {req_id} (is_policy={is_policy})")
+                # --- ИЗМЕНЕНИЕ: Проверяем обновления после получения задачи ---
+                self._check_for_updates()
                 
                 with torch.inference_mode():
                     infoset_tensor = torch.tensor([infoset], dtype=torch.float32, device=self.device)
@@ -130,24 +169,22 @@ class InferenceWorker(mp.Process):
 
                     if is_policy:
                         if not action_vectors:
-                            self.result_queue[req_id] = (req_id, True, [])
-                            self._log(f"[{self.name}] Sent EMPTY policy result for {req_id}")
-                            continue
-
-                        num_actions = len(action_vectors)
-                        infoset_batch = infoset_tensor.repeat(num_actions, 1, 1, 1)
-                        actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
-                        street_vector = infoset_batch[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
-                        
-                        policy_logits, _ = model_to_use(infoset_batch, actions_tensor, street_vector)
-                        predictions = policy_logits.cpu().numpy().flatten().tolist()
-                        
-                        self.result_queue[req_id] = (req_id, True, predictions)
-                        self._log(f"[{self.name}] Sent POLICY result for {req_id}")
+                            result = (req_id, True, [])
+                        else:
+                            num_actions = len(action_vectors)
+                            infoset_batch = infoset_tensor.repeat(num_actions, 1, 1, 1)
+                            actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
+                            street_vector = infoset_batch[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
+                            
+                            policy_logits, _ = model_to_use(infoset_batch, actions_tensor, street_vector)
+                            predictions = policy_logits.cpu().numpy().flatten().tolist()
+                            result = (req_id, True, predictions)
                     else: # is_value
                         value = model_to_use(infoset_tensor)
-                        self.result_queue[req_id] = (req_id, False, [value.item()])
-                        self._log(f"[{self.name}] Sent VALUE result for {req_id}")
+                        result = (req_id, False, [value.item()])
+                    
+                    # --- ИЗМЕНЕНИЕ: Отправляем результат в персональную очередь C++ воркера ---
+                    self.result_queues[worker_id].put(result)
 
             except (KeyboardInterrupt, SystemExit):
                 break
@@ -157,14 +194,18 @@ class InferenceWorker(mp.Process):
                 for line in exc_info.split('\n'):
                     self._log(line)
         
-        self._log(f"[{self.name}] Stopped.")
+        self._log("Stopped.")
 
 def update_opponent_pool(model_version):
     if not os.path.exists(MODEL_PATH): return
     state_dict_to_save = torch.load(MODEL_PATH)
+    
+    os.makedirs(OPPONENT_POOL_DIR, exist_ok=True)
     pool_files = sorted(glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth")), key=os.path.getmtime)
+    
     while len(pool_files) >= MAX_OPPONENTS_IN_POOL:
         os.remove(pool_files.pop(0))
+        
     new_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"paqn_model_v{model_version}.pth")
     torch.save(state_dict_to_save, new_opponent_path)
     print(f"Added model version {model_version} to opponent pool.")
@@ -181,10 +222,15 @@ def main():
     print(f"Using device: {device}", flush=True)
     
     model = OFC_CNN_Network().to(device)
+    model_version = 0
     if os.path.exists(MODEL_PATH):
         try:
             model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
             print("Loaded latest model from:", MODEL_PATH)
+            if os.path.exists(VERSION_FILE):
+                with open(VERSION_FILE, 'r') as f:
+                    model_version = int(f.read())
+                print(f"Current model version: {model_version}")
         except Exception as e:
             print(f"Could not load model, starting from scratch. Error: {e}")
         
@@ -196,22 +242,23 @@ def main():
     
     manager = mp.Manager()
     request_queue = manager.Queue(maxsize=NUM_CPP_WORKERS * 16)
-    result_dict = manager.dict()
+    # --- ИЗМЕНЕНИЕ: Создаем список персональных очередей для результатов ---
+    result_queues = [manager.Queue(maxsize=2) for _ in range(NUM_CPP_WORKERS)]
     log_queue = manager.Queue()
     stop_event = mp.Event()
 
     inference_workers = []
     for i in range(NUM_INFERENCE_WORKERS):
-        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_dict, log_queue, stop_event)
+        # --- ИЗМЕНЕНИЕ: Передаем список очередей в воркер ---
+        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_queues, log_queue, stop_event)
         worker.start()
         inference_workers.append(worker)
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
     solver_manager = SolverManager(
         NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
-        request_queue, result_dict, log_queue
+        request_queue, result_queues, log_queue
     )
-    # --- НОВАЯ СТРОКА: Запускаем потоки здесь ---
     solver_manager.start()
     print("C++ workers are running in the background.", flush=True)
     
@@ -219,24 +266,38 @@ def main():
     value_losses = deque(maxlen=100)
     last_stats_time = time.time()
     last_save_time = time.time()
-    model_version = 0
     
     STREET_START_IDX = 9
     STREET_END_IDX = 14
 
     try:
         while True:
-            while not log_queue.empty():
-                try:
-                    print(log_queue.get_nowait(), flush=True)
-                except queue.Empty:
-                    break
+            # Логирование вынесено в отдельный блок, чтобы не мешать основному циклу
+            if time.time() - last_stats_time > STATS_INTERVAL_SECONDS:
+                while not log_queue.empty():
+                    try:
+                        print(log_queue.get_nowait(), flush=True)
+                    except queue.Empty:
+                        break
+                
+                total_generated = policy_buffer.total_generated()
+                avg_p_loss = np.mean(policy_losses) if policy_losses else float('nan')
+                avg_v_loss = np.mean(value_losses) if value_losses else float('nan')
+                
+                print("\n" + "="*20 + " STATS UPDATE " + "="*20, flush=True)
+                print(f"Time: {time.strftime('%H:%M:%S')}", flush=True)
+                print(f"Model Version: {model_version}", flush=True)
+                print(f"Total Generated: {total_generated:,}", flush=True)
+                print(f"Buffer Fill -> Policy: {policy_buffer.size():,}/{BUFFER_CAPACITY:,} ({policy_buffer.size()/BUFFER_CAPACITY:.1%}) "
+                      f"| Value: {value_buffer.size():,}/{BUFFER_CAPACITY:,} ({value_buffer.size()/BUFFER_CAPACITY:.1%})", flush=True)
+                print(f"Avg Losses (last 100) -> Policy: {avg_p_loss:.6f} | Value: {avg_v_loss:.6f}", flush=True)
+                print(f"Request Queue: {request_queue.qsize()}", flush=True)
+                print("="*54, flush=True)
+                last_stats_time = time.time()
 
             if value_buffer.size() < MIN_BUFFER_FILL_SAMPLES or policy_buffer.size() < MIN_BUFFER_FILL_SAMPLES:
-                # --- ИЗМЕНЕНИЕ 2: Добавляем total_generated для диагностики ---
-                print(f"Waiting... Policy: {policy_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES} | Value: {value_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES} | Total Gen: {policy_buffer.total_generated()} ", end='\r', flush=True)
+                print(f"Waiting for buffer to fill... Policy: {policy_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES} | Value: {value_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}", end='\r', flush=True)
                 time.sleep(1)
-                last_stats_time = time.time()
                 continue
 
             model.train()
@@ -272,52 +333,26 @@ def main():
             model.eval()
 
             now = time.time()
-            if now - last_stats_time > STATS_INTERVAL_SECONDS:
-                while not log_queue.empty():
-                    try:
-                        print(log_queue.get_nowait(), flush=True)
-                    except queue.Empty:
-                        break
-                
-                total_generated = policy_buffer.total_generated()
-                avg_p_loss = np.mean(policy_losses) if policy_losses else float('nan')
-                avg_v_loss = np.mean(value_losses) if value_losses else float('nan')
-                
-                print("\n" + "="*20 + " STATS UPDATE " + "="*20, flush=True)
-                print(f"Time: {time.strftime('%H:%M:%S')}", flush=True)
-                print(f"Total Generated: {total_generated:,}", flush=True)
-                print(f"Buffer Fill -> Policy: {policy_buffer.size():,}/{BUFFER_CAPACITY:,} ({policy_buffer.size()/BUFFER_CAPACITY:.1%}) "
-                      f"| Value: {value_buffer.size():,}/{BUFFER_CAPACITY:,} ({value_buffer.size()/BUFFER_CAPACITY:.1%})", flush=True)
-                print(f"Avg Losses (last 100) -> Policy: {avg_p_loss:.6f} | Value: {avg_v_loss:.6f}", flush=True)
-                print(f"Request Queue: {request_queue.qsize()} | Result Dict: {len(result_dict)}", flush=True)
-                print("="*54, flush=True)
-                last_stats_time = now
-
             if now - last_save_time > SAVE_INTERVAL_SECONDS:
                 print("\n--- Saving models and updating opponent pool ---", flush=True)
                 torch.save(model.state_dict(), MODEL_PATH)
                 model_version += 1
+                with open(VERSION_FILE, 'w') as f:
+                    f.write(str(model_version))
                 update_opponent_pool(model_version)
-                # --- ИЗМЕНЕНИЕ 3: Обновляем state_dicts для воркеров на лету ---
-                latest_state_dict = torch.load(MODEL_PATH, map_location=device)
-                opponent_state_dicts.append(latest_state_dict)
-                if len(opponent_state_dicts) > MAX_OPPONENTS_IN_POOL:
-                    opponent_state_dicts.pop(0)
-                for worker in inference_workers:
-                    worker.latest_state_dict = latest_state_dict
-                    worker.opponent_state_dicts = opponent_state_dicts
-
+                last_save_time = now
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.", flush=True)
     finally:
         print("Stopping all workers...", flush=True)
         stop_event.set()
-        time.sleep(2)
         
+        print("Stopping C++ workers...", flush=True)
         solver_manager.stop()
         print("C++ workers stopped.")
         
+        print("Stopping Python workers...", flush=True)
         for worker in inference_workers:
             worker.join(timeout=5)
             if worker.is_alive():
