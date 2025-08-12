@@ -67,6 +67,8 @@ public:
 
 private:
     void worker_loop(std::unique_ptr<ofc::DeepMCCFR> solver) {
+        // --- ИЗМЕНЕНИЕ: Убран gil_scoped_acquire отсюда ---
+        // Теперь он находится внутри run_traversal
         while (!stop_flag_.load()) {
             solver->run_traversal();
         }
@@ -102,24 +104,19 @@ public:
     }
 
     ~PySolverManager() {
-        // При уничтожении объекта из Python, GIL уже захвачен
+        py::gil_scoped_acquire acquire;
         if (impl_) {
-            // stop() внутри себя отпустит GIL для join()
             impl_->stop();
         }
     }
 
     void start() {
-        // --- ИЗМЕНЕНИЕ: УБРАН py::gil_scoped_release ---
-        // Метод start() быстрый и работает с Python объектами, GIL должен быть удержан.
         if (impl_) {
             impl_->start();
         }
     }
 
     void stop() {
-        // А вот stop() долгий и блокирующий, и он не трогает Python объекты.
-        // Здесь освобождать GIL ПРАВИЛЬНО и ВАЖНО.
         py::gil_scoped_release release;
         if (impl_) {
             impl_->stop();
