@@ -12,13 +12,12 @@ import multiprocessing as mp
 import queue
 import random
 import glob
-import threading # <-- Используем threading для моста
+import threading
 
 if __name__ == '__main__':
     if mp.get_start_method(allow_none=True) != 'spawn':
         mp.set_start_method('spawn', force=True)
 
-# ... (настройка путей без изменений) ...
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..'))
 build_dir = os.path.join(project_root, 'build')
@@ -32,7 +31,6 @@ if build_dir not in sys.path:
 from python_src.model import OFC_CNN_Network
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
-# ... (константы и настройки без изменений) ...
 NUM_FEATURE_CHANNELS = 16
 NUM_SUITS = 4
 NUM_RANKS = 13
@@ -61,11 +59,10 @@ MAX_OPPONENTS_IN_POOL = 20
 
 
 class InferenceWorker(mp.Process):
-    # --- ИЗМЕНЕНИЕ: Конструктор теперь принимает очередь результатов ---
     def __init__(self, name, task_queue, result_queue, log_queue, stop_event):
         super().__init__(name=name)
         self.task_queue = task_queue
-        self.result_queue = result_queue # Это теперь mp.Queue
+        self.result_queue = result_queue
         self.log_queue = log_queue
         self.stop_event = stop_event
         self.latest_model = None
@@ -142,7 +139,6 @@ class InferenceWorker(mp.Process):
         while not self.stop_event.is_set():
             try:
                 try:
-                    # --- ИЗМЕНЕНИЕ: worker_id больше не нужен, C++ его не знает ---
                     req_id, is_policy, infoset, action_vectors = self.task_queue.get(timeout=1)
                 except queue.Empty:
                     self._check_for_updates()
@@ -174,7 +170,6 @@ class InferenceWorker(mp.Process):
                         value = model_to_use(infoset_tensor)
                         result = (req_id, False, [value.item()])
                     
-                    # --- ИЗМЕНЕНИЕ: Кладем результат в общую очередь результатов ---
                     self.result_queue.put(result)
 
             except (KeyboardInterrupt, SystemExit):
@@ -187,7 +182,6 @@ class InferenceWorker(mp.Process):
         
         self._log("Stopped.")
 
-# ... update_opponent_pool без изменений ...
 def update_opponent_pool(model_version):
     if not os.path.exists(MODEL_PATH): return
     state_dict_to_save = torch.load(MODEL_PATH)
@@ -203,14 +197,11 @@ def update_opponent_pool(model_version):
     print(f"Added model version {model_version} to opponent pool.")
 
 
-# --- НОВАЯ ФУНКЦИЯ: Поток-мост для результатов ---
 def result_bridge_thread(result_queue, solver_manager, stop_event):
-    """Перекладывает результаты из mp.Queue в C++ мост."""
     print("[Bridge] Result bridge thread started.")
     while not stop_event.is_set():
         try:
             req_id, is_policy, predictions = result_queue.get(timeout=1)
-            # Передаем результат в C++
             solver_manager.add_result(req_id, (req_id, is_policy, predictions))
         except queue.Empty:
             continue
@@ -249,7 +240,7 @@ def main():
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
     
-    # --- ИЗМЕНЕНИЕ: Используем простые mp.Queue вместо Manager ---
+    # --- ИЗМЕНЕНИЕ: Используем mp.Queue, а не Manager ---
     request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 16)
     result_queue = mp.Queue(maxsize=NUM_INFERENCE_WORKERS * 4)
     log_queue = mp.Queue()
@@ -264,14 +255,15 @@ def main():
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
     solver_manager = SolverManager(
         NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
-        request_queue, log_queue
+        request_queue
     )
     
-    # --- НОВАЯ ЛОГИКА: Запускаем поток-мост ---
     bridge = threading.Thread(target=result_bridge_thread, args=(result_queue, solver_manager, stop_event))
     bridge.start()
 
-    solver_manager.start()
+    # --- ИЗМЕНЕНИЕ: Запускаем C++ потоки в отдельном потоке, чтобы не блокировать основной ---
+    cpp_thread = threading.Thread(target=solver_manager.start)
+    cpp_thread.start()
     print("C++ workers are running in the background.", flush=True)
     
     policy_losses = deque(maxlen=100)
@@ -361,6 +353,7 @@ def main():
         
         print("Stopping C++ workers...", flush=True)
         solver_manager.stop()
+        cpp_thread.join()
         print("C++ workers stopped.")
         
         print("Stopping bridge thread...", flush=True)
