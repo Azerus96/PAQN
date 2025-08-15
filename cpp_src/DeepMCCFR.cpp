@@ -214,7 +214,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         {
             py::gil_scoped_acquire acquire;
             py::object policy_key = py::cast(policy_request_id);
-            if (result_queue_->attr("contains")(policy_key).cast<bool>()) {
+            if (result_queue_->attr("__contains__")(policy_key).cast<bool>()) {
                 py::tuple result_tuple = (*result_queue_)[policy_key].cast<py::tuple>();
                 logits = result_tuple[2].cast<std::vector<float>>();
                 result_queue_->attr("pop")(policy_key);
@@ -224,7 +224,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
 
             if (results_gotten < results_to_get) {
                 py::object value_key = py::cast(value_request_id);
-                if (result_queue_->attr("contains")(value_key).cast<bool>()) {
+                if (result_queue_->attr("__contains__")(value_key).cast<bool>()) {
                     py::tuple result_tuple = (*result_queue_)[value_key].cast<py::tuple>();
                     if (!result_tuple[2].is_none()) {
                         std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
