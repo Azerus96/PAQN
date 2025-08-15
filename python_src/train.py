@@ -47,7 +47,7 @@ NUM_CPP_WORKERS = 40
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
-ACTION_LIMIT = 1000
+ACTION_LIMIT = 100
 LEARNING_RATE = 0.0005
 BUFFER_CAPACITY = 1_000_000
 BATCH_SIZE = 256
