@@ -15,7 +15,6 @@
 
 namespace ofc {
 
-// ... action_to_vector и add_dirichlet_noise без изменений ...
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -54,16 +53,17 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
     }
 }
 
-
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
 
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
-                     RequestCallback request_cb, ResultCallback result_cb) 
+                     InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue,
+                     LogQueue* log_queue) 
     : action_limit_(action_limit),
       policy_buffer_(policy_buffer), 
       value_buffer_(value_buffer),
-      request_cb_(request_cb),
-      result_cb_(result_cb),
+      request_queue_(request_queue),
+      result_queue_(result_queue),
+      log_queue_(log_queue),
       rng_(static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + 
            static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))),
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
@@ -142,140 +142,142 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
 
 
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root, uint64_t traversal_id) {
-    // ВАЖНО: Предполагается, что GIL уже захвачен потоком в worker_loop
-    
-    // --- Блок чисто C++ кода ---
-    {
-        py::gil_scoped_release release;
-        if (state.is_terminal()) {
-            auto payoffs = state.get_payoffs(evaluator_);
-            return {{0, payoffs.first}, {1, payoffs.second}};
-        }
+    if (state.is_terminal()) {
+        auto payoffs = state.get_payoffs(evaluator_);
+        return {{0, payoffs.first}, {1, payoffs.second}};
     }
 
     int current_player = state.get_current_player();
+    
     std::vector<Action> legal_actions;
+    state.get_legal_actions(action_limit_, legal_actions, rng_);
+    
+    int num_actions = legal_actions.size();
     UndoInfo undo_info;
 
-    // --- Блок чисто C++ кода ---
-    {
-        py::gil_scoped_release release;
-        state.get_legal_actions(action_limit_, legal_actions, rng_);
-    }
-    
-    if (legal_actions.empty()) {
-        // --- Блок чисто C++ кода ---
-        {
-            py::gil_scoped_release release;
-            state.apply_action({{}, INVALID_CARD}, traversing_player, undo_info);
-        }
+    if (num_actions == 0) {
+        state.apply_action({{}, INVALID_CARD}, traversing_player, undo_info);
         auto result = traverse(state, traversing_player, false, traversal_id);
-        // --- Блок чисто C++ кода ---
-        {
-            py::gil_scoped_release release;
-            state.undo_action(undo_info, traversing_player);
-        }
+        state.undo_action(undo_info, traversing_player);
         return result;
     }
 
-    std::vector<float> infoset_vec;
+    std::map<int, int> suit_map;
+    GameState canonical_state = state.get_canonical(suit_map);
+    std::vector<float> infoset_vec = featurize_state_cpp(canonical_state, current_player);
+    
     std::vector<std::vector<float>> canonical_action_vectors;
-    // --- Блок чисто C++ кода ---
-    {
-        py::gil_scoped_release release;
-        std::map<int, int> suit_map;
-        GameState canonical_state = state.get_canonical(suit_map);
-        infoset_vec = featurize_state_cpp(canonical_state, current_player);
-        
-        canonical_action_vectors.reserve(legal_actions.size());
-        
-        auto remap_card_safely = [&](Card& card) {
-            if (card == INVALID_CARD) return;
-            auto it = suit_map.find(get_suit(card));
-            if (it != suit_map.end()) {
-                card = get_rank(card) * 4 + it->second;
-            } else {
-                card = INVALID_CARD; 
-            }
-        };
-
-        for (const auto& original_action : legal_actions) {
-            Action canonical_action = original_action;
-            for (auto& placement : canonical_action.first) {
-                remap_card_safely(placement.first);
-            }
-            remap_card_safely(canonical_action.second);
-            canonical_action_vectors.push_back(action_to_vector(canonical_action));
+    canonical_action_vectors.reserve(num_actions);
+    
+    auto remap_card_safely = [&](Card& card) {
+        if (card == INVALID_CARD) return;
+        auto it = suit_map.find(get_suit(card));
+        if (it != suit_map.end()) {
+            card = get_rank(card) * 4 + it->second;
+        } else {
+            card = INVALID_CARD; 
         }
+    };
+
+    for (const auto& original_action : legal_actions) {
+        Action canonical_action = original_action;
+        for (auto& placement : canonical_action.first) {
+            remap_card_safely(placement.first);
+        }
+        remap_card_safely(canonical_action.second);
+        canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
     
     uint64_t policy_request_id = traversal_id * 2;
     uint64_t value_request_id = traversal_id * 2 + 1;
 
-    request_cb_(policy_request_id, true, infoset_vec, canonical_action_vectors);
-    request_cb_(value_request_id, false, infoset_vec, {});
+    {
+        py::gil_scoped_acquire acquire;
+        py::tuple policy_request_tuple = py::make_tuple(
+            policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors)
+        );
+        request_queue_->attr("put")(policy_request_tuple);
 
-    py::tuple policy_result = result_cb_(policy_request_id);
-    py::tuple value_result = result_cb_(value_request_id);
+        py::tuple value_request_tuple = py::make_tuple(
+            value_request_id, false, py::cast(infoset_vec), py::none()
+        );
+        request_queue_->attr("put")(value_request_tuple);
+    }
 
-    std::vector<float> logits = policy_result[2].cast<std::vector<float>>();
+    std::vector<float> logits;
     float value_baseline = 0.0f;
-    if (!value_result[2].is_none()) {
-        std::vector<float> predictions = value_result[2].cast<std::vector<float>>();
-        if (!predictions.empty()) {
-            value_baseline = predictions[0];
+    int results_to_get = 2;
+    int results_gotten = 0;
+
+    while(results_gotten < results_to_get) {
+        bool got_item = false;
+        {
+            py::gil_scoped_acquire acquire;
+            py::object policy_key = py::cast(policy_request_id);
+            if (result_queue_->attr("contains")(policy_key).cast<bool>()) {
+                py::tuple result_tuple = (*result_queue_)[policy_key].cast<py::tuple>();
+                logits = result_tuple[2].cast<std::vector<float>>();
+                result_queue_->attr("pop")(policy_key);
+                results_gotten++;
+                got_item = true;
+            }
+
+            if (results_gotten < results_to_get) {
+                py::object value_key = py::cast(value_request_id);
+                if (result_queue_->attr("contains")(value_key).cast<bool>()) {
+                    py::tuple result_tuple = (*result_queue_)[value_key].cast<py::tuple>();
+                    if (!result_tuple[2].is_none()) {
+                        std::vector<float> predictions = result_tuple[2].cast<std::vector<float>>();
+                        if (!predictions.empty()) {
+                            value_baseline = predictions[0];
+                        }
+                    }
+                    result_queue_->attr("pop")(value_key);
+                    results_gotten++;
+                    got_item = true;
+                }
+            }
+        } 
+
+        if (!got_item) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 
-    int sampled_action_idx;
-    // --- Блок чисто C++ кода ---
-    {
-        py::gil_scoped_release release;
-        int num_actions = legal_actions.size();
-        std::vector<float> strategy(num_actions);
-        if (!logits.empty() && logits.size() == num_actions) {
-            float max_logit = -std::numeric_limits<float>::infinity();
-            for(float l : logits) if(l > max_logit) max_logit = l;
-            float sum_exp = 0.0f;
-            for (int i = 0; i < num_actions; ++i) {
-                strategy[i] = std::exp(logits[i] - max_logit);
-                sum_exp += strategy[i];
-            }
-            if (sum_exp > 1e-6) {
-                for (int i = 0; i < num_actions; ++i) strategy[i] /= sum_exp;
-            } else {
-                std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
-            }
+    std::vector<float> strategy(num_actions);
+    if (!logits.empty() && logits.size() == num_actions) {
+        float max_logit = -std::numeric_limits<float>::infinity();
+        for(float l : logits) if(l > max_logit) max_logit = l;
+        float sum_exp = 0.0f;
+        for (int i = 0; i < num_actions; ++i) {
+            strategy[i] = std::exp(logits[i] - max_logit);
+            sum_exp += strategy[i];
+        }
+        if (sum_exp > 1e-6) {
+            for (int i = 0; i < num_actions; ++i) strategy[i] /= sum_exp;
         } else {
             std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
         }
-
-        if (is_root) {
-            add_dirichlet_noise(strategy, 0.3f, rng_);
-        }
-
-        std::discrete_distribution<int> dist(strategy.begin(), strategy.end());
-        sampled_action_idx = dist(rng_);
-        state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
+    } else {
+        std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
     }
 
+    if (is_root) {
+        add_dirichlet_noise(strategy, 0.3f, rng_);
+    }
+
+    std::discrete_distribution<int> dist(strategy.begin(), strategy.end());
+    int sampled_action_idx = dist(rng_);
+
+    state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
     auto action_payoffs = traverse(state, traversing_player, false, traversal_id);
-    
-    // --- Блок чисто C++ кода ---
-    {
-        py::gil_scoped_release release;
-        state.undo_action(undo_info, traversing_player);
-    }
+    state.undo_action(undo_info, traversing_player);
 
-    // --- Блок чисто C++ кода (кроме push, который внутри себя лочит GIL) ---
-    {
-        py::gil_scoped_release release;
-        auto it = action_payoffs.find(current_player);
-        if (it != action_payoffs.end()) {
-            float advantage = it->second - value_baseline;
-            policy_buffer_->push(infoset_vec, canonical_action_vectors[sampled_action_idx], advantage);
-            value_buffer_->push(infoset_vec, dummy_action_vec_, it->second);
-        }
+    auto it = action_payoffs.find(current_player);
+    if (it != action_payoffs.end()) {
+        float advantage = it->second - value_baseline;
+        policy_buffer_->push(infoset_vec, canonical_action_vectors[sampled_action_idx], advantage);
+        value_buffer_->push(infoset_vec, dummy_action_vec_, it->second);
     }
     return action_payoffs;
 }
