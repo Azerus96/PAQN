@@ -12,6 +12,8 @@ import multiprocessing as mp
 import queue
 import random
 import glob
+import subprocess
+import shutil
 
 if __name__ == '__main__':
     if mp.get_start_method(allow_none=True) != 'spawn':
@@ -30,11 +32,13 @@ if build_dir not in sys.path:
 from python_src.model import OFC_CNN_Network
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
+# --- КОНСТАНТЫ ---
 NUM_FEATURE_CHANNELS = 16
 NUM_SUITS = 4
 NUM_RANKS = 13
 INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 
+# --- НАСТРОЙКИ ---
 TOTAL_CPUS = os.cpu_count() or 88
 RESERVED_CPUS = 4
 NUM_INFERENCE_WORKERS = 30
@@ -42,22 +46,74 @@ NUM_CPP_WORKERS = 40
 
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
-ACTION_LIMIT = 4
+# --- ГИПЕРПАРАМЕТРЫ ---
+ACTION_LIMIT = 1000
 LEARNING_RATE = 0.0005
 BUFFER_CAPACITY = 1_000_000
-# --- ИЗМЕНЕНИЕ №1: Увеличены параметры для стабильного старта ---
 BATCH_SIZE = 256
 MIN_BUFFER_FILL_SAMPLES = 50000
 
+# --- ПУТИ И ИНТЕРВАЛЫ ---
 STATS_INTERVAL_SECONDS = 15
-SAVE_INTERVAL_SECONDS = 300
-MODEL_DIR = "/content/models"
-MODEL_PATH = os.path.join(MODEL_DIR, "paqn_model_latest.pth")
-VERSION_FILE = os.path.join(MODEL_DIR, "latest_version.txt")
-OPPONENT_POOL_DIR = os.path.join(MODEL_DIR, "opponent_pool")
+# ИЗМЕНЕНИЕ: Разделяем интервалы
+LOCAL_SAVE_INTERVAL_SECONDS = 300  # 5 минут для локального сохранения
+GIT_PUSH_INTERVAL_SECONDS = 600    # 10 минут для пуша на GitHub
+
+# ИЗМЕНЕНИЕ: Локальные модели хранятся в отдельной папке, не отслеживаемой Git
+LOCAL_MODEL_DIR = "/content/local_models"
+MODEL_PATH = os.path.join(LOCAL_MODEL_DIR, "paqn_model_latest.pth")
+VERSION_FILE = os.path.join(LOCAL_MODEL_DIR, "latest_version.txt")
+OPPONENT_POOL_DIR = os.path.join(LOCAL_MODEL_DIR, "opponent_pool")
 MAX_OPPONENTS_IN_POOL = 20
 
+# Пути к файлам в репозитории для синхронизации с Git
+GIT_MODEL_PATH = os.path.join(project_root, "paqn_model_latest.pth")
 
+# --- НАСТРОЙКИ GIT ---
+GIT_REPO_OWNER = "Azerus96"
+GIT_REPO_NAME = "PAQN"
+GIT_BRANCH = "main"
+
+# --- GIT HELPER FUNCTIONS ---
+def run_git_command(command, repo_path):
+    try:
+        result = subprocess.run(command, cwd=repo_path, check=True, capture_output=True, text=True, timeout=120)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Git command failed: {' '.join(command)}\nError: {e.stderr}")
+        return False
+    except subprocess.TimeoutExpired:
+        print(f"Git command timed out: {' '.join(command)}")
+        return False
+
+def git_push(commit_message, repo_path, auth_repo_url):
+    print(f"\n--- Attempting to push to GitHub: '{commit_message}' ---")
+    
+    # Копируем последнюю локальную модель в репозиторий для пуша
+    if os.path.exists(MODEL_PATH):
+        shutil.copy2(MODEL_PATH, GIT_MODEL_PATH)
+        print(f"Copied {MODEL_PATH} to {GIT_MODEL_PATH} for pushing.")
+    else:
+        print("No local model to push.")
+        return
+
+    if not run_git_command(["git", "add", GIT_MODEL_PATH], repo_path): return
+    
+    status_result = subprocess.run(["git", "status", "--porcelain"], cwd=repo_path, capture_output=True, text=True)
+    if not status_result.stdout.strip():
+        print("No changes to commit.")
+        return
+
+    if not run_git_command(["git", "commit", "-m", commit_message], repo_path): return
+    if not run_git_command(["git", "push", auth_repo_url, f"HEAD:{GIT_BRANCH}"], repo_path): return
+    print("--- Push successful ---")
+
+def git_pull(repo_path, auth_repo_url):
+    print("\n--- Pulling latest model from GitHub ---")
+    if not run_git_command(["git", "pull", auth_repo_url, GIT_BRANCH], repo_path):
+        print("Git pull failed. Continuing with local version if available.")
+
+# ... Класс InferenceWorker остается БЕЗ ИЗМЕНЕНИЙ ...
 class InferenceWorker(mp.Process):
     def __init__(self, name, task_queue, result_dict, log_queue, stop_event):
         super().__init__(name=name)
@@ -69,7 +125,6 @@ class InferenceWorker(mp.Process):
         self.opponent_model = None
         self.device = None
         self.opponent_pool_files = []
-        # --- ИЗМЕНЕНИЕ №2: Добавлены атрибуты для отслеживания версий ---
         self.model_version = -1
         self.last_version_check_time = 0
         self.request_counter = 0
@@ -112,7 +167,6 @@ class InferenceWorker(mp.Process):
             self._log(f"!!! FAILED to load models: {e}")
             traceback.print_exc()
 
-    # --- ИЗМЕНЕНИЕ №2: Добавлен метод для проверки обновлений ---
     def _check_for_updates(self):
         self.request_counter += 1
         if self.request_counter % 100 != 0 and time.time() - self.last_version_check_time < 5:
@@ -200,8 +254,29 @@ def update_opponent_pool(model_version):
 
 
 def main():
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    # --- АУТЕНТИФИКАЦИЯ И НАСТРОЙКА GIT ---
+    git_username = os.environ.get('GIT_USERNAME')
+    git_token = os.environ.get('GIT_TOKEN')
+
+    if not git_username or not git_token:
+        print("ERROR: GIT_USERNAME and GIT_TOKEN environment variables must be set.")
+        sys.exit(1)
+        
+    auth_repo_url = f"https://{git_username}:{git_token}@github.com/{GIT_REPO_OWNER}/{GIT_REPO_NAME}.git"
+    
+    run_git_command(["git", "config", "--global", "user.email", f"{git_username}@users.noreply.github.com"], project_root)
+    run_git_command(["git", "config", "--global", "user.name", git_username], project_root)
+    
+    git_pull(project_root, auth_repo_url)
+    
+    # Создаем локальные директории
+    os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
     os.makedirs(OPPONENT_POOL_DIR, exist_ok=True)
+
+    # Копируем модель из Git в локальную директорию, если она есть
+    if os.path.exists(GIT_MODEL_PATH) and not os.path.exists(MODEL_PATH):
+        print(f"Copying model from Git repo to local directory: {GIT_MODEL_PATH} -> {MODEL_PATH}")
+        shutil.copy2(GIT_MODEL_PATH, MODEL_PATH)
     
     print("Initializing C++ hand evaluator lookup tables...", flush=True)
     initialize_evaluator()
@@ -215,7 +290,7 @@ def main():
     if os.path.exists(MODEL_PATH):
         try:
             model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-            print("Loaded latest model from:", MODEL_PATH)
+            print("Loaded latest model from local path:", MODEL_PATH)
             if os.path.exists(VERSION_FILE):
                 with open(VERSION_FILE, 'r') as f:
                     model_version = int(f.read())
@@ -253,7 +328,8 @@ def main():
     policy_losses = deque(maxlen=100)
     value_losses = deque(maxlen=100)
     last_stats_time = time.time()
-    last_save_time = time.time()
+    last_local_save_time = time.time()
+    last_git_push_time = time.time()
     
     STREET_START_IDX = 9
     STREET_END_IDX = 14
@@ -320,14 +396,18 @@ def main():
             model.eval()
 
             now = time.time()
-            if now - last_save_time > SAVE_INTERVAL_SECONDS:
-                print("\n--- Saving models and updating opponent pool ---", flush=True)
+            if now - last_local_save_time > LOCAL_SAVE_INTERVAL_SECONDS:
+                print("\n--- Saving models locally and updating opponent pool ---", flush=True)
                 torch.save(model.state_dict(), MODEL_PATH)
                 model_version += 1
                 with open(VERSION_FILE, 'w') as f:
                     f.write(str(model_version))
                 update_opponent_pool(model_version)
-                last_save_time = now
+                last_local_save_time = now
+            
+            if now - last_git_push_time > GIT_PUSH_INTERVAL_SECONDS:
+                git_push(f"Periodic model save v{model_version}", project_root, auth_repo_url)
+                last_git_push_time = now
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.", flush=True)
@@ -348,7 +428,9 @@ def main():
         print("All Python workers stopped.")
         
         print("Final model saving...", flush=True)
-        torch.save(model.state_dict(), os.path.join(MODEL_DIR, "paqn_model_final.pth"))
+        torch.save(model.state_dict(), MODEL_PATH)
+        git_push(f"Final model save v{model_version} on exit", project_root, auth_repo_url)
+        
         print("Training finished.")
 
 if __name__ == "__main__":
