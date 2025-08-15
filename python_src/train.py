@@ -12,7 +12,6 @@ import multiprocessing as mp
 import queue
 import random
 import glob
-import threading
 
 if __name__ == '__main__':
     if mp.get_start_method(allow_none=True) != 'spawn':
@@ -46,6 +45,7 @@ print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Py
 ACTION_LIMIT = 4
 LEARNING_RATE = 0.0005
 BUFFER_CAPACITY = 1_000_000
+# --- ИЗМЕНЕНИЕ №1: Увеличены параметры для стабильного старта ---
 BATCH_SIZE = 256
 MIN_BUFFER_FILL_SAMPLES = 50000
 
@@ -59,16 +59,17 @@ MAX_OPPONENTS_IN_POOL = 20
 
 
 class InferenceWorker(mp.Process):
-    def __init__(self, name, task_queue, result_queue, log_queue, stop_event):
+    def __init__(self, name, task_queue, result_dict, log_queue, stop_event):
         super().__init__(name=name)
         self.task_queue = task_queue
-        self.result_queue = result_queue
+        self.result_dict = result_dict
         self.log_queue = log_queue
         self.stop_event = stop_event
         self.latest_model = None
         self.opponent_model = None
         self.device = None
         self.opponent_pool_files = []
+        # --- ИЗМЕНЕНИЕ №2: Добавлены атрибуты для отслеживания версий ---
         self.model_version = -1
         self.last_version_check_time = 0
         self.request_counter = 0
@@ -111,6 +112,7 @@ class InferenceWorker(mp.Process):
             self._log(f"!!! FAILED to load models: {e}")
             traceback.print_exc()
 
+    # --- ИЗМЕНЕНИЕ №2: Добавлен метод для проверки обновлений ---
     def _check_for_updates(self):
         self.request_counter += 1
         if self.request_counter % 100 != 0 and time.time() - self.last_version_check_time < 5:
@@ -170,7 +172,7 @@ class InferenceWorker(mp.Process):
                         value = model_to_use(infoset_tensor)
                         result = (req_id, False, [value.item()])
                     
-                    self.result_queue.put(result)
+                    self.result_dict[req_id] = result
 
             except (KeyboardInterrupt, SystemExit):
                 break
@@ -195,19 +197,6 @@ def update_opponent_pool(model_version):
     new_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"paqn_model_v{model_version}.pth")
     torch.save(state_dict_to_save, new_opponent_path)
     print(f"Added model version {model_version} to opponent pool.")
-
-
-def result_bridge_thread(result_queue, solver_manager, stop_event):
-    print("[Bridge] Result bridge thread started.")
-    while not stop_event.is_set():
-        try:
-            req_id, is_policy, predictions = result_queue.get(timeout=1)
-            solver_manager.add_result(req_id, (req_id, is_policy, predictions))
-        except queue.Empty:
-            continue
-        except (KeyboardInterrupt, SystemExit):
-            break
-    print("[Bridge] Result bridge thread stopped.")
 
 
 def main():
@@ -240,30 +229,25 @@ def main():
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
     
-    # --- ИЗМЕНЕНИЕ: Используем mp.Queue, а не Manager ---
-    request_queue = mp.Queue(maxsize=NUM_CPP_WORKERS * 16)
-    result_queue = mp.Queue(maxsize=NUM_INFERENCE_WORKERS * 4)
-    log_queue = mp.Queue()
+    manager = mp.Manager()
+    request_queue = manager.Queue(maxsize=NUM_CPP_WORKERS * 16)
+    result_dict = manager.dict()
+    log_queue = manager.Queue()
     stop_event = mp.Event()
 
     inference_workers = []
     for i in range(NUM_INFERENCE_WORKERS):
-        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_queue, log_queue, stop_event)
+        worker = InferenceWorker(f"InferenceWorker-{i}", request_queue, result_dict, log_queue, stop_event)
         worker.start()
         inference_workers.append(worker)
 
     print(f"Creating C++ SolverManager with {NUM_CPP_WORKERS} workers...", flush=True)
     solver_manager = SolverManager(
         NUM_CPP_WORKERS, ACTION_LIMIT, policy_buffer, value_buffer,
-        request_queue
+        request_queue, result_dict, log_queue
     )
     
-    bridge = threading.Thread(target=result_bridge_thread, args=(result_queue, solver_manager, stop_event))
-    bridge.start()
-
-    # --- ИЗМЕНЕНИЕ: Запускаем C++ потоки в отдельном потоке, чтобы не блокировать основной ---
-    cpp_thread = threading.Thread(target=solver_manager.start)
-    cpp_thread.start()
+    solver_manager.start()
     print("C++ workers are running in the background.", flush=True)
     
     policy_losses = deque(maxlen=100)
@@ -279,7 +263,7 @@ def main():
             if time.time() - last_stats_time > STATS_INTERVAL_SECONDS:
                 while not log_queue.empty():
                     try:
-                        print(log_queue.get_nowait(), flush=True)
+                        print(log_queue.get(timeout=0.01), flush=True)
                     except queue.Empty:
                         break
                 
@@ -294,7 +278,7 @@ def main():
                 print(f"Buffer Fill -> Policy: {policy_buffer.size():,}/{BUFFER_CAPACITY:,} ({policy_buffer.size()/BUFFER_CAPACITY:.1%}) "
                       f"| Value: {value_buffer.size():,}/{BUFFER_CAPACITY:,} ({value_buffer.size()/BUFFER_CAPACITY:.1%})", flush=True)
                 print(f"Avg Losses (last 100) -> Policy: {avg_p_loss:.6f} | Value: {avg_v_loss:.6f}", flush=True)
-                print(f"Request Queue: {request_queue.qsize()} | Result Queue: {result_queue.qsize()}", flush=True)
+                print(f"Request Queue: {request_queue.qsize()} | Result Dict: {len(result_dict)}", flush=True)
                 print("="*54, flush=True)
                 last_stats_time = time.time()
 
@@ -353,12 +337,7 @@ def main():
         
         print("Stopping C++ workers...", flush=True)
         solver_manager.stop()
-        cpp_thread.join()
         print("C++ workers stopped.")
-        
-        print("Stopping bridge thread...", flush=True)
-        bridge.join()
-        print("Bridge thread stopped.")
         
         print("Stopping Python workers...", flush=True)
         for worker in inference_workers:
