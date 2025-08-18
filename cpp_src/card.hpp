@@ -5,7 +5,7 @@
 #include <array>
 #include <stdexcept>
 #include <algorithm>
-#include <tuple> // <-- Добавить
+#include <tuple> // <-- ВАЖНО: Добавить этот заголовок
 
 namespace ofc {
 
@@ -18,7 +18,8 @@ namespace ofc {
     using Placement = std::pair<Card, std::pair<std::string, int>>;
     using Action = std::pair<std::vector<Placement>, Card>;
 
-    // --- ДОБАВЛЕНИЕ: Операторы сравнения для Action ---
+    // --- ИСПРАВЛЕНИЕ: Добавляем операторы сравнения для Action и Placement ---
+    // Это необходимо для std::sort и std::unique, чтобы корректно удалять дубликаты.
     inline bool operator<(const Placement& a, const Placement& b) {
         return std::tie(a.first, a.second.first, a.second.second) < std::tie(b.first, b.second.first, b.second.second);
     }
@@ -28,13 +29,14 @@ namespace ofc {
     }
 
     inline bool operator<(const Action& a, const Action& b) {
+        // Сначала сравниваем векторы расстановок, потом карту сброса
         return std::tie(a.first, a.second) < std::tie(b.first, b.second);
     }
 
     inline bool operator==(const Action& a, const Action& b) {
-        return std::tie(a.first, a.second) == std::tie(b.first, b.second);
+        return a.first == b.first && a.second == b.second;
     }
-    // --- КОНЕЦ ДОБАВЛЕНИЯ ---
+    // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
     inline int get_rank(Card c) { return c / 4; }
     inline int get_suit(Card c) { return c % 4; }
