@@ -209,7 +209,22 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     int results_to_get = 2;
     int results_gotten = 0;
 
+    // --- ИЗМЕНЕНИЕ: Добавляем таймаут для защиты от дедлоков ---
+    auto start_time = std::chrono::steady_clock::now();
+    const auto timeout = std::chrono::seconds(30);
+
     while(results_gotten < results_to_get) {
+        if (std::chrono::steady_clock::now() - start_time > timeout) {
+            {
+                py::gil_scoped_acquire acquire;
+                std::stringstream ss;
+                ss << "[C++ WORKER TIMEOUT] Waiting for inference results timed out. Req IDs: " 
+                   << policy_request_id << ", " << value_request_id;
+                log_queue_->attr("put")(py::str(ss.str()));
+            }
+            return {{0, 0.0f}, {1, 0.0f}}; // Возвращаем нейтральный результат
+        }
+
         bool got_item = false;
         {
             py::gil_scoped_acquire acquire;
@@ -240,7 +255,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         } 
 
         if (!got_item) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5)); // Увеличиваем сон
         }
     }
 
