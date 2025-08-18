@@ -136,19 +136,26 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def(py::init<uint64_t>(), py::arg("capacity"))
         .def("size", &ofc::SharedReplayBuffer::size)
         .def("total_generated", &ofc::SharedReplayBuffer::total_generated)
+        // --- ИЗМЕНЕНИЕ: Безопасный биндинг для sample с правильным использованием GIL ---
         .def("sample", [](ofc::SharedReplayBuffer &buffer, int batch_size) -> py::object {
             auto infosets_np = py::array_t<float>({batch_size, ofc::INFOSET_SIZE});
-            auto actions_np = py::array_t<float>({batch_size, ofc::ACTION_VECTOR_SIZE});
-            auto targets_np = py::array_t<float>({batch_size});
-            
-            bool success;
+            auto actions_np  = py::array_t<float>({batch_size, ofc::ACTION_VECTOR_SIZE});
+            auto targets_np  = py::array_t<float>({batch_size});
+
+            // Получаем сырые указатели, пока GIL удерживается
+            auto infos_bi = infosets_np.request();
+            auto act_bi   = actions_np.request();
+            auto targ_bi  = targets_np.request();
+
+            bool success = false;
             {
+                // Отпускаем GIL только на время копирования данных в C++
                 py::gil_scoped_release release;
-                success = buffer.sample(
-                    batch_size, 
-                    infosets_np,
-                    actions_np,
-                    targets_np
+                success = buffer.sample_to_ptr(
+                    batch_size,
+                    static_cast<float*>(infos_bi.ptr),
+                    static_cast<float*>(act_bi.ptr),
+                    static_cast<float*>(targ_bi.ptr)
                 );
             }
 
@@ -156,7 +163,7 @@ PYBIND11_MODULE(ofc_engine, m) {
                 return py::none();
             }
             
-            return py::cast(std::make_tuple(infosets_np, actions_np, targets_np));
+            return py::make_tuple(infosets_np, actions_np, targets_np);
         }, py::arg("batch_size"), "Samples a batch from the buffer.");
         
     py::class_<PySolverManager>(m, "SolverManager")
