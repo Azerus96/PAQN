@@ -6,26 +6,18 @@
 #include "Hand.h"
 #include <cstdint>
 #include <cassert>
+#include <mutex> // Для потокобезопасной инициализации
 
 namespace omp {
 
-// Evaluates hands with any number of cards up to 7.
 class HandEvaluator
 {
 public:
-    // ИЗМЕНЕНО: Добавлена функция для явной инициализации
-    static void initialize() {
-        if (!is_initialized) {
-            staticInit();
-            is_initialized = true;
-        }
-    }
+    // --- ИЗМЕНЕНИЕ: Явная, потокобезопасная функция инициализации ---
+    static void initialize();
 
     HandEvaluator();
 
-    // Returns the rank of a hand as a 16-bit integer. Higher value is better. Can also rank hands with less than 5
-    // cards. A missing card is considered the worst kicker, e.g. K < KQJT8 < A < AK < KKAQJ < AA < AA2 < AA4 < AA432.
-    // Hand category can be extracted by dividing the value by 4096. 1=highcard, 2=pair, etc.
     template<bool tFlushPossible = true>
     OMP_FORCE_INLINE uint16_t evaluate(const Hand& hand) const
     {
@@ -41,8 +33,9 @@ public:
     }
 
 private:
-    // ИЗМЕНЕНО: Добавлен статический флаг для отслеживания инициализации
+    // --- ИЗМЕНЕНИЕ: Статические члены для управления инициализацией ---
     static bool is_initialized;
+    static std::mutex init_mutex;
 
     static unsigned perfHash(unsigned key)
     {
@@ -50,7 +43,6 @@ private:
         return key + PERF_HASH_ROW_OFFSETS[key >> PERF_HASH_ROW_SHIFT];
     }
 
-    static bool cardInit;
     static void initCardConstants();
     static void staticInit();
     static void calculatePerfectHashOffsets();
@@ -60,29 +52,18 @@ private:
     static unsigned getBiggestStraight(uint64_t rankCounts);
     static void outputTableStats(const char* name, const void* p, size_t elementSize, size_t count);
 
-    // Rank multipliers for non-flush and flush hands.
     static const unsigned RANKS[RANK_COUNT];
     static const unsigned FLUSH_RANKS[RANK_COUNT];
-
-    // Turn on to recalculate and output the offset array.
     static const bool RECALCULATE_PERF_HASH_OFFSETS = false;
-
-    // Determines in how many rows the original lookup table is divided (2^shift). More rows means slightly smaller
-    // lookup table but much bigger offset table.
     static const unsigned PERF_HASH_ROW_SHIFT = 12;
     static const unsigned PERF_HASH_COLUMN_MASK = (1 << PERF_HASH_ROW_SHIFT) - 1;
-
-    // Minimum number of cards required for evaluating a hand. Can be set to higher value to decrease lookup
-    // table size (requires hash recalculation).
     static const unsigned MIN_CARDS = 0;
-
-    // Lookup tables
     static const unsigned MAX_KEY;
     static const size_t FLUSH_LOOKUP_SIZE = 8192;
     static uint16_t* ORIG_LOOKUP;
-    static uint16_t LOOKUP[86547 + RECALCULATE_PERF_HASH_OFFSETS * 100000000];
+    static uint16_t LOOKUP[]; // Размер определяется в .hxx
     static uint16_t FLUSH_LOOKUP[FLUSH_LOOKUP_SIZE];
-    static uint32_t PERF_HASH_ROW_OFFSETS[8191 + RECALCULATE_PERF_HASH_OFFSETS * 100000];
+    static uint32_t PERF_HASH_ROW_OFFSETS[]; // Размер определяется в .hxx
 };
 
 }
