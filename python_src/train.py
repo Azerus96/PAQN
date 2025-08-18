@@ -56,8 +56,8 @@ INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 
 # --- НАСТРОЙКИ ---
 # Возвращаем к исходным значениям, т.к. проблема не в количестве, а в управлении потоками
-NUM_INFERENCE_WORKERS = 8
-NUM_CPP_WORKERS = 16
+NUM_INFERENCE_WORKERS = 24
+NUM_CPP_WORKERS = 48
 
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
@@ -65,7 +65,7 @@ print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Py
 ACTION_LIMIT = 100
 LEARNING_RATE = 0.0005
 BUFFER_CAPACITY = 1_000_000
-BATCH_SIZE = 256
+BATCH_SIZE = 512
 MIN_BUFFER_FILL_SAMPLES = 50000
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
