@@ -102,16 +102,13 @@ namespace ofc {
             for (int i = 0; i < k; ++i) {
                 placement.push_back({cards_to_place[i], available_slots[current_indices[i]]});
             }
-            std::sort(placement.begin(), placement.end(), 
-                [](const Placement& a, const Placement& b){
-                    if (a.second.first != b.second.first) return a.second.first < b.second.first;
-                    return a.second.second < b.second.second;
-            });
+            // --- ИСПРАВЛЕНИЕ: Сортируем placement для канонического вида ---
+            std::sort(placement.begin(), placement.end());
             out_actions.push_back({placement, discarded});
             return;
         }
 
-        if (start_idx >= available_slots.size()) return;
+        if (start_idx >= (int)available_slots.size()) return;
 
         for (size_t i = start_idx; i < available_slots.size(); ++i) {
             current_indices.push_back(i);
@@ -146,11 +143,8 @@ namespace ofc {
                 current_placement.push_back({temp_cards[j], temp_slots[j]});
             }
             
-            std::sort(current_placement.begin(), current_placement.end(), 
-                [](const Placement& a, const Placement& b){
-                    if (a.second.first != b.second.first) return a.second.first < b.second.first;
-                    return a.second.second < b.second.second;
-            });
+            // --- ИСПРАВЛЕНИЕ: Сортируем placement для канонического вида ---
+            std::sort(current_placement.begin(), current_placement.end());
 
             actions.push_back({current_placement, discarded});
         }
@@ -180,15 +174,16 @@ namespace ofc {
         } else { 
             CardSet cards_to_place = dealt_cards_;
             generate_random_placements(cards_to_place, INVALID_CARD, out_actions, action_limit, rng);
-            
-            // --- ИЗМЕНЕНИЕ: Замена std::set на std::sort + std::unique ---
-            std::sort(out_actions.begin(), out_actions.end());
-            out_actions.erase(std::unique(out_actions.begin(), out_actions.end()), out_actions.end());
+        }
+        
+        // --- ИСПРАВЛЕНИЕ: Используем std::sort + std::unique для удаления дубликатов ---
+        // Это требует наличия operator< и operator== для Action, которые мы добавили в card.hpp
+        std::sort(out_actions.begin(), out_actions.end());
+        out_actions.erase(std::unique(out_actions.begin(), out_actions.end()), out_actions.end());
 
-            if (action_limit > 0 && out_actions.size() > action_limit) {
-                std::shuffle(out_actions.begin(), out_actions.end(), rng);
-                out_actions.resize(action_limit);
-            }
+        if (action_limit > 0 && out_actions.size() > action_limit) {
+            std::shuffle(out_actions.begin(), out_actions.end(), rng);
+            out_actions.resize(action_limit);
         }
     }
 
@@ -229,7 +224,9 @@ namespace ofc {
         int player_who_acted = undo_info.prev_current_player;
         current_player_ = player_who_acted;
 
+        // Восстанавливаем карты в колоду из dealt_cards_ *после* хода
         deck_.insert(deck_.end(), dealt_cards_.begin(), dealt_cards_.end());
+        // Восстанавливаем dealt_cards_ в состояние *до* хода
         dealt_cards_ = undo_info.dealt_cards_before_action;
 
         const auto& placements = undo_info.action.first;
