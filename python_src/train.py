@@ -147,25 +147,49 @@ class InferenceWorker(mp.Process):
         self.opponent_model.eval()
 
     def _load_models(self):
+        # --- ИЗМЕНЕНИЕ: Добавляем отказоустойчивость при загрузке моделей ---
+        # Загрузка основной модели
         try:
             if os.path.exists(MODEL_PATH):
-                self.latest_model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
-                self._log(f"Loaded latest model (version {self.model_version}).")
+                for attempt in range(3):
+                    try:
+                        self.latest_model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
+                        self._log(f"Loaded latest model (version {self.model_version}).")
+                        break
+                    except Exception as e:
+                        self._log(f"Attempt {attempt+1} to load latest model failed: {e}. Retrying in 0.1s...")
+                        time.sleep(0.1)
+                else:
+                    self._log(f"!!! CRITICAL: FAILED to load latest model after 3 attempts. Continuing with old version.")
             else:
                 self._log("No latest model found, using initialized weights.")
+        except Exception as e:
+            self._log(f"!!! UNEXPECTED EXCEPTION during latest model loading: {e}")
+            traceback.print_exc()
 
+        # Загрузка модели оппонента
+        try:
             self.opponent_pool_files = glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth"))
             if self.opponent_pool_files:
                 opponent_path = random.choice(self.opponent_pool_files)
-                self.opponent_model.load_state_dict(torch.load(opponent_path, map_location=self.device))
-                self._log(f"Loaded opponent model: {os.path.basename(opponent_path)}")
+                for attempt in range(3):
+                    try:
+                        self.opponent_model.load_state_dict(torch.load(opponent_path, map_location=self.device))
+                        self._log(f"Loaded opponent model: {os.path.basename(opponent_path)}")
+                        break
+                    except Exception as e:
+                        self._log(f"Attempt {attempt+1} to load opponent model failed: {e}. Retrying in 0.1s...")
+                        time.sleep(0.1)
+                else:
+                    self._log(f"!!! CRITICAL: FAILED to load opponent model. Using latest model as opponent.")
+                    self.opponent_model.load_state_dict(self.latest_model.state_dict())
             else:
                 self.opponent_model.load_state_dict(self.latest_model.state_dict())
                 self._log("Opponent pool is empty, using latest model as opponent.")
-
         except Exception as e:
-            self._log(f"!!! FAILED to load models: {e}")
+            self._log(f"!!! UNEXPECTED EXCEPTION during opponent model loading: {e}")
             traceback.print_exc()
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     def _check_for_updates(self):
         self.request_counter += 1
@@ -240,17 +264,31 @@ class InferenceWorker(mp.Process):
 
 def update_opponent_pool(model_version):
     if not os.path.exists(MODEL_PATH): return
-    state_dict_to_save = torch.load(MODEL_PATH)
     
     os.makedirs(OPPONENT_POOL_DIR, exist_ok=True)
+    
+    # --- ИЗМЕНЕНИЕ: Безопасное копирование в пул оппонентов ---
+    temp_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"temp_paqn_model_v{model_version}.pth")
+    new_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"paqn_model_v{model_version}.pth")
+    
+    try:
+        shutil.copy2(MODEL_PATH, temp_opponent_path)
+        os.rename(temp_opponent_path, new_opponent_path)
+        print(f"Added model version {model_version} to opponent pool.")
+    except Exception as e:
+        print(f"Error updating opponent pool: {e}")
+        if os.path.exists(temp_opponent_path):
+            os.remove(temp_opponent_path)
+        return # Не продолжаем, если не удалось скопировать
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
     pool_files = sorted(glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth")), key=os.path.getmtime)
     
     while len(pool_files) >= MAX_OPPONENTS_IN_POOL:
-        os.remove(pool_files.pop(0))
-        
-    new_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"paqn_model_v{model_version}.pth")
-    torch.save(state_dict_to_save, new_opponent_path)
-    print(f"Added model version {model_version} to opponent pool.")
+        try:
+            os.remove(pool_files.pop(0))
+        except OSError as e:
+            print(f"Warning: Could not remove old opponent file: {e}")
 
 
 def main():
@@ -398,7 +436,13 @@ def main():
             now = time.time()
             if now - last_local_save_time > LOCAL_SAVE_INTERVAL_SECONDS:
                 print("\n--- Saving models locally and updating opponent pool ---", flush=True)
-                torch.save(model.state_dict(), MODEL_PATH)
+                
+                # --- ИЗМЕНЕНИЕ: Атомарное сохранение модели ---
+                temp_model_path = MODEL_PATH + ".tmp"
+                torch.save(model.state_dict(), temp_model_path)
+                os.rename(temp_model_path, MODEL_PATH)
+                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
                 model_version += 1
                 with open(VERSION_FILE, 'w') as f:
                     f.write(str(model_version))
@@ -428,7 +472,11 @@ def main():
         print("All Python workers stopped.")
         
         print("Final model saving...", flush=True)
-        torch.save(model.state_dict(), MODEL_PATH)
+        # --- ИЗМЕНЕНИЕ: Атомарное сохранение модели при выходе ---
+        temp_model_path = MODEL_PATH + ".tmp"
+        torch.save(model.state_dict(), temp_model_path)
+        os.rename(temp_model_path, MODEL_PATH)
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         git_push(f"Final model save v{model_version} on exit", project_root, auth_repo_url)
         
         print("Training finished.")
