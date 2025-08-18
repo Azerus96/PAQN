@@ -1,7 +1,20 @@
+# --- ШАГ 0: УСТАНОВКА ЛИМИТОВ ПОТОКОВ ДО ВСЕХ ИМПОРТОВ ---
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("OMP_DYNAMIC", "FALSE")
+os.environ.setdefault("OMP_MAX_ACTIVE_LEVELS", "1")
+os.environ.setdefault("PYTHONFAULTHANDLER", "1")
+
 import sys
 import time
 import torch
+# --- УСТАНОВКА ЛИМИТОВ ПОТОКОВ ДЛЯ PYTORCH ---
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
@@ -14,6 +27,9 @@ import random
 import glob
 import subprocess
 import shutil
+import gc
+import psutil
+import threading
 
 if __name__ == '__main__':
     if mp.get_start_method(allow_none=True) != 'spawn':
@@ -39,10 +55,9 @@ NUM_RANKS = 13
 INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 
 # --- НАСТРОЙКИ ---
-TOTAL_CPUS = os.cpu_count() or 88
-RESERVED_CPUS = 4
-NUM_INFERENCE_WORKERS = 16
-NUM_CPP_WORKERS = 32
+# Возвращаем к исходным значениям, т.к. проблема не в количестве, а в управлении потоками
+NUM_INFERENCE_WORKERS = 8
+NUM_CPP_WORKERS = 16
 
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
@@ -55,18 +70,15 @@ MIN_BUFFER_FILL_SAMPLES = 50000
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
 STATS_INTERVAL_SECONDS = 15
-# ИЗМЕНЕНИЕ: Разделяем интервалы
-LOCAL_SAVE_INTERVAL_SECONDS = 300  # 5 минут для локального сохранения
-GIT_PUSH_INTERVAL_SECONDS = 600    # 10 минут для пуша на GitHub
+LOCAL_SAVE_INTERVAL_SECONDS = 300
+GIT_PUSH_INTERVAL_SECONDS = 600
 
-# ИЗМЕНЕНИЕ: Локальные модели хранятся в отдельной папке, не отслеживаемой Git
 LOCAL_MODEL_DIR = "/content/local_models"
 MODEL_PATH = os.path.join(LOCAL_MODEL_DIR, "paqn_model_latest.pth")
 VERSION_FILE = os.path.join(LOCAL_MODEL_DIR, "latest_version.txt")
 OPPONENT_POOL_DIR = os.path.join(LOCAL_MODEL_DIR, "opponent_pool")
 MAX_OPPONENTS_IN_POOL = 20
 
-# Пути к файлам в репозитории для синхронизации с Git
 GIT_MODEL_PATH = os.path.join(project_root, "paqn_model_latest.pth")
 
 # --- НАСТРОЙКИ GIT ---
@@ -74,7 +86,7 @@ GIT_REPO_OWNER = "Azerus96"
 GIT_REPO_NAME = "PAQN"
 GIT_BRANCH = "main"
 
-# --- GIT HELPER FUNCTIONS ---
+# --- GIT HELPER FUNCTIONS (без изменений) ---
 def run_git_command(command, repo_path):
     try:
         result = subprocess.run(command, cwd=repo_path, check=True, capture_output=True, text=True, timeout=120)
@@ -88,22 +100,17 @@ def run_git_command(command, repo_path):
 
 def git_push(commit_message, repo_path, auth_repo_url):
     print(f"\n--- Attempting to push to GitHub: '{commit_message}' ---")
-    
-    # Копируем последнюю локальную модель в репозиторий для пуша
     if os.path.exists(MODEL_PATH):
         shutil.copy2(MODEL_PATH, GIT_MODEL_PATH)
         print(f"Copied {MODEL_PATH} to {GIT_MODEL_PATH} for pushing.")
     else:
         print("No local model to push.")
         return
-
     if not run_git_command(["git", "add", GIT_MODEL_PATH], repo_path): return
-    
     status_result = subprocess.run(["git", "status", "--porcelain"], cwd=repo_path, capture_output=True, text=True)
     if not status_result.stdout.strip():
         print("No changes to commit.")
         return
-
     if not run_git_command(["git", "commit", "-m", commit_message], repo_path): return
     if not run_git_command(["git", "push", auth_repo_url, f"HEAD:{GIT_BRANCH}"], repo_path): return
     print("--- Push successful ---")
@@ -113,7 +120,6 @@ def git_pull(repo_path, auth_repo_url):
     if not run_git_command(["git", "pull", auth_repo_url, GIT_BRANCH], repo_path):
         print("Git pull failed. Continuing with local version if available.")
 
-# ... Класс InferenceWorker остается БЕЗ ИЗМЕНЕНИЙ ...
 class InferenceWorker(mp.Process):
     def __init__(self, name, task_queue, result_dict, log_queue, stop_event):
         super().__init__(name=name)
@@ -147,8 +153,6 @@ class InferenceWorker(mp.Process):
         self.opponent_model.eval()
 
     def _load_models(self):
-        # --- ИЗМЕНЕНИЕ: Добавляем отказоустойчивость при загрузке моделей ---
-        # Загрузка основной модели
         try:
             if os.path.exists(MODEL_PATH):
                 for attempt in range(3):
@@ -167,7 +171,6 @@ class InferenceWorker(mp.Process):
             self._log(f"!!! UNEXPECTED EXCEPTION during latest model loading: {e}")
             traceback.print_exc()
 
-        # Загрузка модели оппонента
         try:
             self.opponent_pool_files = glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth"))
             if self.opponent_pool_files:
@@ -189,7 +192,6 @@ class InferenceWorker(mp.Process):
         except Exception as e:
             self._log(f"!!! UNEXPECTED EXCEPTION during opponent model loading: {e}")
             traceback.print_exc()
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     def _check_for_updates(self):
         self.request_counter += 1
@@ -202,12 +204,15 @@ class InferenceWorker(mp.Process):
                 with open(VERSION_FILE, 'r') as f:
                     latest_version = int(f.read())
                 if latest_version > self.model_version:
+                    # --- ИЗМЕНЕНИЕ: Распределяем нагрузку при перезагрузке моделей ---
+                    worker_id = int(self.name.split('-')[-1])
+                    time.sleep(worker_id * 0.1) # Задержка до 3 секунд для 30 воркеров
+                    
                     self._log(f"New model version detected ({latest_version}). Reloading models...")
                     self.model_version = latest_version
                     self._load_models()
         except (IOError, ValueError) as e:
             self._log(f"Could not check for model update: {e}")
-
 
     def run(self):
         self._initialize()
@@ -267,7 +272,6 @@ def update_opponent_pool(model_version):
     
     os.makedirs(OPPONENT_POOL_DIR, exist_ok=True)
     
-    # --- ИЗМЕНЕНИЕ: Безопасное копирование в пул оппонентов ---
     temp_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"temp_paqn_model_v{model_version}.pth")
     new_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"paqn_model_v{model_version}.pth")
     
@@ -279,8 +283,7 @@ def update_opponent_pool(model_version):
         print(f"Error updating opponent pool: {e}")
         if os.path.exists(temp_opponent_path):
             os.remove(temp_opponent_path)
-        return # Не продолжаем, если не удалось скопировать
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        return
 
     pool_files = sorted(glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth")), key=os.path.getmtime)
     
@@ -290,8 +293,18 @@ def update_opponent_pool(model_version):
         except OSError as e:
             print(f"Warning: Could not remove old opponent file: {e}")
 
-
 def main():
+    # --- МОНИТОРИНГ РЕСУРСОВ ---
+    def monitor_resources():
+        p = psutil.Process(os.getpid())
+        while True:
+            try:
+                print(f"[MONITOR] RSS={p.memory_info().rss/1024**3:.2f} GB, Threads={p.num_threads()}", flush=True)
+                time.sleep(15)
+            except (psutil.NoSuchProcess, KeyboardInterrupt):
+                break
+    threading.Thread(target=monitor_resources, daemon=True).start()
+
     # --- АУТЕНТИФИКАЦИЯ И НАСТРОЙКА GIT ---
     git_username = os.environ.get('GIT_USERNAME')
     git_token = os.environ.get('GIT_TOKEN')
@@ -307,11 +320,9 @@ def main():
     
     git_pull(project_root, auth_repo_url)
     
-    # Создаем локальные директории
     os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
     os.makedirs(OPPONENT_POOL_DIR, exist_ok=True)
 
-    # Копируем модель из Git в локальную директорию, если она есть
     if os.path.exists(GIT_MODEL_PATH) and not os.path.exists(MODEL_PATH):
         print(f"Copying model from Git repo to local directory: {GIT_MODEL_PATH} -> {MODEL_PATH}")
         shutil.copy2(GIT_MODEL_PATH, MODEL_PATH)
@@ -368,6 +379,7 @@ def main():
     last_stats_time = time.time()
     last_local_save_time = time.time()
     last_git_push_time = time.time()
+    last_cleanup_time = time.time()
     
     STREET_START_IDX = 9
     STREET_END_IDX = 14
@@ -395,6 +407,19 @@ def main():
                 print(f"Request Queue: {request_queue.qsize()} | Result Dict: {len(result_dict)}", flush=True)
                 print("="*54, flush=True)
                 last_stats_time = time.time()
+
+            # --- ИЗМЕНЕНИЕ: Периодическая очистка result_dict для предотвращения утечки ---
+            if time.time() - last_cleanup_time > 60: # Раз в минуту
+                if len(result_dict) > 10000: # Порог очистки
+                    keys = sorted(result_dict.keys())
+                    for key in keys[:-5000]: # Оставляем 5000 самых свежих
+                        try:
+                            del result_dict[key]
+                        except KeyError:
+                            pass
+                    print(f"[CLEANUP] result_dict cleaned. Size before: {len(keys)}, after: {len(result_dict)}", flush=True)
+                gc.collect()
+                last_cleanup_time = time.time()
 
             if value_buffer.size() < MIN_BUFFER_FILL_SAMPLES or policy_buffer.size() < MIN_BUFFER_FILL_SAMPLES:
                 print(f"Waiting for buffer to fill... Policy: {policy_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES} | Value: {value_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}", end='\r', flush=True)
@@ -437,11 +462,9 @@ def main():
             if now - last_local_save_time > LOCAL_SAVE_INTERVAL_SECONDS:
                 print("\n--- Saving models locally and updating opponent pool ---", flush=True)
                 
-                # --- ИЗМЕНЕНИЕ: Атомарное сохранение модели ---
                 temp_model_path = MODEL_PATH + ".tmp"
                 torch.save(model.state_dict(), temp_model_path)
                 os.rename(temp_model_path, MODEL_PATH)
-                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
                 model_version += 1
                 with open(VERSION_FILE, 'w') as f:
@@ -472,11 +495,9 @@ def main():
         print("All Python workers stopped.")
         
         print("Final model saving...", flush=True)
-        # --- ИЗМЕНЕНИЕ: Атомарное сохранение модели при выходе ---
         temp_model_path = MODEL_PATH + ".tmp"
         torch.save(model.state_dict(), temp_model_path)
         os.rename(temp_model_path, MODEL_PATH)
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         git_push(f"Final model save v{model_version} on exit", project_root, auth_repo_url)
         
         print("Training finished.")
