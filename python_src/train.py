@@ -41,8 +41,8 @@ INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 # --- НАСТРОЙКИ ---
 TOTAL_CPUS = os.cpu_count() or 88
 RESERVED_CPUS = 4
-NUM_INFERENCE_WORKERS = 8
-NUM_CPP_WORKERS = 16
+NUM_INFERENCE_WORKERS = 16
+NUM_CPP_WORKERS = 32
 
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
