@@ -1,6 +1,5 @@
 #pragma once
 
-// --- ИСПРАВЛЕНИЕ: Добавляем базовые заголовки ДО pybind11 ---
 #include <cstddef>
 #include <vector>
 #include <string>
@@ -10,7 +9,6 @@
 #include <mutex>
 #include <chrono>
 #include <thread>
-// --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
 #include "constants.hpp"
 #include <pybind11/pybind11.h>
@@ -37,11 +35,10 @@ public:
         : capacity_(capacity), head_(0), count_(0)
     {
         buffer_.resize(capacity_);
-        thread_local static std::mt19937 rng(
-            static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + 
-            static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))
-        );
-        rng_ = &rng;
+        // Инициализация RNG в конструкторе, чтобы избежать проблем с thread_local
+        unsigned seed = static_cast<unsigned>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + 
+                        static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        rng_ = std::make_unique<std::mt19937>(seed);
         std::cout << "C++: Replay Buffer created with capacity " << capacity << std::endl;
     }
 
@@ -60,26 +57,19 @@ public:
         }
     }
 
-    bool sample(int batch_size, py::array_t<float>& out_infosets, py::array_t<float>& out_actions, py::array_t<float>& out_targets) {
+    // --- ИЗМЕНЕНИЕ: Безопасный метод для работы с сырыми указателями без GIL ---
+    bool sample_to_ptr(int batch_size, float* infos_ptr, float* actions_ptr, float* targets_ptr) {
         std::lock_guard<std::mutex> lock(mtx_);
-        
-        if (count_ < static_cast<uint64_t>(batch_size)) {
-            return false;
-        }
+        if (count_ < static_cast<uint64_t>(batch_size)) return false;
 
         std::uniform_int_distribution<uint64_t> dist(0, count_ - 1);
-        
-        auto infosets_ptr = static_cast<float*>(out_infosets.request().ptr);
-        auto actions_ptr = static_cast<float*>(out_actions.request().ptr);
-        auto targets_ptr = static_cast<float*>(out_targets.request().ptr);
 
         for (int i = 0; i < batch_size; ++i) {
             uint64_t sample_idx = dist(*rng_);
-            const auto& sample = buffer_[sample_idx];
-            
-            std::copy(sample.infoset.begin(), sample.infoset.end(), infosets_ptr + i * INFOSET_SIZE);
-            std::copy(sample.action_vector.begin(), sample.action_vector.end(), actions_ptr + i * ACTION_VECTOR_SIZE);
-            *(targets_ptr + i) = sample.target_value;
+            const auto& s = buffer_[sample_idx];
+            std::copy(s.infoset.begin(), s.infoset.end(),   infos_ptr   + i * INFOSET_SIZE);
+            std::copy(s.action_vector.begin(), s.action_vector.end(), actions_ptr + i * ACTION_VECTOR_SIZE);
+            targets_ptr[i] = s.target_value;
         }
         return true;
     }
@@ -100,7 +90,7 @@ private:
     uint64_t head_;
     uint64_t count_;
     std::mutex mtx_;
-    std::mt19937* rng_;
+    std::unique_ptr<std::mt19937> rng_;
 };
 
 } // namespace ofc
