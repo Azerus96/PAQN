@@ -15,7 +15,7 @@ import torch
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
-import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
@@ -30,6 +30,7 @@ import shutil
 import gc
 import psutil
 import threading
+import aim # *** ИЗМЕНЕНИЕ: Импортируем Aim ***
 
 if __name__ == '__main__':
     if mp.get_start_method(allow_none=True) != 'spawn':
@@ -45,7 +46,7 @@ if build_dir not in sys.path:
     sys.path.insert(0, build_dir)
 
 
-from python_src.model import OFC_CNN_Network
+from python_src.model import OFC_CNN_Network # *** ИЗМЕНЕНИЕ: Импортируем новую модель ***
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
 # --- КОНСТАНТЫ ---
@@ -55,7 +56,6 @@ NUM_RANKS = 13
 INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 
 # --- НАСТРОЙКИ ---
-# Возвращаем к исходным значениям, т.к. проблема не в количестве, а в управлении потоками
 NUM_INFERENCE_WORKERS = 24
 NUM_CPP_WORKERS = 48
 
@@ -204,9 +204,8 @@ class InferenceWorker(mp.Process):
                 with open(VERSION_FILE, 'r') as f:
                     latest_version = int(f.read())
                 if latest_version > self.model_version:
-                    # --- ИЗМЕНЕНИЕ: Распределяем нагрузку при перезагрузке моделей ---
                     worker_id = int(self.name.split('-')[-1])
-                    time.sleep(worker_id * 0.1) # Задержка до 3 секунд для 30 воркеров
+                    time.sleep(worker_id * 0.1)
                     
                     self._log(f"New model version detected ({latest_version}). Reloading models...")
                     self.model_version = latest_version
@@ -219,12 +218,13 @@ class InferenceWorker(mp.Process):
         
         STREET_START_IDX = 9
         STREET_END_IDX = 14
-        TURN_CHANNEL_IDX = 15
 
         while not self.stop_event.is_set():
             try:
                 try:
-                    req_id, is_policy, infoset, action_vectors = self.task_queue.get(timeout=1)
+                    # *** ИЗМЕНЕНИЕ: Принимаем новый формат запроса ***
+                    request_tuple = self.task_queue.get(timeout=1)
+                    req_id, is_policy, infoset, action_vectors, is_traverser_turn = request_tuple
                 except queue.Empty:
                     self._check_for_updates()
                     continue
@@ -235,9 +235,8 @@ class InferenceWorker(mp.Process):
                     infoset_tensor = torch.tensor([infoset], dtype=torch.float32, device=self.device)
                     infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
                     
-                    turn_channel_val = infoset[TURN_CHANNEL_IDX * NUM_SUITS * NUM_RANKS]
-                    is_player_turn = turn_channel_val > 0.5
-                    model_to_use = self.latest_model if is_player_turn else self.opponent_model
+                    # *** ИЗМЕНЕНИЕ: Выбираем модель на основе флага, а не TURN-канала ***
+                    model_to_use = self.latest_model if is_traverser_turn else self.opponent_model
 
                     if is_policy:
                         if not action_vectors:
@@ -294,12 +293,27 @@ def update_opponent_pool(model_version):
             print(f"Warning: Could not remove old opponent file: {e}")
 
 def main():
+    # --- ИНИЦИАЛИЗАЦИЯ AIM ---
+    aim_run = aim.Run(experiment="paqn_ofc_poker")
+    aim_run["hparams"] = {
+        "num_cpp_workers": NUM_CPP_WORKERS,
+        "num_inference_workers": NUM_INFERENCE_WORKERS,
+        "learning_rate": LEARNING_RATE,
+        "buffer_capacity": BUFFER_CAPACITY,
+        "batch_size": BATCH_SIZE,
+        "action_limit": ACTION_LIMIT
+    }
+
     # --- МОНИТОРИНГ РЕСУРСОВ ---
     def monitor_resources():
         p = psutil.Process(os.getpid())
         while True:
             try:
-                print(f"[MONITOR] RSS={p.memory_info().rss/1024**3:.2f} GB, Threads={p.num_threads()}", flush=True)
+                rss_gb = p.memory_info().rss / 1024**3
+                threads = p.num_threads()
+                print(f"[MONITOR] RSS={rss_gb:.2f} GB, Threads={threads}", flush=True)
+                aim_run.track(rss_gb, name="system/memory_rss_gb")
+                aim_run.track(threads, name="system/num_threads")
                 time.sleep(15)
             except (psutil.NoSuchProcess, KeyboardInterrupt):
                 break
@@ -348,7 +362,6 @@ def main():
             print(f"Could not load model, starting from scratch. Error: {e}")
         
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.MSELoss()
     
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
@@ -383,6 +396,7 @@ def main():
     
     STREET_START_IDX = 9
     STREET_END_IDX = 14
+    global_step = 0
 
     try:
         while True:
@@ -406,13 +420,21 @@ def main():
                 print(f"Avg Losses (last 100) -> Policy: {avg_p_loss:.6f} | Value: {avg_v_loss:.6f}", flush=True)
                 print(f"Request Queue: {request_queue.qsize()} | Result Dict: {len(result_dict)}", flush=True)
                 print("="*54, flush=True)
+                
+                # *** ИЗМЕНЕНИЕ: Логирование в Aim ***
+                aim_run.track(total_generated, name="system/total_samples_generated")
+                aim_run.track(policy_buffer.size(), name="buffer/policy_buffer_size")
+                aim_run.track(value_buffer.size(), name="buffer/value_buffer_size")
+                aim_run.track(request_queue.qsize(), name="system/request_queue_size")
+                if policy_losses: aim_run.track(avg_p_loss, name="loss/policy_loss_avg")
+                if value_losses: aim_run.track(avg_v_loss, name="loss/value_loss_avg")
+                
                 last_stats_time = time.time()
 
-            # --- ИЗМЕНЕНИЕ: Периодическая очистка result_dict для предотвращения утечки ---
-            if time.time() - last_cleanup_time > 60: # Раз в минуту
-                if len(result_dict) > 10000: # Порог очистки
+            if time.time() - last_cleanup_time > 60:
+                if len(result_dict) > 10000:
                     keys = sorted(result_dict.keys())
-                    for key in keys[:-5000]: # Оставляем 5000 самых свежих
+                    for key in keys[:-5000]:
                         try:
                             del result_dict[key]
                         except KeyError:
@@ -428,14 +450,19 @@ def main():
 
             model.train()
             
+            # --- VALUE HEAD TRAINING ---
             v_batch = value_buffer.sample(BATCH_SIZE)
             if not v_batch: continue
             v_infosets_np, _, v_targets_np = v_batch
             v_infosets = torch.from_numpy(v_infosets_np).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
             v_targets = torch.from_numpy(v_targets_np).unsqueeze(1).to(device)
-            pred_values = model(v_infosets)
-            loss_v = criterion(pred_values, v_targets)
             
+            # *** ИЗМЕНЕНИЕ: Нормализация и клиппинг таргетов для Value ***
+            v_targets_clipped = torch.clamp(v_targets, -50.0, 50.0) # Ограничиваем экстремальные значения
+            pred_values = model(v_infosets)
+            loss_v = F.huber_loss(pred_values, v_targets_clipped, delta=1.0)
+            
+            # --- POLICY HEAD TRAINING ---
             p_batch = policy_buffer.sample(BATCH_SIZE)
             if not p_batch: continue
             p_infosets_np, p_actions_np, p_advantages_np = p_batch
@@ -443,18 +470,31 @@ def main():
             p_actions = torch.from_numpy(p_actions_np).to(device)
             p_advantages = torch.from_numpy(p_advantages_np).unsqueeze(1).to(device)
             
+            # *** ИЗМЕНЕНИЕ: Нормализация и клиппинг таргетов для Policy ***
+            adv_mean, adv_std = p_advantages.mean(), p_advantages.std()
+            p_advantages_normalized = torch.clamp((p_advantages - adv_mean) / (adv_std + 1e-6), -5.0, 5.0)
+
             p_street_vector = p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
             pred_logits, _ = model(p_infosets, p_actions, p_street_vector)
-            loss_p = criterion(pred_logits, p_advantages)
+            loss_p = F.huber_loss(pred_logits, p_advantages_normalized, delta=1.0)
 
+            # --- OPTIMIZATION STEP ---
             optimizer.zero_grad()
             total_loss = loss_v + loss_p
             total_loss.backward()
-            clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = clip_grad_norm_(model.parameters(), 5.0) # Увеличили клиппинг для стабильности
             optimizer.step()
             
             value_losses.append(loss_v.item())
             policy_losses.append(loss_p.item())
+            global_step += 1
+            
+            # *** ИЗМЕНЕНИЕ: Логирование метрик обучения в Aim ***
+            aim_run.track(loss_v.item(), name="loss/value_loss", step=global_step)
+            aim_run.track(loss_p.item(), name="loss/policy_loss", step=global_step)
+            aim_run.track(grad_norm.item(), name="diagnostics/grad_norm", step=global_step)
+            aim_run.track(adv_mean.item(), name="targets/advantage_mean", step=global_step)
+            aim_run.track(adv_std.item(), name="targets/advantage_std", step=global_step)
             
             model.eval()
 
@@ -500,6 +540,7 @@ def main():
         os.rename(temp_model_path, MODEL_PATH)
         git_push(f"Final model save v{model_version} on exit", project_root, auth_repo_url)
         
+        aim_run.close()
         print("Training finished.")
 
 if __name__ == "__main__":
