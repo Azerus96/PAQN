@@ -191,15 +191,18 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     uint64_t policy_request_id = traversal_id * 2;
     uint64_t value_request_id = traversal_id * 2 + 1;
 
+    // *** ИЗМЕНЕНИЕ: Добавляем флаг, чтобы Python знал, чья очередь ***
+    bool is_traverser_turn = (current_player == traversing_player);
+
     {
         py::gil_scoped_acquire acquire;
         py::tuple policy_request_tuple = py::make_tuple(
-            policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors)
+            policy_request_id, true, py::cast(infoset_vec), py::cast(canonical_action_vectors), py::bool_(is_traverser_turn)
         );
         request_queue_->attr("put")(policy_request_tuple);
 
         py::tuple value_request_tuple = py::make_tuple(
-            value_request_id, false, py::cast(infoset_vec), py::none()
+            value_request_id, false, py::cast(infoset_vec), py::none(), py::bool_(is_traverser_turn)
         );
         request_queue_->attr("put")(value_request_tuple);
     }
@@ -209,7 +212,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     int results_to_get = 2;
     int results_gotten = 0;
 
-    // --- ИЗМЕНЕНИЕ: Добавляем таймаут для защиты от дедлоков ---
     auto start_time = std::chrono::steady_clock::now();
     const auto timeout = std::chrono::seconds(30);
 
@@ -222,7 +224,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
                    << policy_request_id << ", " << value_request_id;
                 log_queue_->attr("put")(py::str(ss.str()));
             }
-            return {{0, 0.0f}, {1, 0.0f}}; // Возвращаем нейтральный результат
+            return {{0, 0.0f}, {1, 0.0f}};
         }
 
         bool got_item = false;
@@ -255,7 +257,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         } 
 
         if (!got_item) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5)); // Увеличиваем сон
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
 
