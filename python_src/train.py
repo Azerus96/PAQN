@@ -229,6 +229,21 @@ class InferenceWorker(mp.Process):
                     self._check_for_updates()
                     continue
 
+                # ===================================================================
+                # === МОДИФИКАЦИЯ 1: ДИАГНОСТИКА ВХОДНЫХ ДАННЫХ (НАЧАЛО) ===
+                # ===================================================================
+                if self.request_counter % 500 == 1: # Печатаем статистику для каждого 500-го запроса
+                    self._log("--- INPUT TENSOR DIAGNOSTICS ---")
+                    infoset_np = np.array(infoset)
+                    self._log(f"Infoset stats: shape={infoset_np.shape}, min={infoset_np.min():.2f}, max={infoset_np.max():.2f}, mean={infoset_np.mean():.4f}, non-zero={np.count_nonzero(infoset_np)}")
+                    if is_policy and action_vectors:
+                        actions_np = np.array(action_vectors)
+                        self._log(f"Actions stats: shape={actions_np.shape}, min={actions_np.min():.2f}, max={actions_np.max():.2f}, mean={actions_np.mean():.4f}, non-zero={np.count_nonzero(actions_np)}")
+                    self._log("------------------------------------")
+                # ===================================================================
+                # === МОДИФИКАЦИЯ 1: ДИАГНОСТИКА ВХОДНЫХ ДАННЫХ (КОНЕЦ) ===
+                # ===================================================================
+
                 self._check_for_updates()
                 
                 with torch.inference_mode():
@@ -360,6 +375,26 @@ def main():
                 print(f"Current model version: {model_version}")
         except Exception as e:
             print(f"Could not load model, starting from scratch. Error: {e}")
+
+    # ===================================================================
+    # === МОДИФИКАЦИЯ 2: ПРОВЕРКА ВЕСОВ МОДЕЛИ (НАЧАЛО) ===
+    # ===================================================================
+    print("--- Checking model parameters statistics ---")
+    dead_layers = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            std_dev = param.std().item()
+            if std_dev < 1e-6:
+                print(f"WARNING: Layer '{name}' looks dead (std={std_dev:.2e})")
+                dead_layers += 1
+    if dead_layers == 0:
+        print("✅ All layers seem to be initialized correctly.")
+    else:
+        print(f"🚨 Found {dead_layers} potentially dead layers!")
+    print("-----------------------------------------")
+    # ===================================================================
+    # === МОДИФИКАЦИЯ 2: ПРОВЕРКА ВЕСОВ МОДЕЛИ (КОНЕЦ) ===
+    # ===================================================================
         
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
