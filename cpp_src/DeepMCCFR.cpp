@@ -15,6 +15,7 @@
 
 namespace ofc {
 
+// ... (функции action_to_vector и add_dirichlet_noise остаются без изменений) ...
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -53,6 +54,7 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
     }
 }
 
+
 std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
 
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
@@ -64,11 +66,15 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, Sha
       request_queue_(request_queue),
       result_queue_(result_queue),
       log_queue_(log_queue),
-      rng_(static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + 
-           static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id()))),
+      // ===================================================================
+      // === ИСПРАВЛЕНИЕ 1: ИСПОЛЬЗОВАНИЕ std::random_device ДЛЯ УНИКАЛЬНОГО SEED ===
+      // ===================================================================
+      rng_(std::random_device{}()),
+      // ===================================================================
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
 {}
 
+// ... (остальная часть файла DeepMCCFR.cpp остается без изменений) ...
 void DeepMCCFR::run_traversal() {
     uint64_t traversal_id = ++traversal_counter_;
     GameState state; 
