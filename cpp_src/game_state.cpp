@@ -6,6 +6,7 @@
 #include <functional>
 #include <thread>
 #include <set>
+#include <random> // <-- Добавляем этот заголовок для std::random_device
 
 namespace ofc {
 
@@ -27,9 +28,12 @@ namespace ofc {
             board.bottom.fill(INVALID_CARD);
         }
         
-        unsigned seed = static_cast<unsigned>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) +
-                        static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-        std::mt19937 temp_rng(seed);
+        // ===================================================================
+        // === ИСПРАВЛЕНИЕ 2: ИСПОЛЬЗОВАНИЕ std::random_device ДЛЯ УНИКАЛЬНОГО SEED ===
+        // ===================================================================
+        std::random_device rd;
+        std::mt19937 temp_rng(rd());
+        // ===================================================================
 
         deck_.resize(52);
         std::iota(deck_.begin(), deck_.end(), 0);
@@ -48,6 +52,7 @@ namespace ofc {
         deal_cards();
     }
 
+// ... (остальная часть файла game_state.cpp остается без изменений) ...
     std::pair<float, float> GameState::get_payoffs(const HandEvaluator& evaluator) const {
         const int SCOOP_BONUS = 3;
         const Board& p1_board = boards_[0];
