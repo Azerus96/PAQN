@@ -1,3 +1,5 @@
+# --- НАЧАЛО ФАЙЛА python_src/train.py ---
+
 # --- ШАГ 0: УСТАНОВКА ЛИМИТОВ ПОТОКОВ ДО ВСЕХ ИМПОРТОВ ---
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -30,7 +32,7 @@ import shutil
 import gc
 import psutil
 import threading
-import aim # *** ИЗМЕНЕНИЕ: Импортируем Aim ***
+import aim
 
 if __name__ == '__main__':
     if mp.get_start_method(allow_none=True) != 'spawn':
@@ -46,7 +48,7 @@ if build_dir not in sys.path:
     sys.path.insert(0, build_dir)
 
 
-from python_src.model import OFC_CNN_Network # *** ИЗМЕНЕНИЕ: Импортируем новую модель ***
+from python_src.model import OFC_CNN_Network
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
 # --- КОНСТАНТЫ ---
@@ -222,17 +224,13 @@ class InferenceWorker(mp.Process):
         while not self.stop_event.is_set():
             try:
                 try:
-                    # *** ИЗМЕНЕНИЕ: Принимаем новый формат запроса ***
                     request_tuple = self.task_queue.get(timeout=1)
                     req_id, is_policy, infoset, action_vectors, is_traverser_turn = request_tuple
                 except queue.Empty:
                     self._check_for_updates()
                     continue
 
-                # ===================================================================
-                # === МОДИФИКАЦИЯ 1: ДИАГНОСТИКА ВХОДНЫХ ДАННЫХ (НАЧАЛО) ===
-                # ===================================================================
-                if self.request_counter % 500 == 1: # Печатаем статистику для каждого 500-го запроса
+                if self.request_counter % 500 == 1:
                     self._log("--- INPUT TENSOR DIAGNOSTICS ---")
                     infoset_np = np.array(infoset)
                     self._log(f"Infoset stats: shape={infoset_np.shape}, min={infoset_np.min():.2f}, max={infoset_np.max():.2f}, mean={infoset_np.mean():.4f}, non-zero={np.count_nonzero(infoset_np)}")
@@ -240,9 +238,6 @@ class InferenceWorker(mp.Process):
                         actions_np = np.array(action_vectors)
                         self._log(f"Actions stats: shape={actions_np.shape}, min={actions_np.min():.2f}, max={actions_np.max():.2f}, mean={actions_np.mean():.4f}, non-zero={np.count_nonzero(actions_np)}")
                     self._log("------------------------------------")
-                # ===================================================================
-                # === МОДИФИКАЦИЯ 1: ДИАГНОСТИКА ВХОДНЫХ ДАННЫХ (КОНЕЦ) ===
-                # ===================================================================
 
                 self._check_for_updates()
                 
@@ -250,7 +245,6 @@ class InferenceWorker(mp.Process):
                     infoset_tensor = torch.tensor([infoset], dtype=torch.float32, device=self.device)
                     infoset_tensor = infoset_tensor.view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS)
                     
-                    # *** ИЗМЕНЕНИЕ: Выбираем модель на основе флага, а не TURN-канала ***
                     model_to_use = self.latest_model if is_traverser_turn else self.opponent_model
 
                     if is_policy:
@@ -308,7 +302,6 @@ def update_opponent_pool(model_version):
             print(f"Warning: Could not remove old opponent file: {e}")
 
 def main():
-    # --- ИНИЦИАЛИЗАЦИЯ AIM ---
     aim_run = aim.Run(experiment="paqn_ofc_poker")
     aim_run["hparams"] = {
         "num_cpp_workers": NUM_CPP_WORKERS,
@@ -319,7 +312,6 @@ def main():
         "action_limit": ACTION_LIMIT
     }
 
-    # --- МОНИТОРИНГ РЕСУРСОВ ---
     def monitor_resources():
         p = psutil.Process(os.getpid())
         while True:
@@ -334,7 +326,6 @@ def main():
                 break
     threading.Thread(target=monitor_resources, daemon=True).start()
 
-    # --- АУТЕНТИФИКАЦИЯ И НАСТРОЙКА GIT ---
     git_username = os.environ.get('GIT_USERNAME')
     git_token = os.environ.get('GIT_TOKEN')
 
@@ -376,27 +367,24 @@ def main():
         except Exception as e:
             print(f"Could not load model, starting from scratch. Error: {e}")
 
-    # ===================================================================
-    # === МОДИФИКАЦИЯ 2: ПРОВЕРКА ВЕСОВ МОДЕЛИ (НАЧАЛО) ===
-    # ===================================================================
-    print("--- Checking model parameters statistics ---")
-    dead_layers = 0
+    # !!! ИЗМЕНЕНИЕ: Улучшенная настройка оптимизатора с AdamW и группировкой параметров !!!
+    decay_params = []
+    no_decay_params = []
     for name, param in model.named_parameters():
-        if param.requires_grad:
-            std_dev = param.std().item()
-            if std_dev < 1e-6:
-                print(f"WARNING: Layer '{name}' looks dead (std={std_dev:.2e})")
-                dead_layers += 1
-    if dead_layers == 0:
-        print("✅ All layers seem to be initialized correctly.")
-    else:
-        print(f"🚨 Found {dead_layers} potentially dead layers!")
-    print("-----------------------------------------")
-    # ===================================================================
-    # === МОДИФИКАЦИЯ 2: ПРОВЕРКА ВЕСОВ МОДЕЛИ (КОНЕЦ) ===
-    # ===================================================================
-        
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        if not param.requires_grad:
+            continue
+        # Исключаем смещения (bias) и параметры нормализации (weight/bias) из weight decay
+        if len(param.shape) == 1 or name.endswith(".bias") or "norm" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    optimizer_grouped_parameters = [
+        {'params': decay_params, 'weight_decay': 0.01},
+        {'params': no_decay_params, 'weight_decay': 0.0}
+    ]
+    optimizer = optim.AdamW(optimizer_grouped_parameters, lr=LEARNING_RATE)
+    print("Optimizer configured with AdamW and parameter groups (with/without weight decay).")
     
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
@@ -456,7 +444,6 @@ def main():
                 print(f"Request Queue: {request_queue.qsize()} | Result Dict: {len(result_dict)}", flush=True)
                 print("="*54, flush=True)
                 
-                # *** ИЗМЕНЕНИЕ: Логирование в Aim ***
                 aim_run.track(total_generated, name="system/total_samples_generated")
                 aim_run.track(policy_buffer.size(), name="buffer/policy_buffer_size")
                 aim_run.track(value_buffer.size(), name="buffer/value_buffer_size")
@@ -485,19 +472,16 @@ def main():
 
             model.train()
             
-            # --- VALUE HEAD TRAINING ---
             v_batch = value_buffer.sample(BATCH_SIZE)
             if not v_batch: continue
             v_infosets_np, _, v_targets_np = v_batch
             v_infosets = torch.from_numpy(v_infosets_np).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
             v_targets = torch.from_numpy(v_targets_np).unsqueeze(1).to(device)
             
-            # *** ИЗМЕНЕНИЕ: Нормализация и клиппинг таргетов для Value ***
-            v_targets_clipped = torch.clamp(v_targets, -50.0, 50.0) # Ограничиваем экстремальные значения
+            v_targets_clipped = torch.clamp(v_targets, -50.0, 50.0)
             pred_values = model(v_infosets)
             loss_v = F.huber_loss(pred_values, v_targets_clipped, delta=1.0)
             
-            # --- POLICY HEAD TRAINING ---
             p_batch = policy_buffer.sample(BATCH_SIZE)
             if not p_batch: continue
             p_infosets_np, p_actions_np, p_advantages_np = p_batch
@@ -505,7 +489,6 @@ def main():
             p_actions = torch.from_numpy(p_actions_np).to(device)
             p_advantages = torch.from_numpy(p_advantages_np).unsqueeze(1).to(device)
             
-            # *** ИЗМЕНЕНИЕ: Нормализация и клиппинг таргетов для Policy ***
             adv_mean, adv_std = p_advantages.mean(), p_advantages.std()
             p_advantages_normalized = torch.clamp((p_advantages - adv_mean) / (adv_std + 1e-6), -5.0, 5.0)
 
@@ -513,18 +496,16 @@ def main():
             pred_logits, _ = model(p_infosets, p_actions, p_street_vector)
             loss_p = F.huber_loss(pred_logits, p_advantages_normalized, delta=1.0)
 
-            # --- OPTIMIZATION STEP ---
             optimizer.zero_grad()
             total_loss = loss_v + loss_p
             total_loss.backward()
-            grad_norm = clip_grad_norm_(model.parameters(), 5.0) # Увеличили клиппинг для стабильности
+            grad_norm = clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
             
             value_losses.append(loss_v.item())
             policy_losses.append(loss_p.item())
             global_step += 1
             
-            # *** ИЗМЕНЕНИЕ: Логирование метрик обучения в Aim ***
             aim_run.track(loss_v.item(), name="loss/value_loss", step=global_step)
             aim_run.track(loss_p.item(), name="loss/policy_loss", step=global_step)
             aim_run.track(grad_norm.item(), name="diagnostics/grad_norm", step=global_step)
@@ -580,3 +561,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# --- КОНЕЦ ФАЙЛА python_src/train.py ---
