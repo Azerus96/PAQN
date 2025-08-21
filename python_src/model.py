@@ -1,3 +1,5 @@
+# --- НАЧАЛО ФАЙЛА python_src/model.py ---
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,7 +33,7 @@ class ResBlock(nn.Module):
 
 class OFC_CNN_Network(nn.Module):
     """
-    Улучшенная архитектура сети с ResNet-подобным телом и сбалансированной policy-головой.
+    ИСПРАВЛЕННАЯ архитектура сети с ResNet-подобным телом и сбалансированной policy-головой.
     """
     def __init__(self, hidden_size=512, channels=64, num_res_blocks=6, groups=8):
         super(OFC_CNN_Network, self).__init__()
@@ -62,7 +64,7 @@ class OFC_CNN_Network(nn.Module):
         # 4. Голова для оценки действий (Policy Head)
         # Проекции для векторов действия и улицы для уменьшения размерности
         self.action_proj = nn.Sequential(
-            nn.LayerNorm(ACTION_VECTOR_SIZE),
+            # !!! ИЗМЕНЕНИЕ: Убран LayerNorm отсюда, он будет применен ниже !!!
             nn.Linear(ACTION_VECTOR_SIZE, 128),
             nn.SiLU(inplace=True),
         )
@@ -71,8 +73,16 @@ class OFC_CNN_Network(nn.Module):
             nn.SiLU(inplace=True),
         )
         
+        # !!! ИЗМЕНЕНИЕ: Раздельные слои нормализации для каждой ветви !!!
+        self.body_ln = nn.LayerNorm(hidden_size)
+        self.action_ln = nn.LayerNorm(128)
+        self.street_ln = nn.LayerNorm(8)
+        
         policy_input_size = hidden_size + 128 + 8
-        self.policy_ln = nn.LayerNorm(policy_input_size) # LayerNorm для стабилизации входа
+        
+        # !!! ИЗМЕНЕНИЕ: Старый общий LayerNorm удален !!!
+        # self.policy_ln = nn.LayerNorm(policy_input_size)
+        
         self.policy_head = nn.Sequential(
             nn.Linear(policy_input_size, hidden_size),
             nn.SiLU(inplace=True),
@@ -99,12 +109,22 @@ class OFC_CNN_Network(nn.Module):
         if street_vector is None:
             raise ValueError("street_vector must be provided for policy evaluation")
             
-        # Проекция и конкатенация всех входов для policy-головы
+        # !!! ИЗМЕНЕНИЕ: Применяем раздельную нормализацию ДО конкатенации !!!
+        # 1. Получаем эмбеддинги
         action_embedding = self.action_proj(action_vec)
         street_embedding = self.street_proj(street_vector)
         
-        policy_input = torch.cat([body_out, action_embedding, street_embedding], dim=1)
-        policy_input_normalized = self.policy_ln(policy_input)
-        policy_logit = self.policy_head(policy_input_normalized)
+        # 2. Нормализуем КАЖДУЮ часть ОТДЕЛЬНО
+        body_norm = self.body_ln(body_out)
+        action_norm = self.action_ln(action_embedding)
+        street_norm = self.street_ln(street_embedding)
+        
+        # 3. Конкатенируем УЖЕ нормализованные векторы
+        policy_input = torch.cat([body_norm, action_norm, street_norm], dim=1)
+        
+        # 4. Подаем в голову напрямую, без общей нормализации
+        policy_logit = self.policy_head(policy_input)
         
         return policy_logit, None
+
+# --- КОНЕЦ ФАЙЛА python_src/model.py ---
