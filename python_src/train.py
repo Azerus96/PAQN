@@ -47,7 +47,6 @@ if project_root not in sys.path:
 if build_dir not in sys.path:
     sys.path.insert(0, build_dir)
 
-
 from python_src.model import OFC_CNN_Network
 from ofc_engine import ReplayBuffer, initialize_evaluator, SolverManager
 
@@ -137,6 +136,12 @@ class InferenceWorker(mp.Process):
         self.last_version_check_time = 0
         self.request_counter = 0
 
+        # --- NEW: параметры дампа живых сэмплов ---
+        self.dump_every = int(os.environ.get("DUMP_EVERY", "0"))  # 0 = выкл
+        self.dump_dir = os.environ.get("DUMP_DIR", "/content/local_models/samples")
+        self.dump_max = int(os.environ.get("DUMP_MAX_SAMPLES", "30"))
+        self.sample_counter = 0  # считаем обработанные запросы
+
     def _log(self, message):
         self.log_queue.put(f"[{self.name}] {message}")
 
@@ -148,6 +153,9 @@ class InferenceWorker(mp.Process):
         
         self.latest_model = OFC_CNN_Network().to(self.device)
         self.opponent_model = OFC_CNN_Network().to(self.device)
+
+        if self.dump_every:
+            os.makedirs(self.dump_dir, exist_ok=True)
         
         self._load_models()
         
@@ -226,6 +234,7 @@ class InferenceWorker(mp.Process):
                 try:
                     request_tuple = self.task_queue.get(timeout=1)
                     req_id, is_policy, infoset, action_vectors, is_traverser_turn = request_tuple
+                    self.sample_counter += 1  # считаем каждый обработанный запрос
                 except queue.Empty:
                     self._check_for_updates()
                     continue
@@ -238,6 +247,37 @@ class InferenceWorker(mp.Process):
                         actions_np = np.array(action_vectors)
                         self._log(f"Actions stats: shape={actions_np.shape}, min={actions_np.min():.2f}, max={actions_np.max():.2f}, mean={actions_np.mean():.4f}, non-zero={np.count_nonzero(actions_np)}")
                     self._log("------------------------------------")
+
+                # --- NEW: периодический дамп реальных сэмплов (до dump_max файлов) ---
+                if self.dump_every and (self.sample_counter % self.dump_every == 1):
+                    try:
+                        existing = sorted(glob.glob(os.path.join(self.dump_dir, "*.pt")), key=os.path.getmtime)
+                        while len(existing) >= self.dump_max:
+                            try:
+                                os.remove(existing.pop(0))
+                            except OSError:
+                                break
+
+                        infoset_tensor_1 = torch.tensor(infoset, dtype=torch.float32).view(1, 16, 4, 13)
+                        street_vec_1 = infoset_tensor_1[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
+                        sample = {
+                            "req_id": req_id,
+                            "timestamp": time.time(),
+                            "worker": self.name,
+                            "model_version": self.model_version,
+                            "is_policy": bool(is_policy),
+                            "is_traverser_turn": bool(is_traverser_turn),
+                            "infoset": infoset_tensor_1,  # [1,16,4,13]
+                            "street": street_vec_1,       # [1,5]
+                            "actions": torch.tensor(action_vectors, dtype=torch.float32) if (is_policy and action_vectors) else None,  # [K,208] или None
+                        }
+                        tmp_path = os.path.join(self.dump_dir, f"sample_{int(time.time())}_{self.name}.pt.tmp")
+                        final_path = tmp_path[:-4]
+                        torch.save(sample, tmp_path)
+                        os.rename(tmp_path, final_path)
+                        self._log(f"Saved sample: {final_path}")
+                    except Exception as e:
+                        self._log(f"Sample save failed: {e}")
 
                 self._check_for_updates()
                 
@@ -367,13 +407,12 @@ def main():
         except Exception as e:
             print(f"Could not load model, starting from scratch. Error: {e}")
 
-    # !!! ИЗМЕНЕНИЕ: Улучшенная настройка оптимизатора с AdamW и группировкой параметров !!!
+    # AdamW с группировкой параметров (без изменений)
     decay_params = []
     no_decay_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # Исключаем смещения (bias) и параметры нормализации (weight/bias) из weight decay
         if len(param.shape) == 1 or name.endswith(".bias") or "norm" in name:
             no_decay_params.append(param)
         else:
@@ -511,6 +550,30 @@ def main():
             aim_run.track(grad_norm.item(), name="diagnostics/grad_norm", step=global_step)
             aim_run.track(adv_mean.item(), name="targets/advantage_mean", step=global_step)
             aim_run.track(adv_std.item(), name="targets/advantage_std", step=global_step)
+
+            # --- NEW: диагностические метрики ---
+            with torch.no_grad():
+                try:
+                    y = p_advantages_normalized.view(-1).cpu().numpy()
+                    yhat = pred_logits.view(-1).detach().cpu().numpy()
+                    if y.std() > 1e-6 and yhat.std() > 1e-6:
+                        corr = float(np.corrcoef(y, yhat)[0, 1])
+                    else:
+                        corr = 0.0
+                except Exception:
+                    corr = 0.0
+                aim_run.track(corr, name="diagnostics/policy_corr", step=global_step)
+
+                try:
+                    t = v_targets_clipped.view(-1).cpu().numpy()
+                    v = pred_values.view(-1).detach().cpu().numpy()
+                    ev = 1.0 - np.var(t - v) / (np.var(t) + 1e-8)
+                except Exception:
+                    ev = 0.0
+                aim_run.track(float(ev), name="diagnostics/value_explained_var", step=global_step)
+
+                aim_run.track(float(pred_logits.std().item()), name="diagnostics/policy_logit_std", step=global_step)
+                aim_run.track(float(pred_values.std().item()), name="diagnostics/value_pred_std", step=global_step)
             
             model.eval()
 
