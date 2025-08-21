@@ -1,6 +1,6 @@
-# --- НАЧАЛО ФАЙЛА python_src/train.py (ОБЪЕДИНЕННАЯ ВЕРСИЯ v2) ---
+# --- НАЧАЛО ФАЙЛА python_src/train.py (ФИНАЛЬНАЯ СИНХРОНИЗИРОВАННАЯ ВЕРСИЯ) ---
 
-# --- ШАГ 0: УСТАНОВКА ЛИМИТОВ ПОТОКОВ ДО ВСЕХ ИМПОРТОВ ---
+# ... (все импорты и константы остаются без изменений) ...
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -13,7 +13,6 @@ os.environ.setdefault("PYTHONFAULTHANDLER", "1")
 import sys
 import time
 import torch
-# --- УСТАНОВКА ЛИМИТОВ ПОТОКОВ ДЛЯ PYTORCH ---
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
@@ -458,6 +457,7 @@ def main():
     STREET_START_IDX = 9
     STREET_END_IDX = 14
     global_step = 0
+    training_started = False # <<< НОВЫЙ ФЛАГ
 
     try:
         while True:
@@ -475,6 +475,7 @@ def main():
                 print("\n" + "="*20 + " STATS UPDATE " + "="*20, flush=True)
                 print(f"Time: {time.strftime('%H:%M:%S')}", flush=True)
                 print(f"Model Version: {model_version}", flush=True)
+                print(f"Global Step: {global_step}", flush=True)
                 print(f"Total Generated: {total_generated:,}", flush=True)
                 print(f"Buffer Fill -> Policy: {policy_buffer.size():,}/{BUFFER_CAPACITY:,} ({policy_buffer.size()/BUFFER_CAPACITY:.1%}) "
                       f"| Value: {value_buffer.size():,}/{BUFFER_CAPACITY:,} ({value_buffer.size()/BUFFER_CAPACITY:.1%})", flush=True)
@@ -508,9 +509,12 @@ def main():
                 time.sleep(1)
                 continue
 
+            if not training_started:
+                print("\nBuffer filled. Starting training...")
+                training_started = True
+
             model.train()
             
-            # --- Head-only warmup gradient freezing ---
             if head_warmup_steps > 0 and global_step < head_warmup_steps:
                 for p in trunk_params: p.requires_grad = False
             else:
@@ -574,7 +578,6 @@ def main():
                 aim_run.track(float(pred_logits.std().item()), name="diagnostics/policy_logit_std", step=global_step)
                 aim_run.track(float(pred_values.std().item()), name="diagnostics/value_pred_std", step=global_step)
                 
-                # --- JSON Heartbeat ---
                 try:
                     live_metrics = {
                         "step": int(global_step), "policy_corr": float(corr), "value_explained_var": float(ev),
@@ -588,7 +591,8 @@ def main():
             model.eval()
 
             now = time.time()
-            if now - last_local_save_time > LOCAL_SAVE_INTERVAL_SECONDS:
+            # <<< ИЗМЕНЕНИЕ: ПРОВЕРЯЕМ ФЛАГ ПЕРЕД СОХРАНЕНИЕМ >>>
+            if training_started and now - last_local_save_time > LOCAL_SAVE_INTERVAL_SECONDS:
                 print("\n--- Saving models locally and updating opponent pool ---", flush=True)
                 
                 temp_model_path = MODEL_PATH + ".tmp"
@@ -601,7 +605,7 @@ def main():
                 update_opponent_pool(model_version)
                 last_local_save_time = now
             
-            if now - last_git_push_time > GIT_PUSH_INTERVAL_SECONDS:
+            if training_started and now - last_git_push_time > GIT_PUSH_INTERVAL_SECONDS:
                 git_push(f"Periodic model save v{model_version}", project_root, auth_repo_url)
                 last_git_push_time = now
 
@@ -623,11 +627,12 @@ def main():
                 worker.terminate()
         print("All Python workers stopped.")
         
-        print("Final model saving...", flush=True)
-        temp_model_path = MODEL_PATH + ".tmp"
-        torch.save(model.state_dict(), temp_model_path)
-        os.rename(temp_model_path, MODEL_PATH)
-        git_push(f"Final model save v{model_version} on exit", project_root, auth_repo_url)
+        if training_started:
+            print("Final model saving...", flush=True)
+            temp_model_path = MODEL_PATH + ".tmp"
+            torch.save(model.state_dict(), temp_model_path)
+            os.rename(temp_model_path, MODEL_PATH)
+            git_push(f"Final model save v{model_version} on exit", project_root, auth_repo_url)
         
         aim_run.close()
         print("Training finished.")
@@ -635,4 +640,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# --- КОНЕЦ ФАЙЛА python_src/train.py ---
+# --- КОНЕЦ ФАЙЛА ---
