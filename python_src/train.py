@@ -69,9 +69,9 @@ MIN_BUFFER_FILL_SAMPLES = 50000
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
 STATS_INTERVAL_SECONDS = 15
-FIRST_SAVE_STEP = 2000 # Первое сохранение после 2000 шагов
-SAVE_INTERVAL_STEPS = 5000
-GIT_PUSH_INTERVAL_STEPS = 10000
+FIRST_SAVE_STEP = 100 # Первое сохранение после 2000 шагов
+SAVE_INTERVAL_STEPS = 100
+GIT_PUSH_INTERVAL_STEPS = 100
 
 LOCAL_MODEL_DIR = "/content/local_models"
 MODEL_PATH = os.path.join(LOCAL_MODEL_DIR, "paqn_model_latest.pth")
