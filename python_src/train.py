@@ -1,4 +1,4 @@
-# --- НАЧАЛО ФАЙЛА python_src/train.py (ФИНАЛЬНАЯ СИНХРОНИЗИРОВАННАЯ ВЕРСИЯ v4.2) ---
+# --- НАЧАЛО ФАЙЛА python_src/train.py (v4.3 - ФИНАЛЬНАЯ ВЕРСИЯ С ИСПРАВЛЕНИЯМИ) ---
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -69,7 +69,7 @@ MIN_BUFFER_FILL_SAMPLES = 50000
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
 STATS_INTERVAL_SECONDS = 15
-FIRST_SAVE_STEP = 100 # Первое сохранение после 2000 шагов
+FIRST_SAVE_STEP = 100
 SAVE_INTERVAL_STEPS = 100
 GIT_PUSH_INTERVAL_STEPS = 100
 
@@ -253,27 +253,15 @@ class InferenceWorker(mp.Process):
                         if not action_vectors:
                             result = (req_id, True, [])
                         else:
-                            # --- ОПТИМИЗАЦИЯ НАЧИНАЕТСЯ ЗДЕСЬ ---
                             num_actions = len(action_vectors)
-                            
-                            # 1. Прогоняем состояние через "тело" ОДИН РАЗ
                             body_out_single = model_to_use.forward_body(infoset_tensor)
-                            
-                            # 2. "Размножаем" маленький вектор признаков
                             body_out_batch = body_out_single.repeat(num_actions, 1)
-                            
-                            # 3. Готовим батчи для действий и улицы
                             actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
                             street_vector = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0].repeat(num_actions, 1)
-                            
-                            # 4. Вызываем только "голову" политики с уже готовыми данными
                             policy_logits = model_to_use.forward_policy_head(body_out_batch, actions_tensor, street_vector)
-                            
                             predictions = policy_logits.cpu().numpy().flatten().tolist()
                             result = (req_id, True, predictions)
-                            # --- ОПТИМИЗАЦИЯ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ ---
                     else: # is_value
-                        # Для value запроса используется стандартный forward, который вызывает body и value_head
                         value = model_to_use(infoset_tensor)
                         result = (req_id, False, [value.item()])
                     
@@ -587,36 +575,46 @@ def main():
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.", flush=True)
     finally:
-        print("Stopping all workers...", flush=True)
+        print("\n" + "="*15 + " НАЧАТА ПРОЦЕДУРА ЗАВЕРШЕНИЯ " + "="*15, flush=True)
+        
+        if 'aim_run' in locals() and aim_run.active:
+            print("1. Закрытие сессии Aim для сохранения всех метрик...", flush=True)
+            aim_run.close()
+            print("   ✅ Сессия Aim успешно закрыта.", flush=True)
+
+        print("2. Отправка сигнала остановки всем воркерам...", flush=True)
         stop_event.set()
         
-        print("Stopping C++ workers...", flush=True)
-        solver_manager.stop()
-        print("C++ workers stopped.")
+        print("3. Остановка C++ воркеров...", flush=True)
+        if 'solver_manager' in locals():
+            solver_manager.stop()
+        print("   ✅ C++ воркеры остановлены.", flush=True)
         
-        print("Stopping Python workers...", flush=True)
-        for worker in inference_workers:
-            worker.join(timeout=5)
-            if worker.is_alive():
-                print(f"Terminating worker {worker.name}...", flush=True)
-                worker.terminate()
-        print("All Python workers stopped.")
+        print("4. Остановка Python воркеров...", flush=True)
+        if 'inference_workers' in locals():
+            for worker in inference_workers:
+                worker.join(timeout=5)
+                if worker.is_alive():
+                    print(f"   - Принудительное завершение {worker.name}...", flush=True)
+                    worker.terminate()
+        print("   ✅ Python воркеры остановлены.", flush=True)
         
         if training_started:
-            print("Final model saving...", flush=True)
-            torch.save({
-                'global_step': global_step,
-                'model_version': model_version,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }, MODEL_PATH + ".tmp")
-            os.rename(MODEL_PATH + ".tmp", MODEL_PATH)
-            git_push(f"Final save: v{model_version}, step {global_step}", project_root, auth_repo_url)
+            print("5. Финальное сохранение и пуш модели...", flush=True)
+            try:
+                torch.save({
+                    'global_step': global_step,
+                    'model_version': model_version,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, MODEL_PATH)
+                print("   ✅ Модель сохранена локально.", flush=True)
+                git_push(f"Final save on exit: v{model_version}, step {global_step}", project_root, auth_repo_url)
+            except Exception as e:
+                print(f"   ---! ❌ ОШИБКА при финальном сохранении/пуше: {e}", flush=True)
         
-        aim_run.close()
-        print("Training finished.")
+        print("="*58)
+        print("✅ Процесс обучения корректно завершен.")
 
 if __name__ == "__main__":
     main()
-
-# --- КОНЕЦ ФАЙЛА ---
