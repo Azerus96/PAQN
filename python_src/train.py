@@ -313,8 +313,9 @@ def main():
                 rss_gb = p.memory_info().rss / 1024**3
                 threads = p.num_threads()
                 print(f"[MONITOR] RSS={rss_gb:.2f} GB, Threads={threads}", flush=True)
-                aim_run.track(rss_gb, name="system/memory_rss_gb")
-                aim_run.track(threads, name="system/num_threads")
+                if aim_run.active:
+                    aim_run.track(rss_gb, name="system/memory_rss_gb")
+                    aim_run.track(threads, name="system/num_threads")
                 time.sleep(15)
             except (psutil.NoSuchProcess, KeyboardInterrupt):
                 break
@@ -443,12 +444,13 @@ def main():
                 print(f"Request Queue: {request_queue.qsize()} | Result Dict: {len(result_dict)}", flush=True)
                 print("="*54, flush=True)
                 
-                aim_run.track(total_generated, name="system/total_samples_generated")
-                aim_run.track(policy_buffer.size(), name="buffer/policy_buffer_size")
-                aim_run.track(value_buffer.size(), name="buffer/value_buffer_size")
-                aim_run.track(request_queue.qsize(), name="system/request_queue_size")
-                if policy_losses: aim_run.track(avg_p_loss, name="loss/policy_loss_avg")
-                if value_losses: aim_run.track(avg_v_loss, name="loss/value_loss_avg")
+                if aim_run.active:
+                    aim_run.track(total_generated, name="system/total_samples_generated", step=global_step)
+                    aim_run.track(policy_buffer.size(), name="buffer/policy_buffer_size", step=global_step)
+                    aim_run.track(value_buffer.size(), name="buffer/value_buffer_size", step=global_step)
+                    aim_run.track(request_queue.qsize(), name="system/request_queue_size", step=global_step)
+                    if policy_losses: aim_run.track(avg_p_loss, name="loss/policy_loss_avg", step=global_step)
+                    if value_losses: aim_run.track(avg_v_loss, name="loss/value_loss_avg", step=global_step)
                 
                 last_stats_time = time.time()
 
@@ -514,29 +516,31 @@ def main():
             policy_losses.append(loss_p.item())
             global_step += 1
             
-            aim_run.track(loss_v.item(), name="loss/value_loss", step=global_step)
-            aim_run.track(loss_p.item(), name="loss/policy_loss", step=global_step)
-            aim_run.track(grad_norm.item(), name="diagnostics/grad_norm", step=global_step)
-            aim_run.track(adv_mean.item(), name="targets/advantage_mean", step=global_step)
-            aim_run.track(adv_std.item(), name="targets/advantage_std", step=global_step)
+            if aim_run.active:
+                aim_run.track(loss_v.item(), name="loss/value_loss", step=global_step)
+                aim_run.track(loss_p.item(), name="loss/policy_loss", step=global_step)
+                aim_run.track(grad_norm.item(), name="diagnostics/grad_norm", step=global_step)
+                aim_run.track(adv_mean.item(), name="targets/advantage_mean", step=global_step)
+                aim_run.track(adv_std.item(), name="targets/advantage_std", step=global_step)
 
             with torch.no_grad():
-                try:
-                    y = p_advantages_normalized.view(-1).cpu().numpy()
-                    yhat = pred_logits.view(-1).detach().cpu().numpy()
-                    corr = float(np.corrcoef(y, yhat)[0, 1]) if y.std() > 1e-6 and yhat.std() > 1e-6 else 0.0
-                except Exception: corr = 0.0
-                aim_run.track(corr, name="diagnostics/policy_corr", step=global_step)
+                if aim_run.active:
+                    try:
+                        y = p_advantages_normalized.view(-1).cpu().numpy()
+                        yhat = pred_logits.view(-1).detach().cpu().numpy()
+                        corr = float(np.corrcoef(y, yhat)[0, 1]) if y.std() > 1e-6 and yhat.std() > 1e-6 else 0.0
+                    except Exception: corr = 0.0
+                    aim_run.track(corr, name="diagnostics/policy_corr", step=global_step)
 
-                try:
-                    t = v_targets_clipped.view(-1).cpu().numpy()
-                    v = pred_values.view(-1).detach().cpu().numpy()
-                    ev = 1.0 - np.var(t - v) / (np.var(t) + 1e-8)
-                except Exception: ev = 0.0
-                aim_run.track(float(ev), name="diagnostics/value_explained_var", step=global_step)
+                    try:
+                        t = v_targets_clipped.view(-1).cpu().numpy()
+                        v = pred_values.view(-1).detach().cpu().numpy()
+                        ev = 1.0 - np.var(t - v) / (np.var(t) + 1e-8)
+                    except Exception: ev = 0.0
+                    aim_run.track(float(ev), name="diagnostics/value_explained_var", step=global_step)
 
-                aim_run.track(float(pred_logits.std().item()), name="diagnostics/policy_logit_std", step=global_step)
-                aim_run.track(float(pred_values.std().item()), name="diagnostics/value_pred_std", step=global_step)
+                    aim_run.track(float(pred_logits.std().item()), name="diagnostics/policy_logit_std", step=global_step)
+                    aim_run.track(float(pred_values.std().item()), name="diagnostics/value_pred_std", step=global_step)
                 
                 try:
                     live_metrics = {
@@ -618,3 +622,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# --- КОНЕЦ ФАЙЛА ---```
