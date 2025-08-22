@@ -1,6 +1,5 @@
-# --- НАЧАЛО ФАЙЛА python_src/train.py (ФИНАЛЬНАЯ СИНХРОНИЗИРОВАННАЯ ВЕРСИЯ) ---
+# --- НАЧАЛО ФАЙЛА python_src/train.py (ФИНАЛЬНАЯ СИНХРОНИЗИРОВАННАЯ ВЕРСИЯ v4.2) ---
 
-# ... (все импорты и константы остаются без изменений) ...
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -59,7 +58,6 @@ INFOSET_SIZE = NUM_FEATURE_CHANNELS * NUM_SUITS * NUM_RANKS
 # --- НАСТРОЙКИ ---
 NUM_INFERENCE_WORKERS = 24
 NUM_CPP_WORKERS = 48
-
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
 # --- ГИПЕРПАРАМЕТРЫ ---
@@ -71,16 +69,17 @@ MIN_BUFFER_FILL_SAMPLES = 50000
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
 STATS_INTERVAL_SECONDS = 15
-LOCAL_SAVE_INTERVAL_SECONDS = 300
-GIT_PUSH_INTERVAL_SECONDS = 600
+FIRST_SAVE_STEP = 2000 # Первое сохранение после 2000 шагов
+SAVE_INTERVAL_STEPS = 5000
+GIT_PUSH_INTERVAL_STEPS = 10000
 
 LOCAL_MODEL_DIR = "/content/local_models"
 MODEL_PATH = os.path.join(LOCAL_MODEL_DIR, "paqn_model_latest.pth")
 VERSION_FILE = os.path.join(LOCAL_MODEL_DIR, "latest_version.txt")
-OPPONENT_POOL_DIR = os.path.join(LOCAL_MODEL_DIR, "opponent_pool")
+GIT_OPPONENT_POOL_DIR = os.path.join(project_root, "opponent_pool")
+LOCAL_OPPONENT_POOL_DIR = os.path.join(LOCAL_MODEL_DIR, "opponent_pool")
 MAX_OPPONENTS_IN_POOL = 20
 LIVE_METRICS_FILE = os.path.join(LOCAL_MODEL_DIR, "live_metrics.json")
-
 GIT_MODEL_PATH = os.path.join(project_root, "paqn_model_latest.pth")
 
 # --- НАСТРОЙКИ GIT ---
@@ -88,7 +87,6 @@ GIT_REPO_OWNER = "Azerus96"
 GIT_REPO_NAME = "PAQN"
 GIT_BRANCH = "main"
 
-# --- GIT HELPER FUNCTIONS (без изменений) ---
 def run_git_command(command, repo_path):
     try:
         result = subprocess.run(command, cwd=repo_path, check=True, capture_output=True, text=True, timeout=120)
@@ -104,11 +102,15 @@ def git_push(commit_message, repo_path, auth_repo_url):
     print(f"\n--- Attempting to push to GitHub: '{commit_message}' ---")
     if os.path.exists(MODEL_PATH):
         shutil.copy2(MODEL_PATH, GIT_MODEL_PATH)
-        print(f"Copied {MODEL_PATH} to {GIT_MODEL_PATH} for pushing.")
-    else:
-        print("No local model to push.")
-        return
-    if not run_git_command(["git", "add", GIT_MODEL_PATH], repo_path): return
+        print(f"Copied {MODEL_PATH} to {GIT_MODEL_PATH}.")
+    
+    os.makedirs(GIT_OPPONENT_POOL_DIR, exist_ok=True)
+    if os.path.exists(LOCAL_OPPONENT_POOL_DIR):
+        for f in glob.glob(os.path.join(LOCAL_OPPONENT_POOL_DIR, "*.pth")):
+            shutil.copy2(f, GIT_OPPONENT_POOL_DIR)
+        print(f"Synced local opponent pool to git directory.")
+
+    if not run_git_command(["git", "add", GIT_MODEL_PATH, GIT_OPPONENT_POOL_DIR], repo_path): return
     status_result = subprocess.run(["git", "status", "--porcelain"], cwd=repo_path, capture_output=True, text=True)
     if not status_result.stdout.strip():
         print("No changes to commit.")
@@ -136,8 +138,6 @@ class InferenceWorker(mp.Process):
         self.model_version = -1
         self.last_version_check_time = 0
         self.request_counter = 0
-
-        # --- Параметры дампа живых сэмплов ---
         self.dump_every = int(os.environ.get("DUMP_EVERY", "0"))
         self.dump_dir = os.environ.get("DUMP_DIR", "/content/local_models/samples")
         self.dump_max = int(os.environ.get("DUMP_MAX_SAMPLES", "30"))
@@ -152,75 +152,50 @@ class InferenceWorker(mp.Process):
         self.device = torch.device("cpu")
         torch.set_num_threads(1)
         os.environ['OMP_NUM_THREADS'] = '1'
-        
         self.latest_model = OFC_CNN_Network().to(self.device)
         self.opponent_model = OFC_CNN_Network().to(self.device)
-
-        if self.dump_every:
-            os.makedirs(self.dump_dir, exist_ok=True)
-        
+        if self.dump_every: os.makedirs(self.dump_dir, exist_ok=True)
         self._load_models()
-        
         self.latest_model.eval()
         self.opponent_model.eval()
 
     def _load_models(self):
         try:
             if os.path.exists(MODEL_PATH):
-                for attempt in range(3):
-                    try:
-                        self.latest_model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
-                        self._log(f"Loaded latest model (version {self.model_version}).")
-                        break
-                    except Exception as e:
-                        self._log(f"Attempt {attempt+1} to load latest model failed: {e}. Retrying in 0.1s...")
-                        time.sleep(0.1)
-                else:
-                    self._log(f"!!! CRITICAL: FAILED to load latest model after 3 attempts. Continuing with old version.")
+                state_dict = torch.load(MODEL_PATH, map_location=self.device)
+                self.latest_model.load_state_dict(state_dict.get('model_state_dict', state_dict))
+                self.model_version = state_dict.get('model_version', -1)
+                self._log(f"Loaded latest model (version {self.model_version}).")
             else:
                 self._log("No latest model found, using initialized weights.")
         except Exception as e:
-            self._log(f"!!! UNEXPECTED EXCEPTION during latest model loading: {e}")
-            traceback.print_exc()
+            self._log(f"!!! EXCEPTION during latest model loading: {e}")
 
         try:
-            self.opponent_pool_files = glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth"))
+            self.opponent_pool_files = glob.glob(os.path.join(LOCAL_OPPONENT_POOL_DIR, "*.pth"))
             if self.opponent_pool_files:
                 opponent_path = random.choice(self.opponent_pool_files)
-                for attempt in range(3):
-                    try:
-                        self.opponent_model.load_state_dict(torch.load(opponent_path, map_location=self.device))
-                        self._log(f"Loaded opponent model: {os.path.basename(opponent_path)}")
-                        break
-                    except Exception as e:
-                        self._log(f"Attempt {attempt+1} to load opponent model failed: {e}. Retrying in 0.1s...")
-                        time.sleep(0.1)
-                else:
-                    self._log(f"!!! CRITICAL: FAILED to load opponent model. Using latest model as opponent.")
-                    self.opponent_model.load_state_dict(self.latest_model.state_dict())
+                state_dict = torch.load(opponent_path, map_location=self.device)
+                self.opponent_model.load_state_dict(state_dict.get('model_state_dict', state_dict))
+                self._log(f"Loaded opponent model: {os.path.basename(opponent_path)}")
             else:
                 self.opponent_model.load_state_dict(self.latest_model.state_dict())
                 self._log("Opponent pool is empty, using latest model as opponent.")
         except Exception as e:
-            self._log(f"!!! UNEXPECTED EXCEPTION during opponent model loading: {e}")
-            traceback.print_exc()
+            self._log(f"!!! EXCEPTION during opponent model loading: {e}")
 
     def _check_for_updates(self):
         self.request_counter += 1
         if self.request_counter % 100 != 0 and time.time() - self.last_version_check_time < 5:
             return
-
         self.last_version_check_time = time.time()
         try:
             if os.path.exists(VERSION_FILE):
                 with open(VERSION_FILE, 'r') as f:
                     latest_version = int(f.read())
                 if latest_version > self.model_version:
-                    worker_id = int(self.name.split('-')[-1])
-                    time.sleep(worker_id * 0.1)
-                    
+                    time.sleep(int(self.name.split('-')[-1]) * 0.1)
                     self._log(f"New model version detected ({latest_version}). Reloading models...")
-                    self.model_version = latest_version
                     self._load_models()
         except (IOError, ValueError) as e:
             self._log(f"Could not check for model update: {e}")
@@ -240,15 +215,6 @@ class InferenceWorker(mp.Process):
                 except queue.Empty:
                     self._check_for_updates()
                     continue
-
-                if self.request_counter % 500 == 1:
-                    self._log("--- INPUT TENSOR DIAGNOSTICS ---")
-                    infoset_np = np.array(infoset)
-                    self._log(f"Infoset stats: shape={infoset_np.shape}, min={infoset_np.min():.2f}, max={infoset_np.max():.2f}, mean={infoset_np.mean():.4f}, non-zero={np.count_nonzero(infoset_np)}")
-                    if is_policy and action_vectors:
-                        actions_np = np.array(action_vectors)
-                        self._log(f"Actions stats: shape={actions_np.shape}, min={actions_np.min():.2f}, max={actions_np.max():.2f}, mean={actions_np.mean():.4f}, non-zero={np.count_nonzero(actions_np)}")
-                    self._log("------------------------------------")
 
                 if self.dump_every and (self.sample_counter > self.dump_skip_first) and (self.sample_counter % self.dump_every == 1):
                     try:
@@ -272,7 +238,6 @@ class InferenceWorker(mp.Process):
                         final_path = tmp_path[:-4]
                         torch.save(sample, tmp_path)
                         os.rename(tmp_path, final_path)
-                        self._log(f"Saved sample: {final_path}")
                     except Exception as e:
                         self._log(f"Sample save failed: {e}")
 
@@ -288,15 +253,27 @@ class InferenceWorker(mp.Process):
                         if not action_vectors:
                             result = (req_id, True, [])
                         else:
+                            # --- ОПТИМИЗАЦИЯ НАЧИНАЕТСЯ ЗДЕСЬ ---
                             num_actions = len(action_vectors)
-                            infoset_batch = infoset_tensor.repeat(num_actions, 1, 1, 1)
-                            actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
-                            street_vector = infoset_batch[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
                             
-                            policy_logits, _ = model_to_use(infoset_batch, actions_tensor, street_vector)
+                            # 1. Прогоняем состояние через "тело" ОДИН РАЗ
+                            body_out_single = model_to_use.forward_body(infoset_tensor)
+                            
+                            # 2. "Размножаем" маленький вектор признаков
+                            body_out_batch = body_out_single.repeat(num_actions, 1)
+                            
+                            # 3. Готовим батчи для действий и улицы
+                            actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
+                            street_vector = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0].repeat(num_actions, 1)
+                            
+                            # 4. Вызываем только "голову" политики с уже готовыми данными
+                            policy_logits = model_to_use.forward_policy_head(body_out_batch, actions_tensor, street_vector)
+                            
                             predictions = policy_logits.cpu().numpy().flatten().tolist()
                             result = (req_id, True, predictions)
+                            # --- ОПТИМИЗАЦИЯ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ ---
                     else: # is_value
+                        # Для value запроса используется стандартный forward, который вызывает body и value_head
                         value = model_to_use(infoset_tensor)
                         result = (req_id, False, [value.item()])
                     
@@ -314,27 +291,19 @@ class InferenceWorker(mp.Process):
 
 def update_opponent_pool(model_version):
     if not os.path.exists(MODEL_PATH): return
-    
-    os.makedirs(OPPONENT_POOL_DIR, exist_ok=True)
-    
-    temp_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"temp_paqn_model_v{model_version}.pth")
-    new_opponent_path = os.path.join(OPPONENT_POOL_DIR, f"paqn_model_v{model_version}.pth")
-    
+    os.makedirs(LOCAL_OPPONENT_POOL_DIR, exist_ok=True)
+    new_opponent_path = os.path.join(LOCAL_OPPONENT_POOL_DIR, f"paqn_model_v{model_version}.pth")
     try:
-        shutil.copy2(MODEL_PATH, temp_opponent_path)
-        os.rename(temp_opponent_path, new_opponent_path)
-        print(f"Added model version {model_version} to opponent pool.")
+        shutil.copy2(MODEL_PATH, new_opponent_path)
+        print(f"Added model version {model_version} to local opponent pool.")
     except Exception as e:
         print(f"Error updating opponent pool: {e}")
-        if os.path.exists(temp_opponent_path):
-            os.remove(temp_opponent_path)
         return
-
-    pool_files = sorted(glob.glob(os.path.join(OPPONENT_POOL_DIR, "*.pth")), key=os.path.getmtime)
-    
-    while len(pool_files) >= MAX_OPPONENTS_IN_POOL:
+    pool_files = sorted(glob.glob(os.path.join(LOCAL_OPPONENT_POOL_DIR, "*.pth")), key=os.path.getmtime)
+    while len(pool_files) > MAX_OPPONENTS_IN_POOL:
         try:
             os.remove(pool_files.pop(0))
+            print(f"Removed oldest opponent from pool.")
         except OSError as e:
             print(f"Warning: Could not remove old opponent file: {e}")
 
@@ -365,23 +334,23 @@ def main():
 
     git_username = os.environ.get('GIT_USERNAME')
     git_token = os.environ.get('GIT_TOKEN')
-
     if not git_username or not git_token:
         print("ERROR: GIT_USERNAME and GIT_TOKEN environment variables must be set.")
         sys.exit(1)
-        
     auth_repo_url = f"https://{git_username}:{git_token}@github.com/{GIT_REPO_OWNER}/{GIT_REPO_NAME}.git"
-    
     run_git_command(["git", "config", "--global", "user.email", f"{git_username}@users.noreply.github.com"], project_root)
     run_git_command(["git", "config", "--global", "user.name", git_username], project_root)
-    
     git_pull(project_root, auth_repo_url)
     
     os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
-    os.makedirs(OPPONENT_POOL_DIR, exist_ok=True)
+    os.makedirs(LOCAL_OPPONENT_POOL_DIR, exist_ok=True)
+    if os.path.exists(GIT_OPPONENT_POOL_DIR):
+        print("Syncing opponent pool from Git...")
+        for f in glob.glob(os.path.join(GIT_OPPONENT_POOL_DIR, "*.pth")):
+            shutil.copy2(f, LOCAL_OPPONENT_POOL_DIR)
+        print(f"Synced {len(os.listdir(LOCAL_OPPONENT_POOL_DIR))} opponents.")
 
     if os.path.exists(GIT_MODEL_PATH) and not os.path.exists(MODEL_PATH):
-        print(f"Copying model from Git repo to local directory: {GIT_MODEL_PATH} -> {MODEL_PATH}")
         shutil.copy2(GIT_MODEL_PATH, MODEL_PATH)
     
     print("Initializing C++ hand evaluator lookup tables...", flush=True)
@@ -392,36 +361,36 @@ def main():
     print(f"Using device: {device}", flush=True)
     
     model = OFC_CNN_Network().to(device)
-    model_version = 0
-    if os.path.exists(MODEL_PATH):
-        try:
-            model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-            print("Loaded latest model from local path:", MODEL_PATH)
-            if os.path.exists(VERSION_FILE):
-                with open(VERSION_FILE, 'r') as f:
-                    model_version = int(f.read())
-                print(f"Current model version: {model_version}")
-        except Exception as e:
-            print(f"Could not load model, starting from scratch. Error: {e}")
-
-    # --- Head-only warmup logic ---
-    head_names = ("value_head.", "policy_head.", "action_proj.", "street_proj.", "body_ln", "action_ln", "street_ln")
+    
+    head_names = ("value_head.", "policy_head_fc.", "action_proj.", "street_proj.", "body_ln", "action_ln", "street_ln")
     head_params, trunk_params = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad: continue
         (head_params if any(h in n for h in head_names) else trunk_params).append(p)
-
     head_lr_mult = float(os.environ.get("HEAD_LR_MULT", "1.0"))
     optimizer_grouped_parameters = [
         {'params': trunk_params, 'lr': LEARNING_RATE, 'weight_decay': 0.01},
         {'params': head_params,  'lr': LEARNING_RATE * head_lr_mult, 'weight_decay': 0.0},
     ]
     optimizer = optim.AdamW(optimizer_grouped_parameters)
+    
+    model_version, global_step = 0, 0
+    if os.path.exists(MODEL_PATH):
+        try:
+            state_dict = torch.load(MODEL_PATH, map_location=device)
+            model.load_state_dict(state_dict['model_state_dict'])
+            optimizer.load_state_dict(state_dict['optimizer_state_dict'])
+            global_step = state_dict.get('global_step', 0)
+            model_version = state_dict.get('model_version', 0)
+            print(f"Loaded model, optimizer, and state. Resuming from step {global_step}, version {model_version}")
+        except Exception as e:
+            print(f"Could not load full state, starting from scratch. Error: {e}")
+            model = OFC_CNN_Network().to(device)
+            optimizer = optim.AdamW(optimizer_grouped_parameters)
+
     head_warmup_steps = int(os.environ.get("HEAD_WARMUP_STEPS", "0"))
     if head_warmup_steps > 0:
         print(f"!!! HEAD-ONLY WARMUP ENABLED for {head_warmup_steps} steps with LR multiplier x{head_lr_mult} !!!")
-    else:
-        print("Optimizer configured with AdamW and parameter groups (with/without weight decay).")
     
     policy_buffer = ReplayBuffer(BUFFER_CAPACITY)
     value_buffer = ReplayBuffer(BUFFER_CAPACITY)
@@ -450,14 +419,17 @@ def main():
     policy_losses = deque(maxlen=100)
     value_losses = deque(maxlen=100)
     last_stats_time = time.time()
-    last_local_save_time = time.time()
-    last_git_push_time = time.time()
     last_cleanup_time = time.time()
     
     STREET_START_IDX = 9
     STREET_END_IDX = 14
-    global_step = 0
-    training_started = False # <<< НОВЫЙ ФЛАГ
+    training_started = False
+    
+    min_fill = BATCH_SIZE * 4 if global_step > 0 else MIN_BUFFER_FILL_SAMPLES
+    print(f"Training will start when buffer size reaches {min_fill} samples.")
+    
+    last_save_step = global_step
+    last_push_step = global_step
 
     try:
         while True:
@@ -504,13 +476,13 @@ def main():
                 gc.collect()
                 last_cleanup_time = time.time()
 
-            if value_buffer.size() < MIN_BUFFER_FILL_SAMPLES or policy_buffer.size() < MIN_BUFFER_FILL_SAMPLES:
-                print(f"Waiting for buffer to fill... Policy: {policy_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES} | Value: {value_buffer.size()}/{MIN_BUFFER_FILL_SAMPLES}", end='\r', flush=True)
+            if value_buffer.size() < min_fill or policy_buffer.size() < min_fill:
+                print(f"Waiting for buffer... P: {policy_buffer.size()}/{min_fill} | V: {value_buffer.size()}/{min_fill}", end='\r', flush=True)
                 time.sleep(1)
                 continue
 
             if not training_started:
-                print("\nBuffer filled. Starting training...")
+                print("\nBuffer ready. Starting training...")
                 training_started = True
 
             model.train()
@@ -590,24 +562,27 @@ def main():
             
             model.eval()
 
-            now = time.time()
-            # <<< ИЗМЕНЕНИЕ: ПРОВЕРЯЕМ ФЛАГ ПЕРЕД СОХРАНЕНИЕМ >>>
-            if training_started and now - last_local_save_time > LOCAL_SAVE_INTERVAL_SECONDS:
-                print("\n--- Saving models locally and updating opponent pool ---", flush=True)
-                
-                temp_model_path = MODEL_PATH + ".tmp"
-                torch.save(model.state_dict(), temp_model_path)
-                os.rename(temp_model_path, MODEL_PATH)
+            is_first_save = (global_step >= FIRST_SAVE_STEP) and (last_save_step < FIRST_SAVE_STEP)
+            is_regular_save = (global_step - last_save_step) >= SAVE_INTERVAL_STEPS
 
+            if training_started and (is_first_save or is_regular_save):
+                print(f"\n--- Saving model at step {global_step} ---", flush=True)
                 model_version += 1
-                with open(VERSION_FILE, 'w') as f:
-                    f.write(str(model_version))
+                
+                torch.save({
+                    'global_step': global_step, 'model_version': model_version,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, MODEL_PATH + ".tmp")
+                os.rename(MODEL_PATH + ".tmp", MODEL_PATH)
+
+                with open(VERSION_FILE, 'w') as f: f.write(str(model_version))
                 update_opponent_pool(model_version)
-                last_local_save_time = now
+                last_save_step = global_step
             
-            if training_started and now - last_git_push_time > GIT_PUSH_INTERVAL_SECONDS:
-                git_push(f"Periodic model save v{model_version}", project_root, auth_repo_url)
-                last_git_push_time = now
+            if training_started and (global_step - last_push_step) >= GIT_PUSH_INTERVAL_STEPS:
+                git_push(f"Periodic save: v{model_version}, step {global_step}", project_root, auth_repo_url)
+                last_push_step = global_step
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.", flush=True)
@@ -629,10 +604,14 @@ def main():
         
         if training_started:
             print("Final model saving...", flush=True)
-            temp_model_path = MODEL_PATH + ".tmp"
-            torch.save(model.state_dict(), temp_model_path)
-            os.rename(temp_model_path, MODEL_PATH)
-            git_push(f"Final model save v{model_version} on exit", project_root, auth_repo_url)
+            torch.save({
+                'global_step': global_step,
+                'model_version': model_version,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, MODEL_PATH + ".tmp")
+            os.rename(MODEL_PATH + ".tmp", MODEL_PATH)
+            git_push(f"Final save: v{model_version}, step {global_step}", project_root, auth_repo_url)
         
         aim_run.close()
         print("Training finished.")
