@@ -1,4 +1,4 @@
-# --- НАЧАЛО ФАЙЛА python_src/model.py ---
+# --- НАЧАЛО ФАЙЛА python_src/model.py (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ) ---
 
 import torch
 import torch.nn as nn
@@ -33,38 +33,37 @@ class ResBlock(nn.Module):
 
 class OFC_CNN_Network(nn.Module):
     """
-    ИСПРАВЛЕННАЯ архитектура сети с ResNet-подобным телом и сбалансированной policy-головой.
+    ОПТИМИЗИРОВАННАЯ архитектура сети с разделением на тело и головы.
     """
     def __init__(self, hidden_size=512, channels=64, num_res_blocks=6, groups=8):
         super(OFC_CNN_Network, self).__init__()
         
-        # 1. Сверточное "тело" для извлечения признаков из состояния игры
-        self.stem = nn.Sequential(
+        # --- "Тело" сети (тяжелая часть) ---
+        self.body = nn.Sequential(
             nn.Conv2d(NUM_FEATURE_CHANNELS, channels, 3, padding=1, bias=False),
             nn.GroupNorm(groups, channels),
             nn.SiLU(inplace=True),
+            *[ResBlock(channels, groups) for _ in range(num_res_blocks)],
         )
-        self.res_trunk = nn.Sequential(*[ResBlock(channels, groups) for _ in range(num_res_blocks)])
         
         conv_output_size = channels * NUM_SUITS * NUM_RANKS
         
-        # 2. Общая полносвязная часть
+        # --- Общая полносвязная часть ---
         self.body_fc = nn.Sequential(
             nn.Linear(conv_output_size, hidden_size),
             nn.SiLU(inplace=True),
         )
 
-        # 3. Голова для оценки ценности состояния (Value Head)
+        # --- "Головы" сети (легкие части) ---
+        # 1. Голова для оценки ценности состояния (Value Head)
         self.value_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.SiLU(inplace=True),
             nn.Linear(hidden_size // 2, 1)
         )
         
-        # 4. Голова для оценки действий (Policy Head)
-        # Проекции для векторов действия и улицы для уменьшения размерности
+        # 2. Голова для оценки действий (Policy Head)
         self.action_proj = nn.Sequential(
-            # !!! ИЗМЕНЕНИЕ: Убран LayerNorm отсюда, он будет применен ниже !!!
             nn.Linear(ACTION_VECTOR_SIZE, 128),
             nn.SiLU(inplace=True),
         )
@@ -73,17 +72,13 @@ class OFC_CNN_Network(nn.Module):
             nn.SiLU(inplace=True),
         )
         
-        # !!! ИЗМЕНЕНИЕ: Раздельные слои нормализации для каждой ветви !!!
         self.body_ln = nn.LayerNorm(hidden_size)
         self.action_ln = nn.LayerNorm(128)
         self.street_ln = nn.LayerNorm(8)
         
         policy_input_size = hidden_size + 128 + 8
         
-        # !!! ИЗМЕНЕНИЕ: Старый общий LayerNorm удален !!!
-        # self.policy_ln = nn.LayerNorm(policy_input_size)
-        
-        self.policy_head = nn.Sequential(
+        self.policy_head_fc = nn.Sequential(
             nn.Linear(policy_input_size, hidden_size),
             nn.SiLU(inplace=True),
             nn.Linear(hidden_size, hidden_size // 2),
@@ -91,40 +86,48 @@ class OFC_CNN_Network(nn.Module):
             nn.Linear(hidden_size // 2, 1)
         )
 
-    def forward(self, state_image, action_vec=None, street_vector=None):
-        # Прогон через сверточную часть
-        x = self.stem(state_image)
-        x = self.res_trunk(x)
-        
-        # Выпрямление и прогон через общую полносвязную часть
-        flat_out = x.view(x.size(0), -1)
+    # <<< НОВЫЙ МЕТОД >>>
+    # Прогоняет состояние через тяжелую сверточную часть
+    def forward_body(self, state_image):
+        conv_out = self.body(state_image)
+        flat_out = conv_out.view(conv_out.size(0), -1)
         body_out = self.body_fc(flat_out)
-        
-        # Если нужен только Value (оценка состояния)
-        if action_vec is None:
-            value = self.value_head(body_out)
-            return value
-        
-        # Если нужен Policy (оценка действия)
-        if street_vector is None:
-            raise ValueError("street_vector must be provided for policy evaluation")
-            
-        # !!! ИЗМЕНЕНИЕ: Применяем раздельную нормализацию ДО конкатенации !!!
-        # 1. Получаем эмбеддинги
+        return body_out
+
+    # <<< НОВЫЙ МЕТОД >>>
+    # Вычисляет value из вектора признаков
+    def forward_value_head(self, body_out):
+        return self.value_head(body_out)
+
+    # <<< НОВЫЙ МЕТОД >>>
+    # Вычисляет policy logits из вектора признаков и векторов действий
+    def forward_policy_head(self, body_out, action_vec, street_vector):
         action_embedding = self.action_proj(action_vec)
         street_embedding = self.street_proj(street_vector)
         
-        # 2. Нормализуем КАЖДУЮ часть ОТДЕЛЬНО
         body_norm = self.body_ln(body_out)
         action_norm = self.action_ln(action_embedding)
         street_norm = self.street_ln(street_embedding)
         
-        # 3. Конкатенируем УЖЕ нормализованные векторы
         policy_input = torch.cat([body_norm, action_norm, street_norm], dim=1)
+        policy_logit = self.policy_head_fc(policy_input)
+        return policy_logit
+
+    # Основной метод forward для совместимости с циклом обучения
+    def forward(self, state_image, action_vec=None, street_vector=None):
+        body_out = self.forward_body(state_image)
         
-        # 4. Подаем в голову напрямую, без общей нормализации
-        policy_logit = self.policy_head(policy_input)
+        if action_vec is None:
+            # Только Value
+            value = self.forward_value_head(body_out)
+            return value
+        
+        # Policy
+        if street_vector is None:
+            raise ValueError("street_vector must be provided for policy evaluation")
+            
+        policy_logit = self.forward_policy_head(body_out, action_vec, street_vector)
         
         return policy_logit, None
 
-# --- КОНЕЦ ФАЙЛА python_src/model.py ---
+# --- КОНЕЦ ФАЙЛА ---
