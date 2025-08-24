@@ -66,11 +66,7 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, Sha
       request_queue_(request_queue),
       result_queue_(result_queue),
       log_queue_(log_queue),
-      // ===================================================================
-      // === ИСПРАВЛЕНИЕ 1: ИСПОЛЬЗОВАНИЕ std::random_device ДЛЯ УНИКАЛЬНОГО SEED ===
-      // ===================================================================
       rng_(std::random_device{}()),
-      // ===================================================================
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
 {}
 
@@ -197,7 +193,6 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     uint64_t policy_request_id = traversal_id * 2;
     uint64_t value_request_id = traversal_id * 2 + 1;
 
-    // *** ИЗМЕНЕНИЕ: Добавляем флаг, чтобы Python знал, чья очередь ***
     bool is_traverser_turn = (current_player == traversing_player);
 
     {
@@ -300,7 +295,11 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     if (it != action_payoffs.end()) {
         float advantage = it->second - value_baseline;
         policy_buffer_->push(infoset_vec, canonical_action_vectors[sampled_action_idx], advantage);
-        value_buffer_->push(infoset_vec, dummy_action_vec_, it->second);
+        // ===================================================================
+        // === ИСПРАВЛЕНИЕ: ВЫЗОВ НОВОГО МЕТОДА ДЛЯ НОРМАЛИЗАЦИИ ЗНАЧЕНИЙ ===
+        // ===================================================================
+        value_buffer_->push_value(infoset_vec, dummy_action_vec_, it->second);
+        // ===================================================================
     }
     return action_payoffs;
 }
