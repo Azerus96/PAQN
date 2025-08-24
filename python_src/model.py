@@ -1,8 +1,9 @@
-# --- НАЧАЛО ФАЙЛА python_src/model.py (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ) ---
+# --- НАЧАЛО ФАЙЛА python_src/model.py (ОБНОВЛЕННАЯ ВЕРСИЯ) ---
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math # <-- Добавлен импорт для инициализации
 
 # --- КОНСТАНТЫ ---
 NUM_FEATURE_CHANNELS = 16
@@ -21,6 +22,12 @@ class ResBlock(nn.Module):
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.act = nn.SiLU(inplace=True)
+
+        # === ИЗМЕНЕНИЕ (Пункт 1): Инициализация последнего слоя нулями ===
+        # Это делает блок близким к тождественной функции на старте обучения,
+        # что стабилизирует глубокие сети.
+        nn.init.zeros_(self.conv2.weight)
+        # ================================================================
 
     def forward(self, x):
         identity = x
@@ -85,6 +92,24 @@ class OFC_CNN_Network(nn.Module):
             nn.SiLU(inplace=True),
             nn.Linear(hidden_size // 2, 1)
         )
+
+        # === ИЗМЕНЕНИЕ (Пункт 1): Применяем кастомную инициализацию ко всей модели ===
+        self.apply(self._init_weights)
+        # ============================================================================
+
+    # === НОВЫЙ МЕТОД (Пункт 1): Правильная инициализация весов ===
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            # Инициализация Kaiming (He) хорошо подходит для активаций типа ReLU/SiLU
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif isinstance(m, nn.Linear):
+            # Стандартная инициализация PyTorch для Linear, основанная на Kaiming uniform
+            nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+            if m.bias is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                nn.init.uniform_(m.bias, -bound, bound)
+    # ============================================================
 
     # <<< НОВЫЙ МЕТОД >>>
     # Прогоняет состояние через тяжелую сверточную часть
