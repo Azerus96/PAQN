@@ -1,4 +1,4 @@
-# --- НАЧАЛО ФАЙЛА python_src/train.py (v5.1 - С ИСПРАВЛЕНИЕМ КРАША) ---
+# --- НАЧАЛО ФАЙЛА python_src/train.py (С УЛЬТРА-ДИАГНОСТИКОЙ) ---
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -273,10 +273,7 @@ class InferenceWorker(mp.Process):
                         value = model_to_use(infoset_tensor)
                         result = (req_id, False, [value.item()])
                     
-                    # === ИСПРАВЛЕНИЕ: Возвращаем формат, который ожидает C++ ===
-                    # Не добавляем временную метку, чтобы не ломать контракт.
                     self.result_dict[req_id] = result
-                    # ==========================================================
 
             except (KeyboardInterrupt, SystemExit):
                 break
@@ -448,9 +445,7 @@ def main():
     val_value_data = {'infosets': np.array([]), 'targets': np.array([])}
     last_validation_step = global_step
     
-    # === ИСПРАВЛЕНИЕ: Отдельный словарь для временных меток ===
     result_timestamps = {}
-    # =========================================================
 
     try:
         while True:
@@ -486,15 +481,12 @@ def main():
                 
                 last_stats_time = time.time()
 
-            # === ИСПРАВЛЕНИЕ: Логика очистки result_dict по TTL с отдельным словарем ===
             if time.time() - last_cleanup_time > 60:
                 now = time.time()
-                # Обновляем временные метки для всех текущих ключей в result_dict
                 for key in result_dict.keys():
                     if key not in result_timestamps:
                         result_timestamps[key] = now
                 
-                # Удаляем старые ключи
                 keys_to_delete = [key for key, ts in result_timestamps.items() if now - ts > RESULT_TTL_SECONDS]
                 
                 if len(result_dict) > 10000 and keys_to_delete:
@@ -503,7 +495,6 @@ def main():
                         result_dict.pop(key, None)
                         result_timestamps.pop(key, None)
                 
-                # Очищаем словарь временных меток от ключей, которых уже нет в result_dict
                 if len(result_timestamps) > len(result_dict) * 2:
                      current_keys = set(result_dict.keys())
                      ts_keys_to_delete = [key for key in result_timestamps if key not in current_keys]
@@ -512,7 +503,6 @@ def main():
 
                 gc.collect()
                 last_cleanup_time = time.time()
-            # ========================================================================
 
             if value_buffer.size() < min_fill or policy_buffer.size() < min_fill:
                 print(f"Waiting for buffer... P: {policy_buffer.size()}/{min_fill} | V: {value_buffer.size()}/{min_fill}", end='\r', flush=True)
@@ -593,29 +583,66 @@ def main():
             policy_losses.append(loss_p.item())
             global_step += 1
             
+            # =================================================================================
+            # === НАЧАЛО БЛОКА УЛЬТРА-ДИАГНОСТИКИ ===
+            # =================================================================================
             if aim_run.active:
+                # --- 1. Базовые метрики (уже были) ---
                 aim_run.track(loss_v.item(), name="loss/value_loss", step=global_step)
                 aim_run.track(loss_p.item(), name="loss/policy_loss", step=global_step)
                 aim_run.track(grad_norm.item(), name="diagnostics/grad_norm", step=global_step)
-                aim_run.track(adv_mean.item(), name="targets/advantage_mean", step=global_step)
-                aim_run.track(adv_std.item(), name="targets/advantage_std", step=global_step)
+                
+                with torch.no_grad():
+                    # --- 2. Статистика Value Targets (для проверки гипотезы о Var(t) ~ 0) ---
+                    vt_raw = v_targets.view(-1)
+                    vt_clipped = v_targets_clipped.view(-1)
+                    aim_run.track(float(vt_raw.mean().item()), name="targets/value_raw/mean", step=global_step, context={"subset": "train"})
+                    aim_run.track(float(vt_raw.std().item()), name="targets/value_raw/std", step=global_step, context={"subset": "train"})
+                    aim_run.track(float(vt_raw.min().item()), name="targets/value_raw/min", step=global_step, context={"subset": "train"})
+                    aim_run.track(float(vt_raw.max().item()), name="targets/value_raw/max", step=global_step, context={"subset": "train"})
+                    
+                    aim_run.track(float(vt_clipped.mean().item()), name="targets/value_clipped/mean", step=global_step, context={"subset": "train"})
+                    aim_run.track(float(vt_clipped.std().item()), name="targets/value_clipped/std", step=global_step, context={"subset": "train"})
 
-            with torch.no_grad():
-                if aim_run.active:
+                    # --- 3. Статистика Policy Advantages (до и после нормализации) ---
+                    pa_raw = p_advantages.view(-1)
+                    pa_norm = p_advantages_normalized.view(-1)
+                    aim_run.track(float(pa_raw.mean().item()), name="targets/advantage_raw/mean", step=global_step, context={"subset": "train"})
+                    aim_run.track(float(pa_raw.std().item()), name="targets/advantage_raw/std", step=global_step, context={"subset": "train"})
+                    aim_run.track(float(pa_raw.min().item()), name="targets/advantage_raw/min", step=global_step, context={"subset": "train"})
+                    aim_run.track(float(pa_raw.max().item()), name="targets/advantage_raw/max", step=global_step, context={"subset": "train"})
+
+                    aim_run.track(float(pa_norm.mean().item()), name="targets/advantage_normalized/mean", step=global_step, context={"subset": "train"})
+                    aim_run.track(float(pa_norm.std().item()), name="targets/advantage_normalized/std", step=global_step, context={"subset": "train"})
+
+                    # --- 4. Расширенная диагностика Policy Correlation ---
                     try:
-                        y = p_advantages_normalized.view(-1).cpu().numpy()
+                        y = pa_norm.cpu().numpy()
                         yhat = pred_logits.view(-1).detach().cpu().numpy()
-                        corr = float(np.corrcoef(y, yhat)[0, 1]) if y.std() > 1e-6 and yhat.std() > 1e-6 else 0.0
-                    except Exception: corr = 0.0
+                        y_std = float(np.std(y))
+                        yhat_std = float(np.std(yhat))
+                        corr = float(np.corrcoef(y, yhat)[0, 1]) if y_std > 1e-6 and yhat_std > 1e-6 else 0.0
+                    except Exception:
+                        corr, y_std, yhat_std = 0.0, 0.0, 0.0
+                    
                     aim_run.track(corr, name="diagnostics/policy_corr", step=global_step)
+                    aim_run.track(y_std, name="diagnostics/policy_target_std", step=global_step) # std цели
+                    aim_run.track(yhat_std, name="diagnostics/policy_pred_std", step=global_step) # std предсказания
 
+                    # --- 5. Расширенная диагностика Explained Variance с защитой ---
                     try:
-                        t = v_targets_clipped.view(-1).cpu().numpy()
+                        t = vt_clipped.cpu().numpy()
                         v = pred_values.view(-1).detach().cpu().numpy()
-                        ev = 1.0 - np.var(t - v) / (np.var(t) + 1e-8)
-                    except Exception: ev = 0.0
-                    aim_run.track(float(ev), name="diagnostics/value_explained_var", step=global_step)
+                        var_t = float(np.var(t))
+                        # Защита от деления на ноль и логирование дисперсии таргета
+                        ev = 1.0 - float(np.var(t - v)) / max(var_t, 1e-6) 
+                    except Exception:
+                        ev, var_t = 0.0, 0.0
+                    
+                    aim_run.track(ev, name="diagnostics/value_explained_var", step=global_step)
+                    aim_run.track(var_t, name="diagnostics/value_target_var", step=global_step) # Дисперсия цели
 
+                    # --- 6. Статистика предсказаний (уже была, но для полноты) ---
                     aim_run.track(float(pred_logits.std().item()), name="diagnostics/policy_logit_std", step=global_step)
                     aim_run.track(float(pred_values.std().item()), name="diagnostics/value_pred_std", step=global_step)
                 
@@ -628,6 +655,9 @@ def main():
                     }
                     with open(LIVE_METRICS_FILE, "w") as f: json.dump(live_metrics, f)
                 except Exception: pass
+            # =================================================================================
+            # === КОНЕЦ БЛОКА УЛЬТРА-ДИАГНОСТИКИ ===
+            # =================================================================================
             
             model.eval()
 
