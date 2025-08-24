@@ -1,5 +1,3 @@
-# --- НАЧАЛО ФАЙЛА python_src/train.py (С УЛЬТРА-ДИАГНОСТИКОЙ) ---
-
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -8,6 +6,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 os.environ.setdefault("OMP_MAX_ACTIVE_LEVELS", "1")
 os.environ.setdefault("PYTHONFAULTHANDLER", "1")
+os.environ.setdefault("HEAD_WARMUP_STEPS", "2000") # Requirement 2.2
 
 import sys
 import time
@@ -15,7 +14,6 @@ import torch
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
@@ -61,7 +59,7 @@ NUM_INFERENCE_WORKERS = 24
 NUM_CPP_WORKERS = 48
 print(f"Configuration: {NUM_CPP_WORKERS} C++ workers, {NUM_INFERENCE_WORKERS} Python inference workers.")
 
-# --- ГИПЕРПАРАМЕТРЫ ---
+# --- ГИПЕРПАРАМЕТРЫ (Requirement 2.3) ---
 ACTION_LIMIT = 100
 LEARNING_RATE = 0.0001
 BUFFER_CAPACITY = 1_000_000
@@ -146,11 +144,6 @@ class InferenceWorker(mp.Process):
         self.model_version = -1
         self.last_version_check_time = 0
         self.request_counter = 0
-        self.dump_every = int(os.environ.get("DUMP_EVERY", "0"))
-        self.dump_dir = os.environ.get("DUMP_DIR", "/content/local_models/samples")
-        self.dump_max = int(os.environ.get("DUMP_MAX_SAMPLES", "30"))
-        self.dump_skip_first = int(os.environ.get("DUMP_SKIP_FIRST_REQUESTS", "5000"))
-        self.sample_counter = 0
 
     def _log(self, message):
         self.log_queue.put(f"[{self.name}] {message}")
@@ -162,7 +155,6 @@ class InferenceWorker(mp.Process):
         os.environ['OMP_NUM_THREADS'] = '1'
         self.latest_model = OFC_CNN_Network().to(self.device)
         self.opponent_model = OFC_CNN_Network().to(self.device)
-        if self.dump_every: os.makedirs(self.dump_dir, exist_ok=True)
         self._load_models()
         self.latest_model.eval()
         self.opponent_model.eval()
@@ -219,35 +211,9 @@ class InferenceWorker(mp.Process):
                 try:
                     request_tuple = self.task_queue.get(timeout=1)
                     req_id, is_policy, infoset, action_vectors, is_traverser_turn = request_tuple
-                    self.sample_counter += 1
                 except queue.Empty:
                     self._check_for_updates()
                     continue
-
-                if self.dump_every and (self.sample_counter > self.dump_skip_first) and (self.sample_counter % self.dump_every == 1):
-                    try:
-                        existing = sorted(glob.glob(os.path.join(self.dump_dir, "*.pt")), key=os.path.getmtime)
-                        while len(existing) >= self.dump_max:
-                            try:
-                                os.remove(existing.pop(0))
-                            except OSError:
-                                break
-
-                        infoset_tensor_1 = torch.tensor(infoset, dtype=torch.float32).view(1, 16, 4, 13)
-                        street_vec_1 = infoset_tensor_1[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
-                        sample = {
-                            "req_id": req_id, "timestamp": time.time(), "worker": self.name,
-                            "model_version": self.model_version, "is_policy": bool(is_policy),
-                            "is_traverser_turn": bool(is_traverser_turn), "infoset": infoset_tensor_1,
-                            "street": street_vec_1,
-                            "actions": torch.tensor(action_vectors, dtype=torch.float32) if (is_policy and action_vectors) else None,
-                        }
-                        tmp_path = os.path.join(self.dump_dir, f"sample_{int(time.time())}_{self.name}.pt.tmp")
-                        final_path = tmp_path[:-4]
-                        torch.save(sample, tmp_path)
-                        os.rename(tmp_path, final_path)
-                    except Exception as e:
-                        self._log(f"Sample save failed: {e}")
 
                 self._check_for_updates()
                 
@@ -270,7 +236,7 @@ class InferenceWorker(mp.Process):
                             predictions = policy_logits.cpu().numpy().flatten().tolist()
                             result = (req_id, True, predictions)
                     else: # is_value
-                        value = model_to_use(infoset_tensor)
+                        value = model_to_use.forward_value_head(model_to_use.forward_body(infoset_tensor))
                         result = (req_id, False, [value.item()])
                     
                     self.result_dict[req_id] = result
@@ -303,24 +269,42 @@ def update_opponent_pool(model_version):
         except OSError as e:
             print(f"Warning: Could not remove old opponent file: {e}")
 
-def get_params_for_optimizer(model: torch.nn.Module, weight_decay: float):
-    decay_params = []
-    no_decay_params = []
+# Requirement 2.2: Differentiated learning rate and weight decay
+def get_params_for_optimizer(model, base_lr, weight_decay, head_lr_mult=2.0, head_wd=0.0):
+    head_names = ["value_head", "action_proj", "street_proj", "policy_head_fc", "body_ln", "action_ln", "street_ln"]
+    
+    params_body_decay = []
+    params_body_no_decay = []
+    params_head_decay = []
+    params_head_no_decay = []
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.dim() <= 1 or name.endswith(".bias") or "norm" in name:
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
+        
+        is_head = any(h_name in name for h_name in head_names)
+        is_no_decay = param.dim() <= 1 or name.endswith(".bias") or "norm" in name
+
+        if is_head:
+            if is_no_decay:
+                params_head_no_decay.append(param)
+            else:
+                params_head_decay.append(param)
+        else: # is_body
+            if is_no_decay:
+                params_body_no_decay.append(param)
+            else:
+                params_body_decay.append(param)
     
     return [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': no_decay_params, 'weight_decay': 0.0}
+        {'params': params_body_decay, 'weight_decay': weight_decay, 'lr': base_lr},
+        {'params': params_body_no_decay, 'weight_decay': 0.0, 'lr': base_lr},
+        {'params': params_head_decay, 'weight_decay': head_wd, 'lr': base_lr * head_lr_mult},
+        {'params': params_head_no_decay, 'weight_decay': 0.0, 'lr': base_lr * head_lr_mult},
     ]
 
 def main():
-    aim_run = aim.Run(experiment="paqn_ofc_poker")
+    aim_run = aim.Run(experiment="paqn_ofc_poker_fix")
     aim_run["hparams"] = {
         "num_cpp_workers": NUM_CPP_WORKERS,
         "num_inference_workers": NUM_INFERENCE_WORKERS,
@@ -331,7 +315,9 @@ def main():
         "policy_loss_weight": POLICY_LOSS_WEIGHT,
         "adv_clip_value": ADV_CLIP_VALUE,
         "value_clip_value": VALUE_CLIP_VALUE,
-        "validation_split_prob": VALIDATION_SPLIT_PROB,
+        "head_lr_mult": 2.0,
+        "head_wd": 0.0,
+        "head_warmup_steps": int(os.environ.get("HEAD_WARMUP_STEPS", "2000")),
     }
 
     def monitor_resources():
@@ -379,9 +365,7 @@ def main():
     
     model = OFC_CNN_Network().to(device)
     
-    optimizer_grouped_parameters = [
-        {**group, 'lr': LEARNING_RATE} for group in get_params_for_optimizer(model, weight_decay=0.01)
-    ]
+    optimizer_grouped_parameters = get_params_for_optimizer(model, LEARNING_RATE, weight_decay=0.01, head_lr_mult=2.0, head_wd=0.0)
     optimizer = optim.AdamW(optimizer_grouped_parameters)
     
     model_version, global_step = 0, 0
@@ -396,9 +380,9 @@ def main():
         except Exception as e:
             print(f"Could not load full state, starting from scratch. Error: {e}")
             model = OFC_CNN_Network().to(device)
-            optimizer = optim.AdamW(optimizer_grouped_parameters)
+            optimizer = optim.AdamW(get_params_for_optimizer(model, LEARNING_RATE, weight_decay=0.01))
 
-    head_warmup_steps = int(os.environ.get("HEAD_WARMUP_STEPS", "0"))
+    head_warmup_steps = int(os.environ.get("HEAD_WARMUP_STEPS", "2000"))
     if head_warmup_steps > 0:
         print(f"!!! HEAD-ONLY WARMUP ENABLED for {head_warmup_steps} steps !!!")
     
@@ -428,6 +412,7 @@ def main():
     
     policy_losses = deque(maxlen=100)
     value_losses = deque(maxlen=100)
+    skipped_policy_updates = deque(maxlen=100)
     last_stats_time = time.time()
     last_cleanup_time = time.time()
     
@@ -440,10 +425,6 @@ def main():
     
     last_save_step = global_step
     last_push_step = global_step
-    
-    val_policy_data = {'infosets': np.array([]), 'actions': np.array([]), 'advantages': np.array([])}
-    val_value_data = {'infosets': np.array([]), 'targets': np.array([])}
-    last_validation_step = global_step
     
     result_timestamps = {}
 
@@ -515,63 +496,54 @@ def main():
 
             model.train()
             
+            # Requirement 2.2: Head warmup logic
             if head_warmup_steps > 0 and global_step < head_warmup_steps:
+                head_names = ["value_head", "action_proj", "street_proj", "policy_head_fc", "body_ln", "action_ln", "street_ln"]
                 for name, param in model.named_parameters():
-                    if not any(h in name for h in ("value_head.", "policy_head_fc.", "action_proj.", "street_proj.", "body_ln", "action_ln", "street_ln")):
+                    if not any(h in name for h in head_names):
                         param.requires_grad = False
+                    else:
+                        param.requires_grad = True
             else:
                 for param in model.parameters():
                     param.requires_grad = True
 
-            num_to_sample = int(BATCH_SIZE / (1.0 - VALIDATION_SPLIT_PROB))
-            
-            v_batch = value_buffer.sample(num_to_sample)
+            v_batch = value_buffer.sample(BATCH_SIZE)
             if not v_batch: continue
             v_infosets_np, _, v_targets_np = v_batch
             
-            p_batch = policy_buffer.sample(num_to_sample)
+            p_batch = policy_buffer.sample(BATCH_SIZE)
             if not p_batch: continue
             p_infosets_np, p_actions_np, p_advantages_np = p_batch
-
-            val_mask_v = np.random.rand(len(v_infosets_np)) < VALIDATION_SPLIT_PROB
-            train_mask_v = ~val_mask_v
             
-            if np.any(val_mask_v):
-                val_value_data['infosets'] = np.concatenate([val_value_data['infosets'], v_infosets_np[val_mask_v]])[-VALIDATION_BUFFER_SIZE:] if val_value_data['infosets'].size > 0 else v_infosets_np[val_mask_v]
-                val_value_data['targets'] = np.concatenate([val_value_data['targets'], v_targets_np[val_mask_v]])[-VALIDATION_BUFFER_SIZE:] if val_value_data['targets'].size > 0 else v_targets_np[val_mask_v]
-
-            v_infosets_np_train = v_infosets_np[train_mask_v][:BATCH_SIZE]
-            v_targets_np_train = v_targets_np[train_mask_v][:BATCH_SIZE]
-
-            val_mask_p = np.random.rand(len(p_infosets_np)) < VALIDATION_SPLIT_PROB
-            train_mask_p = ~val_mask_p
-
-            if np.any(val_mask_p):
-                val_policy_data['infosets'] = np.concatenate([val_policy_data['infosets'], p_infosets_np[val_mask_p]])[-VALIDATION_BUFFER_SIZE:] if val_policy_data['infosets'].size > 0 else p_infosets_np[val_mask_p]
-                val_policy_data['actions'] = np.concatenate([val_policy_data['actions'], p_actions_np[val_mask_p]])[-VALIDATION_BUFFER_SIZE:] if val_policy_data['actions'].size > 0 else p_actions_np[val_mask_p]
-                val_policy_data['advantages'] = np.concatenate([val_policy_data['advantages'], p_advantages_np[val_mask_p]])[-VALIDATION_BUFFER_SIZE:] if val_policy_data['advantages'].size > 0 else p_advantages_np[val_mask_p]
-
-            p_infosets_np_train = p_infosets_np[train_mask_p][:BATCH_SIZE]
-            p_actions_np_train = p_actions_np[train_mask_p][:BATCH_SIZE]
-            p_advantages_np_train = p_advantages_np[train_mask_p][:BATCH_SIZE]
+            # --- VALUE LOSS (Requirement 2.1) ---
+            v_infosets = torch.from_numpy(v_infosets_np).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
+            v_targets = torch.from_numpy(v_targets_np).unsqueeze(1).to(device)
             
-            v_infosets = torch.from_numpy(v_infosets_np_train).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
-            v_targets = torch.from_numpy(v_targets_np_train).unsqueeze(1).to(device)
-            
+            # Train on raw targets, clipped for stability
             v_targets_clipped = torch.clamp(v_targets, -VALUE_CLIP_VALUE, VALUE_CLIP_VALUE)
-            pred_values = model(v_infosets)
+            pred_values = model.forward_value_head(model.forward_body(v_infosets))
             loss_v = F.huber_loss(pred_values, v_targets_clipped, delta=1.0)
             
-            p_infosets = torch.from_numpy(p_infosets_np_train).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
-            p_actions = torch.from_numpy(p_actions_np_train).to(device)
-            p_advantages = torch.from_numpy(p_advantages_np_train).unsqueeze(1).to(device)
+            # --- POLICY LOSS (Requirement 2.1) ---
+            p_infosets = torch.from_numpy(p_infosets_np).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
+            p_actions = torch.from_numpy(p_actions_np).to(device)
+            p_advantages = torch.from_numpy(p_advantages_np).unsqueeze(1).to(device)
             
             adv_mean, adv_std = p_advantages.mean(), p_advantages.std()
-            p_advantages_normalized = torch.clamp((p_advantages - adv_mean) / (adv_std + 1e-6), -ADV_CLIP_VALUE, ADV_CLIP_VALUE)
-
-            p_street_vector = p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
-            pred_logits, _ = model(p_infosets, p_actions, p_street_vector)
-            loss_p = F.huber_loss(pred_logits, p_advantages_normalized, delta=1.0)
+            
+            # Requirement 2.3: Skip flat policy batches
+            update_skipped = 0
+            if adv_std.item() < 1e-6:
+                loss_p = torch.tensor(0.0, device=device, requires_grad=False)
+                update_skipped = 1
+            else:
+                # Z-score normalize advantages per batch
+                p_advantages_normalized = torch.clamp((p_advantages - adv_mean) / adv_std, -ADV_CLIP_VALUE, ADV_CLIP_VALUE)
+                p_street_vector = p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
+                body_out = model.forward_body(p_infosets)
+                pred_logits = model.forward_policy_head(body_out, p_actions, p_street_vector)
+                loss_p = F.huber_loss(pred_logits, p_advantages_normalized, delta=1.0)
 
             optimizer.zero_grad()
             total_loss = loss_v + POLICY_LOSS_WEIGHT * loss_p
@@ -580,118 +552,43 @@ def main():
             optimizer.step()
             
             value_losses.append(loss_v.item())
-            policy_losses.append(loss_p.item())
+            policy_losses.append(loss_p.item() if update_skipped == 0 else 0)
+            skipped_policy_updates.append(update_skipped)
             global_step += 1
             
-            # =================================================================================
-            # === НАЧАЛО БЛОКА УЛЬТРА-ДИАГНОСТИКИ ===
-            # =================================================================================
+            # Requirement 3.1: Expanded Diagnostics
             if aim_run.active:
-                # --- 1. Базовые метрики (уже были) ---
                 aim_run.track(loss_v.item(), name="loss/value_loss", step=global_step)
                 aim_run.track(loss_p.item(), name="loss/policy_loss", step=global_step)
                 aim_run.track(grad_norm.item(), name="diagnostics/grad_norm", step=global_step)
                 
                 with torch.no_grad():
-                    # --- 2. Статистика Value Targets (для проверки гипотезы о Var(t) ~ 0) ---
-                    vt_raw = v_targets.view(-1)
-                    vt_clipped = v_targets_clipped.view(-1)
-                    aim_run.track(float(vt_raw.mean().item()), name="targets/value_raw/mean", step=global_step, context={"subset": "train"})
-                    aim_run.track(float(vt_raw.std().item()), name="targets/value_raw/std", step=global_step, context={"subset": "train"})
-                    aim_run.track(float(vt_raw.min().item()), name="targets/value_raw/min", step=global_step, context={"subset": "train"})
-                    aim_run.track(float(vt_raw.max().item()), name="targets/value_raw/max", step=global_step, context={"subset": "train"})
+                    # Raw target stats
+                    aim_run.track(float(v_targets.std().item()), name="targets/value_raw/std", step=global_step)
+                    aim_run.track(float(p_advantages.std().item()), name="targets/advantage_raw/std", step=global_step)
                     
-                    aim_run.track(float(vt_clipped.mean().item()), name="targets/value_clipped/mean", step=global_step, context={"subset": "train"})
-                    aim_run.track(float(vt_clipped.std().item()), name="targets/value_clipped/std", step=global_step, context={"subset": "train"})
-
-                    # --- 3. Статистика Policy Advantages (до и после нормализации) ---
-                    pa_raw = p_advantages.view(-1)
-                    pa_norm = p_advantages_normalized.view(-1)
-                    aim_run.track(float(pa_raw.mean().item()), name="targets/advantage_raw/mean", step=global_step, context={"subset": "train"})
-                    aim_run.track(float(pa_raw.std().item()), name="targets/advantage_raw/std", step=global_step, context={"subset": "train"})
-                    aim_run.track(float(pa_raw.min().item()), name="targets/advantage_raw/min", step=global_step, context={"subset": "train"})
-                    aim_run.track(float(pa_raw.max().item()), name="targets/advantage_raw/max", step=global_step, context={"subset": "train"})
-
-                    aim_run.track(float(pa_norm.mean().item()), name="targets/advantage_normalized/mean", step=global_step, context={"subset": "train"})
-                    aim_run.track(float(pa_norm.std().item()), name="targets/advantage_normalized/std", step=global_step, context={"subset": "train"})
-
-                    # --- 4. Расширенная диагностика Policy Correlation ---
-                    try:
-                        y = pa_norm.cpu().numpy()
-                        yhat = pred_logits.view(-1).detach().cpu().numpy()
-                        y_std = float(np.std(y))
-                        yhat_std = float(np.std(yhat))
-                        corr = float(np.corrcoef(y, yhat)[0, 1]) if y_std > 1e-6 and yhat_std > 1e-6 else 0.0
-                    except Exception:
-                        corr, y_std, yhat_std = 0.0, 0.0, 0.0
-                    
-                    aim_run.track(corr, name="diagnostics/policy_corr", step=global_step)
-                    aim_run.track(y_std, name="diagnostics/policy_target_std", step=global_step) # std цели
-                    aim_run.track(yhat_std, name="diagnostics/policy_pred_std", step=global_step) # std предсказания
-
-                    # --- 5. Расширенная диагностика Explained Variance с защитой ---
-                    try:
-                        t = vt_clipped.cpu().numpy()
-                        v = pred_values.view(-1).detach().cpu().numpy()
-                        var_t = float(np.var(t))
-                        # Защита от деления на ноль и логирование дисперсии таргета
-                        ev = 1.0 - float(np.var(t - v)) / max(var_t, 1e-6) 
-                    except Exception:
-                        ev, var_t = 0.0, 0.0
-                    
+                    # Explained Variance
+                    var_t = float(torch.var(v_targets_clipped))
+                    ev = 1.0 - float(torch.var(v_targets_clipped - pred_values)) / max(var_t, 1e-6)
                     aim_run.track(ev, name="diagnostics/value_explained_var", step=global_step)
-                    aim_run.track(var_t, name="diagnostics/value_target_var", step=global_step) # Дисперсия цели
+                    aim_run.track(var_t, name="diagnostics/value_target_var", step=global_step)
 
-                    # --- 6. Статистика предсказаний (уже была, но для полноты) ---
-                    aim_run.track(float(pred_logits.std().item()), name="diagnostics/policy_logit_std", step=global_step)
-                    aim_run.track(float(pred_values.std().item()), name="diagnostics/value_pred_std", step=global_step)
-                
-                try:
-                    live_metrics = {
-                        "step": int(global_step), "policy_corr": float(corr), "value_explained_var": float(ev),
-                        "policy_logit_std": float(pred_logits.std().item()), "value_pred_std": float(pred_values.std().item()),
-                        "loss_policy_last": float(loss_p.item()), "loss_value_last": float(loss_v.item()),
-                        "buffer_policy_size": int(policy_buffer.size()), "buffer_value_size": int(value_buffer.size())
-                    }
-                    with open(LIVE_METRICS_FILE, "w") as f: json.dump(live_metrics, f)
-                except Exception: pass
-            # =================================================================================
-            # === КОНЕЦ БЛОКА УЛЬТРА-ДИАГНОСТИКИ ===
-            # =================================================================================
-            
-            model.eval()
-
-            if training_started and (global_step - last_validation_step >= VALIDATION_INTERVAL_STEPS):
-                if val_value_data['infosets'].size > BATCH_SIZE and val_policy_data['infosets'].size > BATCH_SIZE:
-                    model.eval()
-                    with torch.no_grad():
-                        val_indices_v = np.random.choice(len(val_value_data['infosets']), BATCH_SIZE, replace=False)
-                        val_v_infosets = torch.from_numpy(val_value_data['infosets'][val_indices_v]).view(-1, 16, 4, 13).to(device)
-                        val_v_targets = torch.from_numpy(val_value_data['targets'][val_indices_v]).unsqueeze(1).to(device)
-                        
-                        val_indices_p = np.random.choice(len(val_policy_data['infosets']), BATCH_SIZE, replace=False)
-                        val_p_infosets = torch.from_numpy(val_policy_data['infosets'][val_indices_p]).view(-1, 16, 4, 13).to(device)
-                        val_p_actions = torch.from_numpy(val_policy_data['actions'][val_indices_p]).to(device)
-                        val_p_advantages = torch.from_numpy(val_policy_data['advantages'][val_indices_p]).unsqueeze(1).to(device)
-
-                        val_pred_values = model(val_v_infosets)
-                        val_loss_v = F.huber_loss(val_pred_values, torch.clamp(val_v_targets, -VALUE_CLIP_VALUE, VALUE_CLIP_VALUE))
-
-                        val_p_street = val_p_infosets[:, STREET_START_IDX:STREET_END_IDX, 0, 0]
-                        val_pred_logits, _ = model(val_p_infosets, val_p_actions, val_p_street)
-                        
-                        adv_mean_val, adv_std_val = val_p_advantages.mean(), val_p_advantages.std()
-                        val_p_adv_norm = torch.clamp((val_p_advantages - adv_mean_val) / (adv_std_val + 1e-6), -ADV_CLIP_VALUE, ADV_CLIP_VALUE)
-                        val_loss_p = F.huber_loss(val_pred_logits, val_p_adv_norm)
-
-                        if aim_run.active:
-                            aim_run.track(val_loss_v.item(), name="loss/validation_value_loss", step=global_step)
-                            aim_run.track(val_loss_p.item(), name="loss/validation_policy_loss", step=global_step)
-                        
-                        print(f"\n[VALIDATION] Step {global_step}: Val Value Loss = {val_loss_v.item():.6f}, Val Policy Loss = {val_loss_p.item():.6f}")
+                    # Policy Correlation
+                    if update_skipped == 0:
+                        y = p_advantages_normalized.cpu().numpy().flatten()
+                        yhat = pred_logits.cpu().numpy().flatten()
+                        if y.std() > 1e-6 and yhat.std() > 1e-6:
+                            corr = float(np.corrcoef(y, yhat)[0, 1])
+                            aim_run.track(corr, name="diagnostics/policy_corr", step=global_step)
                     
-                    last_validation_step = global_step
-                model.train()
+                    # Prediction stats
+                    aim_run.track(float(pred_values.std().item()), name="diagnostics/value_pred_std", step=global_step)
+                    if update_skipped == 0:
+                        aim_run.track(float(pred_logits.std().item()), name="diagnostics/policy_logit_std", step=global_step)
+
+                # Skipped updates rate
+                skip_rate = np.mean(skipped_policy_updates) if skipped_policy_updates else 0
+                aim_run.track(skip_rate, name="diagnostics/skipped_policy_updates_rate", step=global_step)
 
             is_first_save = (global_step >= FIRST_SAVE_STEP) and (last_save_step < FIRST_SAVE_STEP)
             is_regular_save = (global_step - last_save_step) >= SAVE_INTERVAL_STEPS
@@ -761,5 +658,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# --- КОНЕЦ ФАЙЛА ---
