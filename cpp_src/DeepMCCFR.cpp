@@ -15,7 +15,6 @@
 
 namespace ofc {
 
-// ... (функции action_to_vector и add_dirichlet_noise остаются без изменений) ...
 std::vector<float> action_to_vector(const Action& action) {
     std::vector<float> vec(ACTION_VECTOR_SIZE, 0.0f);
     const auto& placements = action.first;
@@ -54,8 +53,8 @@ void add_dirichlet_noise(std::vector<float>& strategy, float alpha, std::mt19937
     }
 }
 
-
-std::atomic<uint64_t> DeepMCCFR::traversal_counter_{0};
+// Requirement 1.5: Initialize the static atomic counter
+std::atomic<uint64_t> DeepMCCFR::request_id_counter_{0};
 
 DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, SharedReplayBuffer* value_buffer,
                      InferenceRequestQueue* request_queue, InferenceResultQueue* result_queue,
@@ -70,13 +69,11 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* policy_buffer, Sha
       dummy_action_vec_(ACTION_VECTOR_SIZE, 0.0f)
 {}
 
-// ... (остальная часть файла DeepMCCFR.cpp остается без изменений) ...
 void DeepMCCFR::run_traversal() {
-    uint64_t traversal_id = ++traversal_counter_;
     GameState state; 
-    traverse(state, 0, true, traversal_id);
+    traverse(state, 0, true);
     state.reset(); 
-    traverse(state, 1, true, traversal_id);
+    traverse(state, 1, true);
 }
 
 std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int player_view) {
@@ -143,7 +140,7 @@ std::vector<float> DeepMCCFR::featurize_state_cpp(const GameState& state, int pl
 }
 
 
-std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root, uint64_t traversal_id) {
+std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player, bool is_root) {
     if (state.is_terminal()) {
         auto payoffs = state.get_payoffs(evaluator_);
         return {{0, payoffs.first}, {1, payoffs.second}};
@@ -157,9 +154,11 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     int num_actions = legal_actions.size();
     UndoInfo undo_info;
 
-    if (num_actions == 0) {
-        state.apply_action({{}, INVALID_CARD}, traversing_player, undo_info);
-        auto result = traverse(state, traversing_player, false, traversal_id);
+    // Requirement 1.3: Skip inference for nodes with <= 1 action
+    if (num_actions <= 1) {
+        Action action_to_take = (num_actions == 1) ? legal_actions[0] : Action{{}, INVALID_CARD};
+        state.apply_action(action_to_take, traversing_player, undo_info);
+        auto result = traverse(state, traversing_player, false);
         state.undo_action(undo_info, traversing_player);
         return result;
     }
@@ -190,8 +189,9 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         canonical_action_vectors.push_back(action_to_vector(canonical_action));
     }
     
-    uint64_t policy_request_id = traversal_id * 2;
-    uint64_t value_request_id = traversal_id * 2 + 1;
+    // Requirement 1.5: Use atomic counter for unique IDs
+    uint64_t policy_request_id = ++request_id_counter_;
+    uint64_t value_request_id = ++request_id_counter_;
 
     bool is_traverser_turn = (current_player == traversing_player);
 
@@ -280,6 +280,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
     }
 
+    // Requirement 1.6: Keep Dirichlet noise only for the root node
     if (is_root) {
         add_dirichlet_noise(strategy, 0.3f, rng_);
     }
@@ -288,18 +289,20 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     int sampled_action_idx = dist(rng_);
 
     state.apply_action(legal_actions[sampled_action_idx], traversing_player, undo_info);
-    auto action_payoffs = traverse(state, traversing_player, false, traversal_id);
+    auto action_payoffs = traverse(state, traversing_player, false);
     state.undo_action(undo_info, traversing_player);
 
     auto it = action_payoffs.find(current_player);
     if (it != action_payoffs.end()) {
-        float advantage = it->second - value_baseline;
-        policy_buffer_->push(infoset_vec, canonical_action_vectors[sampled_action_idx], advantage);
-        // ===================================================================
-        // === ИСПРАВЛЕНИЕ: ВЫЗОВ НОВОГО МЕТОДА ДЛЯ НОРМАЛИЗАЦИИ ЗНАЧЕНИЙ ===
-        // ===================================================================
-        value_buffer_->push_value(infoset_vec, dummy_action_vec_, it->second);
-        // ===================================================================
+        // Requirement 1.3: Only write to policy buffer if it's the traverser's turn
+        if (current_player == traversing_player) {
+            // Requirement 1.1: Advantage is raw_return - value_baseline
+            float advantage = it->second - value_baseline;
+            policy_buffer_->push(infoset_vec, canonical_action_vectors[sampled_action_idx], advantage);
+        }
+        
+        // Requirement 1.1: Push raw, unnormalized payoff to the value buffer
+        value_buffer_->push(infoset_vec, dummy_action_vec_, it->second);
     }
     return action_payoffs;
 }
