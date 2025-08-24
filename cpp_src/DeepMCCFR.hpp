@@ -43,9 +43,10 @@ private:
     std::mt19937 rng_;
     std::vector<float> dummy_action_vec_;
     
-    static std::atomic<uint64_t> traversal_counter_;
+    // Requirement 1.5: Static atomic counter for unique request IDs
+    static std::atomic<uint64_t> request_id_counter_;
 
-    std::map<int, float> traverse(GameState& state, int traversing_player, bool is_root, uint64_t traversal_id);
+    std::map<int, float> traverse(GameState& state, int traversing_player, bool is_root);
     std::vector<float> featurize_state_cpp(const GameState& state, int player_view);
 };
 
