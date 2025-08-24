@@ -9,6 +9,7 @@
 #include <mutex>
 #include <chrono>
 #include <thread>
+#include <cmath> // <-- ДОБАВЛЕНО ДЛЯ std::sqrt
 
 #include "constants.hpp"
 #include <pybind11/pybind11.h>
@@ -32,10 +33,10 @@ struct TrainingSample {
 class SharedReplayBuffer {
 public:
     SharedReplayBuffer(uint64_t capacity) 
-        : capacity_(capacity), head_(0), count_(0)
+        : capacity_(capacity), head_(0), count_(0),
+          M2_(0.0), mean_(0.0), value_count_(0)
     {
         buffer_.resize(capacity_);
-        // Инициализация RNG в конструкторе, чтобы избежать проблем с thread_local
         unsigned seed = static_cast<unsigned>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + 
                         static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
         rng_ = std::make_unique<std::mt19937>(seed);
@@ -57,7 +58,40 @@ public:
         }
     }
 
-    // --- ИЗМЕНЕНИЕ: Безопасный метод для работы с сырыми указателями без GIL ---
+    // ===================================================================
+    // === ИСПРАВЛЕНИЕ: НОВЫЙ МЕТОД ДЛЯ НОРМАЛИЗАЦИИ VALUE TARGETS ===
+    // ===================================================================
+    void push_value(const std::vector<float>& infoset_vec, const std::vector<float>& action_vec, float raw_target) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        
+        // --- Шаг 1: Обновляем статистику с помощью алгоритма Уэлфорда ---
+        value_count_++;
+        double delta = raw_target - mean_;
+        mean_ += delta / value_count_;
+        double delta2 = raw_target - mean_;
+        M2_ += delta * delta2;
+
+        // --- Шаг 2: Вычисляем стандартное отклонение и нормализуем цель ---
+        double stddev = (value_count_ > 1) ? std::sqrt(M2_ / value_count_) : 1.0;
+        // Добавляем эпсилон для предотвращения деления на ноль
+        stddev = std::max(stddev, 1e-6);
+        float normalized_target = static_cast<float>((raw_target - mean_) / stddev);
+
+        // --- Шаг 3: Сохраняем нормализованное значение в буфер ---
+        uint64_t index = head_ % capacity_;
+        head_++;
+
+        auto& sample = buffer_[index];
+        std::copy(infoset_vec.begin(), infoset_vec.end(), sample.infoset.begin());
+        std::copy(action_vec.begin(), action_vec.end(), sample.action_vector.begin());
+        sample.target_value = normalized_target;
+        
+        if (count_ < capacity_) {
+            count_++;
+        }
+    }
+    // ===================================================================
+
     bool sample_to_ptr(int batch_size, float* infos_ptr, float* actions_ptr, float* targets_ptr) {
         std::lock_guard<std::mutex> lock(mtx_);
         if (count_ < static_cast<uint64_t>(batch_size)) return false;
@@ -91,6 +125,14 @@ private:
     uint64_t count_;
     std::mutex mtx_;
     std::unique_ptr<std::mt19937> rng_;
+
+    // ===================================================================
+    // === ИСПРАВЛЕНИЕ: ПЕРЕМЕННЫЕ ДЛЯ АЛГОРИТМА УЭЛФОРДА ===
+    // ===================================================================
+    double M2_;
+    double mean_;
+    uint64_t value_count_;
+    // ===================================================================
 };
 
 } // namespace ofc
