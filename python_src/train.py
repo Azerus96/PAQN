@@ -1,4 +1,4 @@
-# --- НАЧАЛО ФАЙЛА python_src/train.py (v5.0 - С ИНТЕГРИРОВАННЫМИ УЛУЧШЕНИЯМИ) ---
+# --- НАЧАЛО ФАЙЛА python_src/train.py (v5.1 - С ИСПРАВЛЕНИЕМ КРАША) ---
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -67,19 +67,13 @@ LEARNING_RATE = 0.0005
 BUFFER_CAPACITY = 1_000_000
 BATCH_SIZE = 512
 MIN_BUFFER_FILL_SAMPLES = 50000
-# === ИЗМЕНЕНИЕ (Пункт 5): Гиперпараметры для потерь и клиппинга ===
-POLICY_LOSS_WEIGHT = 0.5      # Коэффициент для policy loss
-ADV_CLIP_VALUE = 5.0          # Предел клиппинга для advantage
-VALUE_CLIP_VALUE = 50.0       # Предел клиппинга для value таргетов
-# ===================================================================
-# === ИЗМЕНЕНИЕ (Пункт 3): Гиперпараметры для валидации ===
-VALIDATION_BUFFER_SIZE = 50000 # Размер валидационного буфера
-VALIDATION_SPLIT_PROB = 0.01  # 1% всех сэмплов идет в валидацию
-VALIDATION_INTERVAL_STEPS = 200 # Как часто проводить валидацию
-# ========================================================
-# === ИЗМЕНЕНИЕ (Пункт 6): Гиперпараметр для очистки result_dict ===
-RESULT_TTL_SECONDS = 120 # Время жизни результата в словаре (в секундах)
-# ===================================================================
+POLICY_LOSS_WEIGHT = 0.5
+ADV_CLIP_VALUE = 5.0
+VALUE_CLIP_VALUE = 50.0
+VALIDATION_BUFFER_SIZE = 50000
+VALIDATION_SPLIT_PROB = 0.01
+VALIDATION_INTERVAL_STEPS = 200
+RESULT_TTL_SECONDS = 120
 
 # --- ПУТИ И ИНТЕРВАЛЫ ---
 STATS_INTERVAL_SECONDS = 15
@@ -269,11 +263,9 @@ class InferenceWorker(mp.Process):
                         else:
                             num_actions = len(action_vectors)
                             body_out_single = model_to_use.forward_body(infoset_tensor)
-                            # === ИЗМЕНЕНИЕ (Пункт 4): .repeat() -> .expand() для экономии памяти ===
                             body_out_batch = body_out_single.expand(num_actions, -1)
                             actions_tensor = torch.tensor(action_vectors, dtype=torch.float32, device=self.device)
                             street_vector = infoset_tensor[:, STREET_START_IDX:STREET_END_IDX, 0, 0].expand(num_actions, -1)
-                            # ========================================================================
                             policy_logits = model_to_use.forward_policy_head(body_out_batch, actions_tensor, street_vector)
                             predictions = policy_logits.cpu().numpy().flatten().tolist()
                             result = (req_id, True, predictions)
@@ -281,9 +273,10 @@ class InferenceWorker(mp.Process):
                         value = model_to_use(infoset_tensor)
                         result = (req_id, False, [value.item()])
                     
-                    # === ИЗМЕНЕНИЕ (Пункт 6): Сохраняем результат с временной меткой ===
-                    self.result_dict[req_id] = (time.time(), result)
-                    # ===================================================================
+                    # === ИСПРАВЛЕНИЕ: Возвращаем формат, который ожидает C++ ===
+                    # Не добавляем временную метку, чтобы не ломать контракт.
+                    self.result_dict[req_id] = result
+                    # ==========================================================
 
             except (KeyboardInterrupt, SystemExit):
                 break
@@ -313,21 +306,12 @@ def update_opponent_pool(model_version):
         except OSError as e:
             print(f"Warning: Could not remove old opponent file: {e}")
 
-# === НОВАЯ HELPER-ФУНКЦИЯ (Пункт 2): Разделение параметров для оптимизатора ===
 def get_params_for_optimizer(model: torch.nn.Module, weight_decay: float):
-    """
-    Разделяет параметры модели на две группы:
-    1. С weight decay (веса Conv2d, Linear).
-    2. Без weight decay (смещения, параметры GroupNorm, LayerNorm).
-    """
     decay_params = []
     no_decay_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # Параметры без weight decay:
-        # - если это bias (dim=1)
-        # - если это параметр слоя нормализации (weight или bias)
         if param.dim() <= 1 or name.endswith(".bias") or "norm" in name:
             no_decay_params.append(param)
         else:
@@ -337,7 +321,6 @@ def get_params_for_optimizer(model: torch.nn.Module, weight_decay: float):
         {'params': decay_params, 'weight_decay': weight_decay},
         {'params': no_decay_params, 'weight_decay': 0.0}
     ]
-# =====================================================================
 
 def main():
     aim_run = aim.Run(experiment="paqn_ofc_poker")
@@ -399,12 +382,10 @@ def main():
     
     model = OFC_CNN_Network().to(device)
     
-    # === ИЗМЕНЕНИЕ (Пункт 2): Создание групп параметров с корректным weight decay ===
     optimizer_grouped_parameters = [
         {**group, 'lr': LEARNING_RATE} for group in get_params_for_optimizer(model, weight_decay=0.01)
     ]
     optimizer = optim.AdamW(optimizer_grouped_parameters)
-    # ==============================================================================
     
     model_version, global_step = 0, 0
     if os.path.exists(MODEL_PATH):
@@ -463,11 +444,13 @@ def main():
     last_save_step = global_step
     last_push_step = global_step
     
-    # === ИЗМЕНЕНИЕ (Пункт 3): Создаем валидационные буферы ===
     val_policy_data = {'infosets': np.array([]), 'actions': np.array([]), 'advantages': np.array([])}
     val_value_data = {'infosets': np.array([]), 'targets': np.array([])}
     last_validation_step = global_step
-    # ========================================================
+    
+    # === ИСПРАВЛЕНИЕ: Отдельный словарь для временных меток ===
+    result_timestamps = {}
+    # =========================================================
 
     try:
         while True:
@@ -503,30 +486,33 @@ def main():
                 
                 last_stats_time = time.time()
 
-            # === ИЗМЕНЕНИЕ (Пункт 6): Логика очистки result_dict по TTL ===
-            if time.time() - last_cleanup_time > 60: # Проверяем раз в минуту
+            # === ИСПРАВЛЕНИЕ: Логика очистки result_dict по TTL с отдельным словарем ===
+            if time.time() - last_cleanup_time > 60:
                 now = time.time()
-                keys_to_check = list(result_dict.keys())
+                # Обновляем временные метки для всех текущих ключей в result_dict
+                for key in result_dict.keys():
+                    if key not in result_timestamps:
+                        result_timestamps[key] = now
                 
-                if len(keys_to_check) > 10000: # Порог для начала очистки
-                    keys_to_delete = []
-                    for key in keys_to_check:
-                        try:
-                            timestamp, _ = result_dict[key]
-                            if now - timestamp > RESULT_TTL_SECONDS:
-                                keys_to_delete.append(key)
-                        except (KeyError, TypeError, ValueError):
-                            # Ключ уже удален или имеет неверный формат, помечаем на удаление
-                            keys_to_delete.append(key)
-                    
-                    if keys_to_delete:
-                        print(f"[CLEANUP] Deleting {len(keys_to_delete)} expired results from result_dict (current size: {len(keys_to_check)})...", flush=True)
-                        for key in keys_to_delete:
-                            result_dict.pop(key, None) # Безопасное удаление
+                # Удаляем старые ключи
+                keys_to_delete = [key for key, ts in result_timestamps.items() if now - ts > RESULT_TTL_SECONDS]
                 
+                if len(result_dict) > 10000 and keys_to_delete:
+                    print(f"[CLEANUP] Deleting {len(keys_to_delete)} expired results from result_dict (current size: {len(result_dict)})...", flush=True)
+                    for key in keys_to_delete:
+                        result_dict.pop(key, None)
+                        result_timestamps.pop(key, None)
+                
+                # Очищаем словарь временных меток от ключей, которых уже нет в result_dict
+                if len(result_timestamps) > len(result_dict) * 2:
+                     current_keys = set(result_dict.keys())
+                     ts_keys_to_delete = [key for key in result_timestamps if key not in current_keys]
+                     for key in ts_keys_to_delete:
+                         result_timestamps.pop(key, None)
+
                 gc.collect()
                 last_cleanup_time = time.time()
-            # ============================================================
+            # ========================================================================
 
             if value_buffer.size() < min_fill or policy_buffer.size() < min_fill:
                 print(f"Waiting for buffer... P: {policy_buffer.size()}/{min_fill} | V: {value_buffer.size()}/{min_fill}", end='\r', flush=True)
@@ -540,7 +526,6 @@ def main():
             model.train()
             
             if head_warmup_steps > 0 and global_step < head_warmup_steps:
-                # Замораживаем 'trunk' параметры для прогрева 'head'
                 for name, param in model.named_parameters():
                     if not any(h in name for h in ("value_head.", "policy_head_fc.", "action_proj.", "street_proj.", "body_ln", "action_ln", "street_ln")):
                         param.requires_grad = False
@@ -548,7 +533,6 @@ def main():
                 for param in model.parameters():
                     param.requires_grad = True
 
-            # === ИЗМЕНЕНИЕ (Пункт 3): Откладываем часть сэмплов на валидацию ===
             num_to_sample = int(BATCH_SIZE / (1.0 - VALIDATION_SPLIT_PROB))
             
             v_batch = value_buffer.sample(num_to_sample)
@@ -559,7 +543,6 @@ def main():
             if not p_batch: continue
             p_infosets_np, p_actions_np, p_advantages_np = p_batch
 
-            # Разделение на обучающую и валидационную выборки
             val_mask_v = np.random.rand(len(v_infosets_np)) < VALIDATION_SPLIT_PROB
             train_mask_v = ~val_mask_v
             
@@ -581,8 +564,7 @@ def main():
             p_infosets_np_train = p_infosets_np[train_mask_p][:BATCH_SIZE]
             p_actions_np_train = p_actions_np[train_mask_p][:BATCH_SIZE]
             p_advantages_np_train = p_advantages_np[train_mask_p][:BATCH_SIZE]
-            # ======================================================================
-
+            
             v_infosets = torch.from_numpy(v_infosets_np_train).view(-1, NUM_FEATURE_CHANNELS, NUM_SUITS, NUM_RANKS).to(device)
             v_targets = torch.from_numpy(v_targets_np_train).unsqueeze(1).to(device)
             
@@ -602,9 +584,7 @@ def main():
             loss_p = F.huber_loss(pred_logits, p_advantages_normalized, delta=1.0)
 
             optimizer.zero_grad()
-            # === ИЗМЕНЕНИЕ (Пункт 5): Применяем весовой коэффициент к policy loss ===
             total_loss = loss_v + POLICY_LOSS_WEIGHT * loss_p
-            # =======================================================================
             total_loss.backward()
             grad_norm = clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
@@ -651,12 +631,10 @@ def main():
             
             model.eval()
 
-            # === ИЗМЕНЕНИЕ (Пункт 3): Периодическая валидация ===
             if training_started and (global_step - last_validation_step >= VALIDATION_INTERVAL_STEPS):
                 if val_value_data['infosets'].size > BATCH_SIZE and val_policy_data['infosets'].size > BATCH_SIZE:
                     model.eval()
                     with torch.no_grad():
-                        # Собираем батч для валидации
                         val_indices_v = np.random.choice(len(val_value_data['infosets']), BATCH_SIZE, replace=False)
                         val_v_infosets = torch.from_numpy(val_value_data['infosets'][val_indices_v]).view(-1, 16, 4, 13).to(device)
                         val_v_targets = torch.from_numpy(val_value_data['targets'][val_indices_v]).unsqueeze(1).to(device)
@@ -666,7 +644,6 @@ def main():
                         val_p_actions = torch.from_numpy(val_policy_data['actions'][val_indices_p]).to(device)
                         val_p_advantages = torch.from_numpy(val_policy_data['advantages'][val_indices_p]).unsqueeze(1).to(device)
 
-                        # Считаем val loss
                         val_pred_values = model(val_v_infosets)
                         val_loss_v = F.huber_loss(val_pred_values, torch.clamp(val_v_targets, -VALUE_CLIP_VALUE, VALUE_CLIP_VALUE))
 
@@ -684,8 +661,7 @@ def main():
                         print(f"\n[VALIDATION] Step {global_step}: Val Value Loss = {val_loss_v.item():.6f}, Val Policy Loss = {val_loss_p.item():.6f}")
                     
                     last_validation_step = global_step
-                model.train() # Возвращаем модель в режим обучения
-            # ======================================================================
+                model.train()
 
             is_first_save = (global_step >= FIRST_SAVE_STEP) and (last_save_step < FIRST_SAVE_STEP)
             is_regular_save = (global_step - last_save_step) >= SAVE_INTERVAL_STEPS
