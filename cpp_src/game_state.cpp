@@ -6,7 +6,8 @@
 #include <functional>
 #include <thread>
 #include <set>
-#include <random> // <-- Добавляем этот заголовок для std::random_device
+#include <random>
+#include <algorithm> // For std::next_permutation
 
 namespace ofc {
 
@@ -28,12 +29,8 @@ namespace ofc {
             board.bottom.fill(INVALID_CARD);
         }
         
-        // ===================================================================
-        // === ИСПРАВЛЕНИЕ 2: ИСПОЛЬЗОВАНИЕ std::random_device ДЛЯ УНИКАЛЬНОГО SEED ===
-        // ===================================================================
         std::random_device rd;
         std::mt19937 temp_rng(rd());
-        // ===================================================================
 
         deck_.resize(52);
         std::iota(deck_.begin(), deck_.end(), 0);
@@ -52,7 +49,6 @@ namespace ofc {
         deal_cards();
     }
 
-// ... (остальная часть файла game_state.cpp остается без изменений) ...
     std::pair<float, float> GameState::get_payoffs(const HandEvaluator& evaluator) const {
         const int SCOOP_BONUS = 3;
         const Board& p1_board = boards_[0];
@@ -102,14 +98,23 @@ namespace ofc {
         std::vector<Action>& out_actions
     ) const {
         if (current_indices.size() == (size_t)k) {
-            std::vector<Placement> placement;
-            placement.reserve(k);
-            for (int i = 0; i < k; ++i) {
-                placement.push_back({cards_to_place[i], available_slots[current_indices[i]]});
-            }
-            // --- ИСПРАВЛЕНИЕ: Сортируем placement для канонического вида ---
-            std::sort(placement.begin(), placement.end());
-            out_actions.push_back({placement, discarded});
+            // Requirement 1.2: Generate permutations of cards for the chosen slots
+            CardSet p_cards = cards_to_place;
+            std::sort(p_cards.begin(), p_cards.end()); // Start with a canonical permutation
+            
+            // For k > 2, this generates all permutations, which might be slow.
+            // The spec specifically targets k=2. This implementation is general but
+            // for k=2 it will correctly generate the 2 permutations.
+            do {
+                std::vector<Placement> placement;
+                placement.reserve(k);
+                for(int i = 0; i < k; ++i) {
+                    placement.push_back({p_cards[i], available_slots[current_indices[i]]});
+                }
+                std::sort(placement.begin(), placement.end()); // Sort placements for canonical action representation
+                out_actions.push_back({placement, discarded});
+            } while (std::next_permutation(p_cards.begin(), p_cards.end()));
+            
             return;
         }
 
@@ -148,9 +153,7 @@ namespace ofc {
                 current_placement.push_back({temp_cards[j], temp_slots[j]});
             }
             
-            // --- ИСПРАВЛЕНИЕ: Сортируем placement для канонического вида ---
             std::sort(current_placement.begin(), current_placement.end());
-
             actions.push_back({current_placement, discarded});
         }
     }
@@ -174,15 +177,13 @@ namespace ofc {
                     if (i != j) cards_to_place.push_back(dealt_cards_[j]);
                 }
                 std::vector<int> indices;
-                generate_all_placements_recursive(cards_to_place, available_slots, indices, 0, 2, current_discarded, out_actions);
+                generate_all_placements_recursive(cards_to_place, available_slots, indices, 0, cards_to_place.size(), current_discarded, out_actions);
             }
         } else { 
             CardSet cards_to_place = dealt_cards_;
             generate_random_placements(cards_to_place, INVALID_CARD, out_actions, action_limit, rng);
         }
         
-        // --- ИСПРАВЛЕНИЕ: Используем std::sort + std::unique для удаления дубликатов ---
-        // Это требует наличия operator< и operator== для Action, которые мы добавили в card.hpp
         std::sort(out_actions.begin(), out_actions.end());
         out_actions.erase(std::unique(out_actions.begin(), out_actions.end()), out_actions.end());
 
@@ -229,9 +230,7 @@ namespace ofc {
         int player_who_acted = undo_info.prev_current_player;
         current_player_ = player_who_acted;
 
-        // Восстанавливаем карты в колоду из dealt_cards_ *после* хода
         deck_.insert(deck_.end(), dealt_cards_.begin(), dealt_cards_.end());
-        // Восстанавливаем dealt_cards_ в состояние *до* хода
         dealt_cards_ = undo_info.dealt_cards_before_action;
 
         const auto& placements = undo_info.action.first;
